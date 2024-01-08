@@ -1,0 +1,27 @@
+{
+	"enableStatusBarItem": true,
+	"enableQuickPick": true,
+	"uploadOnSave": false,
+	"autoDelete": false,
+	"checkGitignore": false,
+	"activeTargets": [
+		"RePlay-Player"
+	],
+	"concurrency": 5,
+	"ignore": [
+		".git/**/*",
+		".vscode/**/*"
+	],
+	"targets": [
+		{
+			"name": "RePlay-Player",
+			"type": "sftp",
+			"host": "192.168.0.18",
+			"port": 22,
+			"user": "root",
+			"password": "root",
+			"dir": "/opt/RePlay-Player",
+			"transferDataType": "binary"
+		}
+	]
+}
