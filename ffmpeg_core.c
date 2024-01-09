@@ -752,13 +752,13 @@ void CORE_PREFIX(retro_run)(void)
    r2    = ret & (1 << RETRO_DEVICE_ID_JOYPAD_R2);
 
    if (left && !last_left)
-      seek_frames -= 10 * media.interpolate_fps;
+      seek_frames -= 15 * media.interpolate_fps;
    if (right && !last_right)
-      seek_frames += 10 * media.interpolate_fps;
+      seek_frames += 15 * media.interpolate_fps;
    if (up && !last_up)
-      seek_frames += 60 * media.interpolate_fps;
+      seek_frames += 180 * media.interpolate_fps;
    if (down && !last_down)
-      seek_frames -= 60 * media.interpolate_fps;
+      seek_frames -= 180 * media.interpolate_fps;
    if (l2 && !last_l2)
       seek_frames -= 300 * media.interpolate_fps;
    if (r2 && !last_r2)
