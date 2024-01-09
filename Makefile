@@ -54,7 +54,7 @@ HAVE_CODEC_HW = 0
 CORE_DIR := .
 
 ifeq ($(platform),)
-platform = unix
+   platform = unix
 ifeq ($(shell uname -a),)
    platform = win
 else ifneq ($(findstring MINGW,$(shell uname -a)),)
@@ -63,6 +63,8 @@ else ifneq ($(findstring Darwin,$(shell uname -a)),)
    platform = osx
 else ifneq ($(findstring win,$(shell uname -a)),)
    platform = win
+else ifneq ($(findstring raspberrypi,$(shell uname -a)),)
+   platform = raspberrypi
 endif
 endif
 
@@ -73,7 +75,7 @@ ARCH_X86 = 1
 ARCH_X86_64 = 1
 endif
 
-TARGET_NAME := ffmpeg
+TARGET_NAME := replay_player
 
 GIT_VERSION ?= " $(shell git rev-parse --short HEAD || echo unknown)"
 ifneq ($(GIT_VERSION)," unknown")
@@ -86,11 +88,9 @@ ifneq (,$(findstring unix,$(platform)))
    fpic := -fPIC
    SHARED := -shared -Wl,--version-script=link.T -Wl,--no-undefined -fPIC
 ifeq ($(OPENGL),1)
+   GL_LIB := -lGL
 	HAVE_OPENGL = 1
 	HAVE_GL_FFT := 1
-	GL_LIB := -lGLESv2
-	GLES = 1
-	CFLAGS += -DHAVE_OPENGLES -DHAVE_OPENGLES3
 endif
    HAVE_SSA := 1
 
@@ -99,6 +99,28 @@ endif
 	HAVE_NETWORK = 1
 	HAVE_SOCKLEN = 1
 	HAVE_PTHREADS=1
+
+else ifneq (,$(findstring raspberrypi,$(platform)))
+	ARCH_X86 = 0
+   ARCH_AARCH64 = 1
+   TARGET := $(TARGET_NAME)_libretro.so
+   fpic := -fPIC
+   SHARED := -shared -Wl,--version-script=link.T -Wl,--no-undefined -fPIC
+
+   HAVE_OPENGL := 1
+   HAVE_GL_FFT := 1
+   GL_LIB := -lGLESv2
+   GLES := 1
+   CFLAGS += -DHAVE_OPENGLES -DHAVE_OPENGLES3
+
+   HAVE_SSA := 1
+	HAVE_POLL_H = 1
+	HAVE_GETADDRINFO = 1
+	HAVE_NETWORK = 1
+	HAVE_SOCKLEN = 1
+	HAVE_PTHREADS = 1
+
+   platform = unix
 
 else ifneq (,$(findstring osx,$(platform)))
 

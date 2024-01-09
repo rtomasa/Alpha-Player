@@ -484,15 +484,14 @@ fft_t *fft_new(unsigned fft_steps, rglgen_proc_address_t proc)
 {
    fft_t *fft    = NULL;
 #ifdef HAVE_OPENGLES3
-   const char *ver = (const char*)(glGetString(GL_VERSION));
-   if (ver)
-   {
-      unsigned major, minor;
-      if (sscanf(ver, "OpenGL ES %u.%u", &major, &minor) != 2 || major < 3)
-         return NULL;
-   }
-   else
+   GLint major;
+   GLint minor;
+   glGetIntegerv(GL_MAJOR_VERSION, &major);
+   glGetIntegerv(GL_MINOR_VERSION, &minor);
+
+   if (major < 3)
       return NULL;
+
 #else
    const char *exts = (const char*)(glGetString(GL_EXTENSIONS));
    if (!exts || !strstr(exts, "ARB_ES3_compatibility"))
@@ -677,6 +676,9 @@ void fft_step_fft(fft_t *fft, const GLshort *audio_buffer, unsigned frames)
 
    fft->output_ptr++;
    fft->output_ptr &= fft->depth - 1;
+
+   glDisable(GL_CULL_FACE);
+   glDisable(GL_DEPTH_TEST);
 
    glBindVertexArray(0);
    glUseProgram(0);

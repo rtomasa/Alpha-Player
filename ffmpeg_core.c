@@ -317,7 +317,7 @@ void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
 #if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
       { "ffmpeg_temporal_interp", "Temporal Interpolation; disabled|enabled" },
 #ifdef HAVE_GL_FFT
-      { "ffmpeg_fft_resolution", "FFT Resolution; 1280x720|1920x1080|2560x1440|3840x2160|640x360|320x180" },
+      { "ffmpeg_fft_resolution", "Music Visualizer Resolution; 320x240|320x180" },
       { "ffmpeg_fft_multisample", "FFT Multisample; 1x|2x|4x" },
 #endif
 #endif
@@ -2221,7 +2221,7 @@ bool CORE_PREFIX(retro_load_game)(const struct retro_game_info *info)
       hw_render.depth              = is_fft;
       hw_render.stencil            = is_fft;
 #if defined(HAVE_OPENGLES)
-      hw_render.context_type = RETRO_HW_CONTEXT_OPENGLES2;
+      hw_render.context_type = RETRO_HW_CONTEXT_OPENGLES3;
 #else
       hw_render.context_type = RETRO_HW_CONTEXT_OPENGL;
 #endif
