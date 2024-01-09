@@ -308,27 +308,105 @@ void CORE_PREFIX(retro_get_system_av_info)(struct retro_system_av_info *info)
 
 void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
 {
-   static const struct retro_variable vars[] = {
-#if ENABLE_HW_ACCEL
-      { "ffmpeg_hw_decoder", "Hardware Decoder (restart); off|auto|"
-         "cuda|d3d11va|drm|dxva2|mediacodec|opencl|qsv|vaapi|vdpau|videotoolbox" },
-#endif
-      { "ffmpeg_sw_decoder_threads", "Software Decoder Threads (restart); auto|1|2|4|6|8|10|12|14|16" },
-#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
-      { "ffmpeg_temporal_interp", "Temporal Interpolation; disabled|enabled" },
-#ifdef HAVE_GL_FFT
-      { "ffmpeg_fft_resolution", "Music Visualizer Resolution; 320x240|320x180" },
-      { "ffmpeg_fft_multisample", "FFT Multisample; 1x|2x|4x" },
-#endif
-#endif
-      { "ffmpeg_color_space", "Colorspace; auto|BT.709|BT.601|FCC|SMPTE240M" },
-      { NULL, NULL },
-   };
-   struct retro_log_callback log;
-
    CORE_PREFIX(environ_cb) = cb;
 
-   cb(RETRO_ENVIRONMENT_SET_VARIABLES, (void*)vars);
+   struct retro_core_option_v2_category option_categories[] =
+   {
+      {"music", "Music", "Music Settings"},
+      {"video", "Video", "Video settings"},
+      {NULL, NULL, NULL}
+   };
+
+   struct retro_core_option_v2_definition option_definitions[] =
+   {
+#if ENABLE_HW_ACCEL
+      {
+         "ffmpeg_hw_decoder", "Hardware Decoder (restart)", NULL, "Requires Restart", NULL, "video",
+         {
+            {"off", "Disabled"},
+            {"auto", "Automatic"},
+            {"cuda", "CUDA"},
+            {"d3d11va", "D3D11VA"},
+            {"dxva2", "DXVA2"},
+            {"drm", "DRM"},
+            {"mediacodec", "MediaCodec"},
+            {"opencl", "OpenCL"},
+            {"qsv", "QSV"},
+            {"vaapi", "VAAPI"},
+            {"vdpau", "VDPAU"},
+            {"videotoolbox", "VideoToolbox"},
+            {NULL, NULL}
+         }, "off"
+      },
+#endif
+      {
+         "ffmpeg_sw_decoder_threads", "Software Decoder Threads (restart)", NULL, "Requires Restart", NULL, "video",
+         {
+            {"auto", "Automatic"},
+            {"1", NULL},
+            {"2", NULL},
+            {"4", NULL},
+            {"6", NULL},
+            {"8", NULL},
+            {"10", NULL},
+            {"12", NULL},
+            {"14", NULL},
+            {"16", NULL},
+            {NULL, NULL}
+         }, "auto"
+      },
+      {
+         "ffmpeg_color_space", "Colorspace", NULL, NULL, NULL, "video",
+         {
+            {"auto", "Automatic"},
+            {"BT.709", NULL},
+            {"BT.601", NULL},
+            {"FCC", NULL},
+            {"SMPTE240M", NULL},
+            {NULL, NULL}
+         }, "auto"
+      },
+#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+      {
+         "ffmpeg_temporal_interp", "Temporal Interpolation", NULL, NULL, NULL, "music",
+         {
+            {"disabled", "Disabled"},
+            {"enabled", "Enabled"},
+            {NULL, NULL}
+         }, "disabled"
+      },
+#ifdef HAVE_GL_FFT
+      {
+         "ffmpeg_fft_resolution", "Visualizer Resolution", NULL, NULL, NULL, "music",
+         {
+            {"320x240", NULL},
+            {"320x180", NULL},
+            {NULL, NULL}
+         }, "320x240"
+      },
+      {
+         "ffmpeg_fft_multisample", "Visualizer Multisample", NULL, NULL, NULL, "music",
+         {
+            {"1x", NULL},
+            {"2x", NULL},
+            {"4x", NULL},
+            {NULL, NULL}
+         }, "1x"
+      },
+#endif
+#endif
+      { NULL, NULL, NULL, NULL, NULL, NULL, {{NULL, NULL}}, NULL }
+   };
+
+   struct retro_core_options_v2 options =
+   {
+      .categories = option_categories,
+      .definitions = option_definitions
+   };
+
+   cb(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_V2, &options);
+
+   struct retro_log_callback log;
 
    if (cb(RETRO_ENVIRONMENT_GET_LOG_INTERFACE, &log))
       log_cb = log.log;
