@@ -49,7 +49,7 @@ HAVE_ZLIB      = 0
 
 #Video support
 OPENGL 		  = 1
-HAVE_CODEC_HW = 0
+HAVE_CODEC_HW = 1
 
 CORE_DIR := .
 
