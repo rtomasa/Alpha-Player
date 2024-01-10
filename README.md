@@ -30,6 +30,7 @@ https://github.com/libretro/docs/blob/master/docs/library/ffmpeg.md
 - [X] Added ability to display current progress time when pressing A
 - [X] Added ability to display current progress % in addition to time stamps
 - [X] Disabled audio and subtitle track change when playing music
+- [X] Changed API shutdown request on media finish to blank screen
 - [X] Changed video audio track button mapping from L1 to Y
 - [X] Changed video subtitle track button mapping from R1 to X
 - [X] Changed some option labels and categorized by Music and Video
@@ -47,10 +48,9 @@ https://github.com/libretro/docs/blob/master/docs/library/ffmpeg.md
     - Controlar fin de video
     - Aspect ratio PIXEL PERFECT not working (need a new option for controlling in video)
     - Check HW h264 `decoders "ffmpeg -decoders | grep h264` -> h264_v4l2m2m
-    
+
     - [ ] Add M3U support
     - [ ] Use L2/R2 for next/last song/video in m3u
-    - [ ] Add option to loop
     - [ ] Add option to set resolution (Native, PAL, NTSC, 240p)
     - [ ] Add suport for aspect ratios (via custom libretro command?)
     - [ ] Remove FFmpeg messages
