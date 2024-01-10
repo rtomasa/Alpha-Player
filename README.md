@@ -22,14 +22,16 @@ https://github.com/libretro/docs/blob/master/docs/library/ffmpeg.md
 # Changelog
 
 - [X] Added libretro API core option v2 support (removed v0)
+- [X] Added new option to enable loop content
 - [X] Added ability to display video title on start
 - [X] Added ability to display music title on start
-- [X] Added ability to display audio track title on change
+- [X] Added ability to display video audio track title when changing
 - [X] Added ability to display music or video title when pressing B
-- [X] Added ability to display current progress when pressing A
-- [X] Removed audio and subtitle track change when playing music
-- [X] Changed audio track mapping button from L1 to Y
-- [X] Changed subtitle track mapping button from R1 to X
+- [X] Added ability to display current progress time when pressing A
+- [X] Added ability to display current progress % in addition to time stamps
+- [X] Disabled audio and subtitle track change when playing music
+- [X] Changed video audio track button mapping from L1 to Y
+- [X] Changed video subtitle track button mapping from R1 to X
 - [X] Changed some option labels and categorized by Music and Video
 - [X] Changed Audio Visualizer Resolution (FFT Resolution) option values:
     * 320x240 for 4:3

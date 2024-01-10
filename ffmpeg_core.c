@@ -89,6 +89,8 @@ static AVFormatContext *fctx;
 static AVCodecContext *vctx;
 static int video_stream_index;
 static enum AVColorSpace colorspace;
+static bool loopcontent;
+AVPacket *pkt;
 
 static unsigned sw_decoder_threads;
 static unsigned sw_sws_threads;
@@ -383,6 +385,14 @@ void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
       },
 #endif
       {
+         "ffmpeg_loop_content", "Loop", NULL, NULL, NULL, NULL,
+         {
+            {"disabled", "Disabled"},
+            {"enabled", "Enabled"},
+            {NULL, NULL}
+         }, "disabled"
+      },
+      {
          "ffmpeg_sw_decoder_threads", "Software Decoder Threads (restart)", NULL, "Requires Restart", NULL, "video",
          {
             {"auto", "Automatic"},
@@ -501,6 +511,7 @@ static void check_variables(bool firststart)
    struct retro_variable hw_var  = {0};
    struct retro_variable sw_threads_var = {0};
    struct retro_variable color_var  = {0};
+   struct retro_variable loop_content  = {0};
 #if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
    struct retro_variable var        = {0};
 #endif
@@ -559,6 +570,15 @@ static void check_variables(bool firststart)
       else
          colorspace = AVCOL_SPC_UNSPECIFIED;
       slock_unlock(decode_thread_lock);
+   }
+
+   loop_content.key = "ffmpeg_loop_content";
+   if (CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_GET_VARIABLE, &loop_content) && loop_content.value)
+   {
+      if (string_is_equal(loop_content.value, "enabled"))
+         loopcontent = true;
+      else
+         loopcontent = false;
    }
 
 #if ENABLE_HW_ACCEL
@@ -670,13 +690,8 @@ static void seek_frame(int seek_frames)
          frame_cnt += seek_frames_capped;
    }
 
-   if (seek_frames == 0)
-      do_seek = false;
-   else
-   {
-      do_seek = true;
-      slock_lock(fifo_lock);
-   }
+   do_seek = true;
+   slock_lock(fifo_lock);
    seek_time      = frame_cnt / media.interpolate_fps;
 
    /* Convert seek time to a printable format */
@@ -686,10 +701,6 @@ static void seek_frame(int seek_frames)
    seek_hours    = seek_minutes / 60;
    seek_minutes %= 60;
 
-   snprintf(msg, sizeof(msg), "%02d:%02d:%02d / %02d:%02d:%02d",
-         seek_hours, seek_minutes, seek_seconds,
-         media.duration.hours, media.duration.minutes, media.duration.seconds);
-
    /* Get current progress */
    if (media.duration.time > 0.0)
    {
@@ -697,6 +708,11 @@ static void seek_frame(int seek_frames)
       seek_progress = (seek_progress < -1)  ? -1  : seek_progress;
       seek_progress = (seek_progress > 100) ? 100 : seek_progress;
    }
+
+   snprintf(msg, sizeof(msg), "%02d:%02d:%02d / %02d:%02d:%02d (%d%%)",
+         seek_hours, seek_minutes, seek_seconds,
+         media.duration.hours, media.duration.minutes, media.duration.seconds,
+         seek_progress);
 
    /* Send message to frontend */
    msg_obj.msg      = msg;
@@ -708,29 +724,95 @@ static void seek_frame(int seek_frames)
    msg_obj.progress = seek_progress;
    CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
 
-   if (do_seek)
+   if (seek_frames_capped < 0)
    {
-      if (seek_frames_capped < 0)
-      {
-         log_cb(RETRO_LOG_INFO, "[FFMPEG] Resetting PTS.\n");
-         frames[0].pts = 0.0;
-         frames[1].pts = 0.0;
-      }
-      audio_frames = frame_cnt * media.sample_rate / media.interpolate_fps;
-
-      if (audio_decode_fifo)
-         fifo_clear(audio_decode_fifo);
-      scond_signal(fifo_decode_cond);
-
-      while (!decode_thread_dead && do_seek)
-      {
-         main_sleeping = true;
-         scond_wait(fifo_cond, fifo_lock);
-         main_sleeping = false;
-      }
-
-      slock_unlock(fifo_lock);
+      log_cb(RETRO_LOG_INFO, "[FFMPEG] Resetting PTS.\n");
+      frames[0].pts = 0.0;
+      frames[1].pts = 0.0;
    }
+   audio_frames = frame_cnt * media.sample_rate / media.interpolate_fps;
+
+   if (audio_decode_fifo)
+      fifo_clear(audio_decode_fifo);
+   scond_signal(fifo_decode_cond);
+
+   while (!decode_thread_dead && do_seek)
+   {
+      main_sleeping = true;
+      scond_wait(fifo_cond, fifo_lock);
+      main_sleeping = false;
+   }
+
+   slock_unlock(fifo_lock);
+}
+
+static void dispaly_time()
+{
+   char msg[256];
+   struct retro_message_ext msg_obj = {0};
+   
+   msg[0] = '\0';
+
+   // Getting total duration
+   double total_duration = (double)fctx->duration / AV_TIME_BASE;
+
+   int media_type = get_media_type();
+   double current_time = 0.0;
+
+   if (media_type == MEDIA_TYPE_VIDEO)
+   {
+      AVRational time_base = fctx->streams[video_stream_index]->time_base;
+      // Convert the 'pts' to seconds
+      current_time = av_q2d(time_base) * pkt->pts;
+   }
+   else if (media_type == MEDIA_TYPE_AUDIO)
+   {
+      int audio_stream_index = audio_streams[audio_streams_ptr];
+      AVRational time_base = fctx->streams[audio_stream_index]->time_base;
+      // Convert the 'pts' to seconds
+      current_time = av_q2d(time_base) * pkt->pts;
+   }
+   else
+      return;
+
+   // If you need to handle the case where 'pts' is AV_NOPTS_VALUE (unspecified)
+   if (pkt->pts == AV_NOPTS_VALUE) {
+      // Handle this case as needed, e.g., by using another timestamp or a default value
+      return;
+   }
+
+   // Calculate hours, minutes, and seconds for current time
+   int current_hours = (int)current_time / 3600;
+   int current_minutes = ((int)current_time % 3600) / 60;
+   int current_seconds = (int)current_time % 60;
+
+   // Calculate hours, minutes, and seconds for total duration
+   int total_hours = (int)total_duration / 3600;
+   int total_minutes = ((int)total_duration % 3600) / 60;
+   int total_seconds = (int)total_duration % 60;
+
+   // Calculate Progress
+   double progress = 0.0;
+   if (total_duration > 0) {
+      progress = (current_time / total_duration) * 100.0;
+   }
+   if (progress < 0.0) progress = 0.0;
+   if (progress > 100.0) progress = 100.0;
+
+   // Print the formatted time
+   snprintf(msg, sizeof(msg), "%02d:%02d:%02d / %02d:%02d:%02d (%d%%)",
+            current_hours, current_minutes, current_seconds,
+            total_hours, total_minutes, total_seconds, (int)progress);
+
+   /* Send message to frontend */
+   msg_obj.msg      = msg;
+   msg_obj.duration = 2000;
+   msg_obj.priority = 3;
+   msg_obj.level    = RETRO_LOG_INFO;
+   msg_obj.target   = RETRO_MESSAGE_TARGET_ALL;
+   msg_obj.type     = RETRO_MESSAGE_TYPE_PROGRESS;
+   msg_obj.progress = progress;
+   CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
 }
 
 void CORE_PREFIX(retro_run)(void)
@@ -815,7 +897,7 @@ void CORE_PREFIX(retro_run)(void)
    if (b && !last_b)
       display_media_title();
    if (a && !last_a)
-      seek_frame(0);
+      dispaly_time();
 
    /* Seek and subtitles */
 
@@ -1965,7 +2047,7 @@ static void decode_thread(void *data)
       double next_video_end   = 0.0;
       double next_audio_start = 0.0;
 
-      AVPacket *pkt = av_packet_alloc();
+      pkt = av_packet_alloc();
       AVCodecContext *actx_active = NULL;
       AVCodecContext *sctx_active = NULL;
 
@@ -2069,8 +2151,29 @@ static void decode_thread(void *data)
 
       if (packet_buffer_empty(audio_packet_buffer) && packet_buffer_empty(video_packet_buffer) && eof)
       {
-         av_packet_free(&pkt);
-         break;
+         if (loopcontent)  // Check if loopcontent is true
+         {
+            // Reset playback to the start of the media
+            slock_lock(fifo_lock);
+            do_seek = true;
+            seek_time = 0.0;
+            eof = false;  // Reset EOF flag
+            slock_unlock(fifo_lock);
+
+            // Reset other necessary variables
+            next_video_end = 0.0;
+            next_audio_start = 0.0;
+            last_audio_end = 0.0;
+            // Possibly clear and reset packet buffers, etc.
+
+            av_packet_free(&pkt);
+            continue;  // Continue the loop instead of breaking
+         }
+         else
+         {
+            av_packet_free(&pkt);
+            break;  // Keep existing behavior when loopcontent is false
+         }
       }
 
       // Read the next frame and stage it in case of audio or video frame.
