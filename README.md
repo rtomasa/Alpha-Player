@@ -21,13 +21,18 @@ https://github.com/libretro/docs/blob/master/docs/library/ffmpeg.md
 
 # Changelog
 
+- [X] Added ability to display video title on start
+- [X] Added ability to display music title on start
+- [X] Added ability to display audio track title on change (L1)
+- [X] Removed audio and subtitle track change for music (L1/R1)
 - [X] Changed API core option v0 to v2
 - [X] Changed some option labels and categorized by Music and Video
 - [X] Changed Audio Visualizer Resolution (FFT Resolution) option values:
     * 320x240 for 4:3
     * 320x180 for 16:9
 - [X] Changed HW decoder default value to Auto
-- [X] Change seek time from 10 to 15 (left/right) and from 60 to 180 (up/down)
+- [X] Changed seek time from 10 to 15 (left/right) and from 60 to 180 (up/down)
+- [X] Changed audio track OSD message to also display the track name
 - [X] Fixed Fast Fourier Transform (FFT) bug preventing frontend from being displayed
 
 <!--
@@ -42,10 +47,9 @@ https://github.com/libretro/docs/blob/master/docs/library/ffmpeg.md
     - [ ] Use A to display current time
     - [ ] Use Y to change audio track
     - [ ] Use X to display suntitles
-    - [ ] Show internal title on start
-    - [ ] Show audio track name instead of track number
     - [ ] Add M3U support
     - [ ] Add option to loop
     - [ ] Add option to set resolution (Native, PAL, NTSC, 240p)
     - [ ] Add suport for aspect ratios (via custom libretro command?)
+    - [ ] Remove FFmpeg messages
 -->

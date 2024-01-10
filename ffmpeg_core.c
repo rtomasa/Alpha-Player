@@ -187,12 +187,19 @@ static GLint tex_loc;
 static GLint mix_loc;
 #endif
 
+enum media_type {
+    MEDIA_TYPE_UNKNOWN = -1,
+    MEDIA_TYPE_VIDEO,
+    MEDIA_TYPE_AUDIO
+};
+
 static struct
 {
    double interpolate_fps;
    unsigned width;
    unsigned height;
    unsigned sample_rate;
+   AVDictionaryEntry *title;
 
    float aspect;
 
@@ -219,6 +226,20 @@ static void ass_msg_cb(int level, const char *fmt, va_list args, void *data)
    }
 }
 #endif
+
+static int get_media_type()
+{
+   int type;
+
+   if (audio_streams_num > 0 && video_stream_index < 0)
+      type = MEDIA_TYPE_AUDIO;
+   else if (video_stream_index >= 0)
+      type = MEDIA_TYPE_VIDEO;
+   else
+      type = MEDIA_TYPE_UNKNOWN;
+
+   return type;
+}
 
 static void append_attachment(const uint8_t *data, size_t size)
 {
@@ -765,7 +786,9 @@ void CORE_PREFIX(retro_run)(void)
       seek_frames += 300 * media.interpolate_fps;
 
 
-   if (l && !last_l && audio_streams_num > 0)
+   int media_type = get_media_type();
+
+   if (media_type == MEDIA_TYPE_VIDEO && l && !last_l && audio_streams_num > 0)
    {
       char msg[256];
       struct retro_message_ext msg_obj = {0};
@@ -776,7 +799,26 @@ void CORE_PREFIX(retro_run)(void)
       audio_streams_ptr = (audio_streams_ptr + 1) % audio_streams_num;
       slock_unlock(decode_thread_lock);
 
-      snprintf(msg, sizeof(msg), "Audio Track #%d", audio_streams_ptr);
+      int audio_stream_index = audio_streams[audio_streams_ptr];
+
+      AVDictionaryEntry *tag = NULL;
+
+      if (fctx->streams[audio_stream_index]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+      {
+            tag = av_dict_get(fctx->streams[audio_stream_index]->metadata, "title", NULL, 0);
+            if (tag)
+            {
+               snprintf(msg, sizeof(msg), "%s #%d", tag->value, audio_streams_ptr);
+            }
+            else
+            {
+               snprintf(msg, sizeof(msg), "Audio Track #%d", audio_streams_ptr);
+            }
+      }
+      else
+      {
+         snprintf(msg, sizeof(msg), "Audio Track #%d", audio_streams_ptr);
+      }
 
       msg_obj.msg      = msg;
       msg_obj.duration = 3000;
@@ -787,7 +829,7 @@ void CORE_PREFIX(retro_run)(void)
       msg_obj.progress = -1;
       CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
    }
-   else if (r && !last_r && subtitle_streams_num > 0)
+   else if (media_type == MEDIA_TYPE_VIDEO && r && !last_r && subtitle_streams_num > 0)
    {
       char msg[256];
       struct retro_message_ext msg_obj = {0};
@@ -1419,6 +1461,47 @@ static bool init_media_info(void)
          media.duration.seconds = 0;
          log_cb(RETRO_LOG_ERROR, "[FFMPEG] Could not determine media duration\n");
       }
+   }
+
+   int type = get_media_type();
+
+   switch (type)
+   {
+      case MEDIA_TYPE_AUDIO:
+      {
+         for (int i = 0; i < fctx->nb_streams; i++)
+         {
+            if (fctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+            {
+               media.title = av_dict_get(fctx->streams[i]->metadata, "title", NULL, 0);
+            }
+         }
+         break;
+      }
+      case MEDIA_TYPE_VIDEO:
+         media.title = av_dict_get(fctx->metadata, "title", media.title, 0);
+         break;
+      default:
+         break;
+   }
+
+   if (media.title)
+   {
+      char msg[256];
+      struct retro_message_ext msg_obj = {0};
+
+      msg[0] = '\0';
+
+      snprintf(msg, sizeof(msg), "%s", media.title->value);
+
+      msg_obj.msg      = msg;
+      msg_obj.duration = 5000;
+      msg_obj.priority = 1;
+      msg_obj.level    = RETRO_LOG_INFO;
+      msg_obj.target   = RETRO_MESSAGE_TARGET_ALL;
+      msg_obj.type     = RETRO_MESSAGE_TYPE_NOTIFICATION;
+      msg_obj.progress = -1;
+      CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
    }
 
 #ifdef HAVE_SSA
