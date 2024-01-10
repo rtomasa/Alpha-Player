@@ -21,11 +21,11 @@ https://github.com/libretro/docs/blob/master/docs/library/ffmpeg.md
 
 # Changelog
 
+- [X] Added libretro API core option v2 support (removed v0)
 - [X] Added ability to display video title on start
 - [X] Added ability to display music title on start
 - [X] Added ability to display audio track title on change (L1)
-- [X] Removed audio and subtitle track change for music (L1/R1)
-- [X] Changed API core option v0 to v2
+- [X] Removed audio and subtitle track change when playing music (L1/R1)
 - [X] Changed some option labels and categorized by Music and Video
 - [X] Changed Audio Visualizer Resolution (FFT Resolution) option values:
     * 320x240 for 4:3
