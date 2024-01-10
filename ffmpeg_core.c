@@ -241,6 +241,28 @@ static int get_media_type()
    return type;
 }
 
+static void display_media_title()
+{
+   if (media.title)
+   {
+      char msg[256];
+      struct retro_message_ext msg_obj = {0};
+
+      msg[0] = '\0';
+
+      snprintf(msg, sizeof(msg), "%s", media.title->value);
+
+      msg_obj.msg      = msg;
+      msg_obj.duration = 5000;
+      msg_obj.priority = 1;
+      msg_obj.level    = RETRO_LOG_INFO;
+      msg_obj.target   = RETRO_MESSAGE_TARGET_ALL;
+      msg_obj.type     = RETRO_MESSAGE_TYPE_NOTIFICATION;
+      msg_obj.progress = -1;
+      CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
+   }
+}
+
 static void append_attachment(const uint8_t *data, size_t size)
 {
    attachments = (struct attachment*)av_realloc(
@@ -648,8 +670,13 @@ static void seek_frame(int seek_frames)
          frame_cnt += seek_frames_capped;
    }
 
-   slock_lock(fifo_lock);
-   do_seek        = true;
+   if (seek_frames == 0)
+      do_seek = false;
+   else
+   {
+      do_seek = true;
+      slock_lock(fifo_lock);
+   }
    seek_time      = frame_cnt / media.interpolate_fps;
 
    /* Convert seek time to a printable format */
@@ -681,26 +708,29 @@ static void seek_frame(int seek_frames)
    msg_obj.progress = seek_progress;
    CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
 
-   if (seek_frames_capped < 0)
+   if (do_seek)
    {
-      log_cb(RETRO_LOG_INFO, "[FFMPEG] Resetting PTS.\n");
-      frames[0].pts = 0.0;
-      frames[1].pts = 0.0;
+      if (seek_frames_capped < 0)
+      {
+         log_cb(RETRO_LOG_INFO, "[FFMPEG] Resetting PTS.\n");
+         frames[0].pts = 0.0;
+         frames[1].pts = 0.0;
+      }
+      audio_frames = frame_cnt * media.sample_rate / media.interpolate_fps;
+
+      if (audio_decode_fifo)
+         fifo_clear(audio_decode_fifo);
+      scond_signal(fifo_decode_cond);
+
+      while (!decode_thread_dead && do_seek)
+      {
+         main_sleeping = true;
+         scond_wait(fifo_cond, fifo_lock);
+         main_sleeping = false;
+      }
+
+      slock_unlock(fifo_lock);
    }
-   audio_frames = frame_cnt * media.sample_rate / media.interpolate_fps;
-
-   if (audio_decode_fifo)
-      fifo_clear(audio_decode_fifo);
-   scond_signal(fifo_decode_cond);
-
-   while (!decode_thread_dead && do_seek)
-   {
-      main_sleeping = true;
-      scond_wait(fifo_cond, fifo_lock);
-      main_sleeping = false;
-   }
-
-   slock_unlock(fifo_lock);
 }
 
 void CORE_PREFIX(retro_run)(void)
@@ -709,13 +739,17 @@ void CORE_PREFIX(retro_run)(void)
    static bool last_right;
    static bool last_up;
    static bool last_down;
+   static bool last_a;
+   static bool last_b;
+   static bool last_x;
+   static bool last_y;
    static bool last_l;
    static bool last_r;
    static bool last_l2;
    static bool last_r2;
    double min_pts;
    int16_t audio_buffer[2048];
-   bool left, right, up, down, l, r, l2, r2;
+   bool left, right, up, down, a, b, x, y, l, r, l2, r2;
    int16_t ret                  = 0;
    size_t to_read_frames        = 0;
    int seek_frames              = 0;
@@ -767,10 +801,23 @@ void CORE_PREFIX(retro_run)(void)
    right = ret & (1 << RETRO_DEVICE_ID_JOYPAD_RIGHT);
    up    = ret & (1 << RETRO_DEVICE_ID_JOYPAD_UP);
    down  = ret & (1 << RETRO_DEVICE_ID_JOYPAD_DOWN);
+   a     = ret & (1 << RETRO_DEVICE_ID_JOYPAD_A);
+   b     = ret & (1 << RETRO_DEVICE_ID_JOYPAD_B);
+   x     = ret & (1 << RETRO_DEVICE_ID_JOYPAD_X);
+   y     = ret & (1 << RETRO_DEVICE_ID_JOYPAD_Y);
    l     = ret & (1 << RETRO_DEVICE_ID_JOYPAD_L);
    r     = ret & (1 << RETRO_DEVICE_ID_JOYPAD_R);
    l2    = ret & (1 << RETRO_DEVICE_ID_JOYPAD_L2);
    r2    = ret & (1 << RETRO_DEVICE_ID_JOYPAD_R2);
+
+   /* Display info */
+
+   if (b && !last_b)
+      display_media_title();
+   if (a && !last_a)
+      seek_frame(0);
+
+   /* Seek and subtitles */
 
    if (left && !last_left)
       seek_frames -= 15 * media.interpolate_fps;
@@ -788,7 +835,7 @@ void CORE_PREFIX(retro_run)(void)
 
    int media_type = get_media_type();
 
-   if (media_type == MEDIA_TYPE_VIDEO && l && !last_l && audio_streams_num > 0)
+   if (media_type == MEDIA_TYPE_VIDEO && y && !last_y && audio_streams_num > 0)
    {
       char msg[256];
       struct retro_message_ext msg_obj = {0};
@@ -829,7 +876,7 @@ void CORE_PREFIX(retro_run)(void)
       msg_obj.progress = -1;
       CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
    }
-   else if (media_type == MEDIA_TYPE_VIDEO && r && !last_r && subtitle_streams_num > 0)
+   else if (media_type == MEDIA_TYPE_VIDEO && x && !last_x && subtitle_streams_num > 0)
    {
       char msg[256];
       struct retro_message_ext msg_obj = {0};
@@ -856,6 +903,10 @@ void CORE_PREFIX(retro_run)(void)
    last_right = right;
    last_up    = up;
    last_down  = down;
+   last_a     = a;
+   last_b     = b;
+   last_x     = x;
+   last_y     = y;
    last_l     = l;
    last_r     = r;
    last_l2    = l2;
@@ -1485,24 +1536,7 @@ static bool init_media_info(void)
          break;
    }
 
-   if (media.title)
-   {
-      char msg[256];
-      struct retro_message_ext msg_obj = {0};
-
-      msg[0] = '\0';
-
-      snprintf(msg, sizeof(msg), "%s", media.title->value);
-
-      msg_obj.msg      = msg;
-      msg_obj.duration = 5000;
-      msg_obj.priority = 1;
-      msg_obj.level    = RETRO_LOG_INFO;
-      msg_obj.target   = RETRO_MESSAGE_TARGET_ALL;
-      msg_obj.type     = RETRO_MESSAGE_TYPE_NOTIFICATION;
-      msg_obj.progress = -1;
-      CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
-   }
+   display_media_title();
 
 #ifdef HAVE_SSA
    if (sctx[0])
