@@ -23,6 +23,7 @@ extern "C" {
 #include <libavutil/imgutils.h>
 #include <libavutil/time.h>
 #include <libavutil/opt.h>
+#include <libavutil/log.h>
 #ifdef HAVE_SWRESAMPLE
 #include <libswresample/swresample.h>
 #endif
@@ -2448,6 +2449,21 @@ void CORE_PREFIX(retro_unload_game)(void)
 
 bool CORE_PREFIX(retro_load_game)(const struct retro_game_info *info)
 {
+   /*
+      AV_LOG_QUIET: No messages are printed.
+      AV_LOG_PANIC: Only panics, which are very serious errors like an application crash, are printed.
+      AV_LOG_FATAL: Fatal errors are printed.
+      AV_LOG_ERROR: Errors are printed.
+      AV_LOG_WARNING: Warnings are printed.
+      AV_LOG_INFO: Informational messages are printed (default level).
+      AV_LOG_VERBOSE: Verbose messages are printed.
+      AV_LOG_DEBUG: Debugging messages are printed.
+   */
+#ifdef DEBUG
+   av_log_set_level(AV_LOG_VERBOSE);
+#else
+   av_log_set_level(AV_LOG_QUIET);
+#endif
    int ret = 0;
    bool is_fft = false;
    enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;

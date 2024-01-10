@@ -131,6 +131,10 @@ ifeq ($(HAVE_SSA), 1)
    DEFINES += -DHAVE_SSA
 endif
 
+ifeq ($(DEBUG), 1)
+   DEFINES += -DDEBUG
+endif
+
 ifeq ($(BAKE_IN_FFMPEG),1)
 DEFINES += -DHAVE_GMTIME_R -DHAVE_LOCALTIME_R
 
