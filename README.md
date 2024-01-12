@@ -22,6 +22,11 @@ https://github.com/libretro/docs/blob/master/docs/library/ffmpeg.md
 # Changelog
 
 - [X] Added libretro API core option v2 support (removed v0)
+- [X] Added new option to select video output resolution (refresh rate keeps native)
+    * Native
+    * PAL (576)
+    * NTSC (480)
+    * VGA (240)
 - [X] Added new option to enable loop content
 - [X] Added compilation flag to enable/disable FFmpeg debug messages
 - [X] Added ability to display video title on start

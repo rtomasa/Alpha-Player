@@ -92,6 +92,8 @@ static int video_stream_index;
 static enum AVColorSpace colorspace;
 static bool loopcontent;
 AVPacket *pkt;
+static int option_width = 320;
+static int option_height = 240;
 
 static unsigned sw_decoder_threads;
 static unsigned sw_sws_threads;
@@ -176,6 +178,8 @@ struct frame
 #endif
    double pts;
 };
+
+#define INFO_RESTART "Requires Restart"
 
 static struct frame frames[2];
 
@@ -321,7 +325,7 @@ void CORE_PREFIX(retro_set_controller_port_device)(unsigned port, unsigned devic
 void CORE_PREFIX(retro_get_system_info)(struct retro_system_info *info)
 {
    memset(info, 0, sizeof(*info));
-   info->library_name     = "FFmpeg";
+   info->library_name     = "RePlay Player";
    info->library_version  = "v1";
    info->need_fullpath    = true;
    info->valid_extensions = "mkv|avi|f4v|f4f|3gp|ogm|flv|mp4|mp3|flac|ogg|m4a|webm|3g2|mov|wmv|mpg|mpeg|vob|asf|divx|m2p|m2ts|ps|ts|mxf|wma|wav";
@@ -344,12 +348,34 @@ void CORE_PREFIX(retro_get_system_av_info)(struct retro_system_av_info *info)
       aspect = 16.0 / 9.0;
    }
 #endif
-
-   info->geometry.base_width   = width;
-   info->geometry.base_height  = height;
-   info->geometry.max_width    = width;
-   info->geometry.max_height   = height;
+   info->geometry.base_width   = option_width;
+   info->geometry.base_height  = option_height;
+   
    info->geometry.aspect_ratio = aspect;
+
+   struct retro_variable video_resolution  = {0};
+   video_resolution.key = "ffmpeg_video_resolution";
+   if (CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_GET_VARIABLE, &video_resolution) && video_resolution.value)
+   {
+      if (string_is_equal(video_resolution.value, "native")) {
+         option_width = media.width;
+         option_height = media.height;
+      }
+      else if (string_is_equal(video_resolution.value, "pal")) {
+         option_width = 720;
+         option_height = 576;
+      }
+      else if (string_is_equal(video_resolution.value, "ntsc")) {
+         option_width = 720;
+         option_height = 480;
+      }
+      else if (string_is_equal(video_resolution.value, "vga")) {
+         option_width = 320;
+         option_height = 240;
+      }
+   }
+   info->geometry.max_width    = option_width;
+   info->geometry.max_height   = option_height;
 }
 
 void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
@@ -365,9 +391,18 @@ void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
 
    struct retro_core_option_v2_definition option_definitions[] =
    {
+      {
+         "ffmpeg_video_resolution", "Resolution (restart)", NULL, INFO_RESTART, NULL, "video",
+         {
+            {"native", "Native"},
+            {"pal", "PAL (576)"},
+            {"ntsc", "NTSC (480)"},
+            {"vga", "VGA (240)"}
+         }, "native"
+      },
 #if ENABLE_HW_ACCEL
       {
-         "ffmpeg_hw_decoder", "Hardware Decoder (restart)", NULL, "Requires Restart", NULL, "video",
+         "ffmpeg_hw_decoder", "Hardware Decoder (restart)", NULL, INFO_RESTART, NULL, "video",
          {
             {"off", "Disabled"},
             {"auto", "Automatic"},
@@ -394,7 +429,7 @@ void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
          }, "disabled"
       },
       {
-         "ffmpeg_sw_decoder_threads", "Software Decoder Threads (restart)", NULL, "Requires Restart", NULL, "video",
+         "ffmpeg_sw_decoder_threads", "Software Decoder Threads (restart)", NULL, INFO_RESTART, NULL, "video",
          {
             {"auto", "Automatic"},
             {"1", NULL},
@@ -535,8 +570,8 @@ static void check_variables(bool firststart)
 #ifdef HAVE_GL_FFT
    fft_var.key = "ffmpeg_fft_resolution";
 
-   fft_width       = 1280;
-   fft_height      = 720;
+   fft_width       = 320;
+   fft_height      = 240;
    fft_multisample = 1;
    if (CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_GET_VARIABLE, &fft_var) && fft_var.value)
    {
@@ -1146,7 +1181,8 @@ void CORE_PREFIX(retro_run)(void)
          glBindFramebuffer(GL_FRAMEBUFFER, hw_render.get_current_framebuffer());
          glClearColor(0, 0, 0, 1);
          glClear(GL_COLOR_BUFFER_BIT);
-         glViewport(0, 0, media.width, media.height);
+         glViewport(0, 0, option_width, option_height);
+
          glUseProgram(prog);
 
          glUniform1f(mix_loc, mix_factor);
@@ -1176,7 +1212,7 @@ void CORE_PREFIX(retro_run)(void)
 
          /* Draw video using OGL*/
          CORE_PREFIX(video_cb)(RETRO_HW_FRAME_BUFFER_VALID,
-               media.width, media.height, media.width * sizeof(uint32_t));
+               option_width, option_height, option_width * sizeof(uint32_t));
       }
       else
 #endif
@@ -1213,7 +1249,7 @@ void CORE_PREFIX(retro_run)(void)
 
          /* Draw video not using OGL */
          CORE_PREFIX(video_cb)(dupe ? NULL : video_frame_temp_buffer,
-               media.width, media.height, media.width * sizeof(uint32_t));
+               option_width, option_height, option_width * sizeof(uint32_t));
       }
    }
 #if defined(HAVE_GL_FFT) && (defined(HAVE_OPENGL) || defined(HAVE_OPENGLES))
@@ -1583,6 +1619,12 @@ static bool init_media_info(void)
       media.height = vctx->height;
       media.aspect = (float)vctx->width *
          av_q2d(vctx->sample_aspect_ratio) / vctx->height;
+      
+      if (option_width == 0 || option_height == 0)
+      {
+         option_width = media.width;
+         option_height = media.height;
+      }
    }
 
    if (fctx)
