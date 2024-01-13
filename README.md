@@ -1,4 +1,4 @@
-# RePlay-Player
+# Media-Player
 
 A port of the powerful audio/video encoding/decoding library FFmpeg to libretro. This core allows playback of a variety of audio and video formats, with a fancy audio visualizer and the ability to do interframe blending for smoother scrolling of non-native framerates.
 
@@ -8,7 +8,7 @@ This is a project based on libretro FFmpeg core used by Retroarch. Since the ori
 
 # Author/License
 
-RePlay-Player FFmpeg based project is authored by
+Media-Player FFmpeg based project is authored by
 
 * Fabrice Bellard
 * FFmpeg team
