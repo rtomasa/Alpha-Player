@@ -27,6 +27,7 @@ https://github.com/libretro/docs/blob/master/docs/library/ffmpeg.md
     * PAL (576)
     * NTSC (480)
     * VGA (240)
+- [X] Added internal variable to prevent CRT TV from setting Native video resolution
 - [X] Added new option to enable loop content
 - [X] Added compilation flag to enable/disable FFmpeg debug messages
 - [X] Added ability to display video title on start
@@ -54,7 +55,6 @@ https://github.com/libretro/docs/blob/master/docs/library/ffmpeg.md
 - [ ] Check HW h264 `decoders "ffmpeg -decoders | grep h264` -> h264_v4l2m2m
 - [ ] Add M3U support
 - [ ] Use L2/R2 for next/last song/video in m3u
-- [ ] Add option to set resolution (Native, PAL, NTSC, 240p)
 - [ ] Add suport for aspect ratios (via custom libretro command?)
 - [ ] Fix bug
     [dca @ 0x558a792630] Not a valid DCA frame

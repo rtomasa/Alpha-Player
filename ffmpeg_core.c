@@ -91,6 +91,7 @@ static AVCodecContext *vctx;
 static int video_stream_index;
 static enum AVColorSpace colorspace;
 static bool loopcontent;
+static bool is_crt = false;
 AVPacket *pkt;
 static int option_width = 320;
 static int option_height = 240;
@@ -325,7 +326,7 @@ void CORE_PREFIX(retro_set_controller_port_device)(unsigned port, unsigned devic
 void CORE_PREFIX(retro_get_system_info)(struct retro_system_info *info)
 {
    memset(info, 0, sizeof(*info));
-   info->library_name     = "RePlay Player";
+   info->library_name     = "Media Player";
    info->library_version  = "v1";
    info->need_fullpath    = true;
    info->valid_extensions = "mkv|avi|f4v|f4f|3gp|ogm|flv|mp4|mp3|flac|ogg|m4a|webm|3g2|mov|wmv|mpg|mpeg|vob|asf|divx|m2p|m2ts|ps|ts|mxf|wma|wav";
@@ -335,47 +336,45 @@ void CORE_PREFIX(retro_get_system_av_info)(struct retro_system_av_info *info)
 {
    unsigned width  = vctx ? media.width : 320;
    unsigned height = vctx ? media.height : 240;
-   float aspect    = vctx ? media.aspect : 0.0;
+   float aspect    = vctx ? media.aspect : (float)width / (float)height;
 
-   info->timing.fps = media.interpolate_fps;
-   info->timing.sample_rate = actx[0] ? media.sample_rate : 32000.0;
-
+   struct retro_variable video_resolution  = {0};
+   video_resolution.key = "mplayer_video_resolution";
+   if (CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_GET_VARIABLE, &video_resolution) && video_resolution.value)
+   {
+      if (string_is_equal(video_resolution.value, "native") && !is_crt) {
+         option_width = width;
+         option_height = height;
+      }
+      else if (string_is_equal(video_resolution.value, "pal")) {
+         option_width = 576.0 * aspect;
+         option_height = 576;
+      }
+      else if (string_is_equal(video_resolution.value, "ntsc")) {
+         option_width = 480.0 * aspect;
+         option_height = 480;
+      }
+      else { // fallback to "vga"
+         option_width = 240.0 * aspect;
+         option_height = 240;
+      }
+   }
 #ifdef HAVE_GL_FFT
    if (audio_streams_num > 0 && video_stream_index < 0)
    {
       width = fft_width;
       height = fft_height;
-      aspect = 16.0 / 9.0;
+      aspect = (float)fft_width / (float)fft_height;
    }
 #endif
+   info->timing.fps = media.interpolate_fps;
+   info->timing.sample_rate = actx[0] ? media.sample_rate : 32000.0;
+
    info->geometry.base_width   = option_width;
    info->geometry.base_height  = option_height;
-   
-   info->geometry.aspect_ratio = aspect;
-
-   struct retro_variable video_resolution  = {0};
-   video_resolution.key = "ffmpeg_video_resolution";
-   if (CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_GET_VARIABLE, &video_resolution) && video_resolution.value)
-   {
-      if (string_is_equal(video_resolution.value, "native")) {
-         option_width = media.width;
-         option_height = media.height;
-      }
-      else if (string_is_equal(video_resolution.value, "pal")) {
-         option_width = 720;
-         option_height = 576;
-      }
-      else if (string_is_equal(video_resolution.value, "ntsc")) {
-         option_width = 720;
-         option_height = 480;
-      }
-      else if (string_is_equal(video_resolution.value, "vga")) {
-         option_width = 320;
-         option_height = 240;
-      }
-   }
    info->geometry.max_width    = option_width;
    info->geometry.max_height   = option_height;
+   info->geometry.aspect_ratio = (float)option_width / (float)option_height;
 }
 
 void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
@@ -392,9 +391,9 @@ void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
    struct retro_core_option_v2_definition option_definitions[] =
    {
       {
-         "ffmpeg_video_resolution", "Resolution (restart)", NULL, INFO_RESTART, NULL, "video",
+         "mplayer_video_resolution", "Resolution (restart)", NULL, INFO_RESTART, NULL, "video",
          {
-            {"native", "Native"},
+            {"native", "Native (LCD)"},
             {"pal", "PAL (576)"},
             {"ntsc", "NTSC (480)"},
             {"vga", "VGA (240)"}
@@ -402,7 +401,7 @@ void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
       },
 #if ENABLE_HW_ACCEL
       {
-         "ffmpeg_hw_decoder", "Hardware Decoder (restart)", NULL, INFO_RESTART, NULL, "video",
+         "mplayer_hw_decoder", "Hardware Decoder (restart)", NULL, INFO_RESTART, NULL, "video",
          {
             {"off", "Disabled"},
             {"auto", "Automatic"},
@@ -421,7 +420,7 @@ void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
       },
 #endif
       {
-         "ffmpeg_loop_content", "Loop", NULL, NULL, NULL, NULL,
+         "mplayer_loop_content", "Loop", NULL, NULL, NULL, NULL,
          {
             {"disabled", "Disabled"},
             {"enabled", "Enabled"},
@@ -429,7 +428,7 @@ void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
          }, "disabled"
       },
       {
-         "ffmpeg_sw_decoder_threads", "Software Decoder Threads (restart)", NULL, INFO_RESTART, NULL, "video",
+         "mplayer_sw_decoder_threads", "Software Decoder Threads (restart)", NULL, INFO_RESTART, NULL, "video",
          {
             {"auto", "Automatic"},
             {"1", NULL},
@@ -445,7 +444,7 @@ void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
          }, "auto"
       },
       {
-         "ffmpeg_color_space", "Colorspace", NULL, NULL, NULL, "video",
+         "mplayer_color_space", "Colorspace", NULL, NULL, NULL, "video",
          {
             {"auto", "Automatic"},
             {"BT.709", NULL},
@@ -457,7 +456,7 @@ void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
       },
 #if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
       {
-         "ffmpeg_temporal_interp", "Temporal Interpolation", NULL, NULL, NULL, "music",
+         "mplayer_temporal_interp", "Temporal Interpolation", NULL, NULL, NULL, "music",
          {
             {"disabled", "Disabled"},
             {"enabled", "Enabled"},
@@ -466,7 +465,7 @@ void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
       },
 #ifdef HAVE_GL_FFT
       {
-         "ffmpeg_fft_resolution", "Visualizer Resolution", NULL, NULL, NULL, "music",
+         "mplayer_fft_resolution", "Visualizer Resolution", NULL, NULL, NULL, "music",
          {
             {"320x240", NULL},
             {"320x180", NULL},
@@ -474,7 +473,7 @@ void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
          }, "320x240"
       },
       {
-         "ffmpeg_fft_multisample", "Visualizer Multisample", NULL, NULL, NULL, "music",
+         "mplayer_fft_multisample", "Visualizer Multisample", NULL, NULL, NULL, "music",
          {
             {"1x", NULL},
             {"2x", NULL},
@@ -548,6 +547,7 @@ static void check_variables(bool firststart)
    struct retro_variable sw_threads_var = {0};
    struct retro_variable color_var  = {0};
    struct retro_variable loop_content  = {0};
+   struct retro_variable replay_is_crt  = {0};
 #if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
    struct retro_variable var        = {0};
 #endif
@@ -557,7 +557,7 @@ static void check_variables(bool firststart)
 #endif
 
 #if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
-   var.key = "ffmpeg_temporal_interp";
+   var.key = "mplayer_temporal_interp";
 
    if (CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
    {
@@ -568,7 +568,7 @@ static void check_variables(bool firststart)
    }
 
 #ifdef HAVE_GL_FFT
-   fft_var.key = "ffmpeg_fft_resolution";
+   fft_var.key = "mplayer_fft_resolution";
 
    fft_width       = 320;
    fft_height      = 240;
@@ -583,14 +583,14 @@ static void check_variables(bool firststart)
       }
    }
 
-   fft_ms_var.key = "ffmpeg_fft_multisample";
+   fft_ms_var.key = "mplayer_fft_multisample";
 
    if (CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_GET_VARIABLE, &fft_ms_var) && fft_ms_var.value)
       fft_multisample = strtoul(fft_ms_var.value, NULL, 0);
 #endif
 #endif
 
-   color_var.key = "ffmpeg_color_space";
+   color_var.key = "mplayer_color_space";
 
    if (CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_GET_VARIABLE, &color_var) && color_var.value)
    {
@@ -608,7 +608,7 @@ static void check_variables(bool firststart)
       slock_unlock(decode_thread_lock);
    }
 
-   loop_content.key = "ffmpeg_loop_content";
+   loop_content.key = "mplayer_loop_content";
    if (CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_GET_VARIABLE, &loop_content) && loop_content.value)
    {
       if (string_is_equal(loop_content.value, "enabled"))
@@ -617,10 +617,19 @@ static void check_variables(bool firststart)
          loopcontent = false;
    }
 
+   replay_is_crt.key = "replay_is_crt";
+   if (CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_GET_VARIABLE, &replay_is_crt) && replay_is_crt.value)
+   {
+      if (string_is_equal(replay_is_crt.value, "true"))
+         is_crt = true;
+      else
+         is_crt = false;
+   }
+
 #if ENABLE_HW_ACCEL
    if (firststart)
    {
-      hw_var.key = "ffmpeg_hw_decoder";
+      hw_var.key = "mplayer_hw_decoder";
 
       force_sw_decoder = false;
       hw_decoder = AV_HWDEVICE_TYPE_NONE;
@@ -657,7 +666,7 @@ static void check_variables(bool firststart)
 
    if (firststart)
    {
-      sw_threads_var.key = "ffmpeg_sw_decoder_threads";
+      sw_threads_var.key = "mplayer_sw_decoder_threads";
       if (CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_GET_VARIABLE, &sw_threads_var) && sw_threads_var.value)
       {
          if (string_is_equal(sw_threads_var.value, "auto"))
@@ -1179,6 +1188,7 @@ void CORE_PREFIX(retro_run)(void)
             mix_factor = 1.0f;
 
          glBindFramebuffer(GL_FRAMEBUFFER, hw_render.get_current_framebuffer());
+
          glClearColor(0, 0, 0, 1);
          glClear(GL_COLOR_BUFFER_BIT);
          glViewport(0, 0, option_width, option_height);

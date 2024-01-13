@@ -77,7 +77,7 @@ ARCH_X86 = 1
 ARCH_X86_64 = 1
 endif
 
-TARGET_NAME := replay_player
+TARGET_NAME := media_player
 
 GIT_VERSION ?= " $(shell git rev-parse --short HEAD || echo unknown)"
 ifneq ($(GIT_VERSION)," unknown")
