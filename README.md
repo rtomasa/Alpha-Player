@@ -19,6 +19,27 @@ Media-Player FFmpeg based project is authored by
 https://docs.libretro.com/library/ffmpeg/
 https://github.com/libretro/docs/blob/master/docs/library/ffmpeg.md
 
+# Compilation
+just execute `make` or make DEBUG=1 if you want a more verbose execution
+
+# IMPORTANT NOTE!!!
+This core has benn tested only in Raspberry Pi devices using a development version of RePlay OS
+
+# Controls
+
+* JOYPAD_LEFT - seek -15s
+* JOYPAD_RIGHT - seek +15s
+* JOYPAD_UP - seek +180s
+* JOYPAD_DOWN - seek -180s
+* JOYPAD_A - display progress
+* JOYPAD_B - display media title
+* JOYPAD_X - enable/disable video subtitles
+* JOYPAD_Y - change video lang audio track
+* JOYPAD_L - NOT SET (reserved for future m3u functionality)
+* JOYPAD_R - NOT SET (reserved for future m3u functionality)
+* JOYPAD_L2 - seek -300s
+* JOYPAD_R2 - seek +300s
+
 # Changelog
 
 - [X] Added libretro API core option v2 support (removed v0)
@@ -27,7 +48,7 @@ https://github.com/libretro/docs/blob/master/docs/library/ffmpeg.md
     * PAL (576)
     * NTSC (480)
     * VGA (240)
-- [X] Added internal variable to prevent CRT TV from setting Native video resolution
+- [X] Added internal variable to prevent CRT TV from setting Native video resolution (works only with RePlay OS)
 - [X] Added new option to enable loop content
 - [X] Added compilation flag to enable/disable FFmpeg debug messages
 - [X] Added ability to display video title on start
