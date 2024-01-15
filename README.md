@@ -23,7 +23,7 @@ https://github.com/libretro/docs/blob/master/docs/library/ffmpeg.md
 just execute `make` or make DEBUG=1 if you want a more verbose execution
 
 # IMPORTANT NOTE!!!
-This core has benn tested only in Raspberry Pi devices using a development version of RePlay OS
+This core has been tested only in Raspberry Pi devices using a development version of RePlay OS
 
 # Controls
 
@@ -70,11 +70,16 @@ This core has benn tested only in Raspberry Pi devices using a development versi
 - [X] Changed audio track OSD message to also display the track name
 - [X] Fixed Fast Fourier Transform (FFT) bug preventing frontend from being displayed
 
+# TODO
+
+- [ ] Add M3U support
+- [ ] Add L2/R2 functionality to do next/last song/video in m3u lists
+- [ ] Add ffmpeg HW h264 acceleration (h264_v4l2m2m???)
+- [ ] Fix deadlock when seeking in some movies
+
 <!--
 ## TODO
 - [ ] Check HW h264 `decoders "ffmpeg -decoders | grep h264` -> h264_v4l2m2m
-- [ ] Add M3U support
-- [ ] Use L2/R2 for next/last song/video in m3u
 - [ ] Fix bug
     [dca @ 0x558a792630] Not a valid DCA frame
     ERROR] [LRCORE] [FFMPEG] Can't decode audio packet: Invalid data found when processing input
