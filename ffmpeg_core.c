@@ -1085,7 +1085,6 @@ void CORE_PREFIX(retro_run)(void)
          scond_wait(fifo_cond, fifo_lock);
          main_sleeping = false;
       }
-
       reading_pts  = decode_last_audio_time -
          (double)FIFO_READ_AVAIL(audio_decode_fifo) / (media.sample_rate * sizeof(int16_t) * 2);
       expected_pts = (double)audio_frames / media.sample_rate;
@@ -1293,7 +1292,6 @@ void CORE_PREFIX(retro_run)(void)
       /* Draw music not using FFT and not using OGL */
       CORE_PREFIX(video_cb)(NULL, 1, 1, sizeof(uint32_t));
    }
-
    if (to_read_frames)
       CORE_PREFIX(audio_batch_cb)(audio_buffer, to_read_frames);
 }
@@ -2512,7 +2510,7 @@ bool CORE_PREFIX(retro_load_game)(const struct retro_game_info *info)
       AV_LOG_DEBUG: Debugging messages are printed.
    */
 #ifdef DEBUG
-   av_log_set_level(AV_LOG_VERBOSE);
+   av_log_set_level(AV_LOG_DEBUG);
 #else
    av_log_set_level(AV_LOG_QUIET);
 #endif

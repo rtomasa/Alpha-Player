@@ -51,11 +51,9 @@ https://github.com/libretro/docs/blob/master/docs/library/ffmpeg.md
 
 <!--
 ## TODO
-- [ ] Aspect ratio PIXEL PERFECT not working (need a new option for controlling in video options)
 - [ ] Check HW h264 `decoders "ffmpeg -decoders | grep h264` -> h264_v4l2m2m
 - [ ] Add M3U support
 - [ ] Use L2/R2 for next/last song/video in m3u
-- [ ] Add suport for aspect ratios (via custom libretro command?)
 - [ ] Fix bug
     [dca @ 0x558a792630] Not a valid DCA frame
     ERROR] [LRCORE] [FFMPEG] Can't decode audio packet: Invalid data found when processing input
