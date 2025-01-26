@@ -5,10 +5,7 @@
 
 #include <boolean.h>
 #include <stdint.h>
-
-#ifdef HAVE_SSA
 #include <ass/ass.h>
-#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -39,9 +36,7 @@ struct video_decoder_context
    AVFrame *source;
    AVFrame *hw_source;
    AVFrame *target;
-#ifdef HAVE_SSA
    ASS_Track *ass_track_active;
-#endif
    uint8_t *frame_buf;
    int index;
 };

@@ -18,6 +18,7 @@
         "stdlib.h": "c",
         "retro_common_api.h": "c",
         "retro_miscellaneous.h": "c",
-        "stdstring.h": "c"
+        "stdstring.h": "c",
+        "swresample.h": "c"
     }
 }

@@ -15,14 +15,8 @@
 #include <libavutil/opt.h>
 #include <libavutil/log.h>
 #include <libswresample/swresample.h>
-
-#ifdef HAVE_SSA
 #include <ass/ass.h>
-#endif
-
-#ifdef HAVE_GL_FFT
 #include "include/ffmpeg_fft.h"
-#endif
 
 #include <glsym/glsym.h>
 #include <features/features_cpu.h>
@@ -91,7 +85,6 @@ static int subtitle_streams[MAX_STREAMS];
 static int subtitle_streams_num;
 static int subtitle_streams_ptr;
 
-#ifdef HAVE_SSA
 /* AAS/SSA subtitles. */
 static ASS_Library *ass;
 static ASS_Renderer *ass_render;
@@ -99,7 +92,6 @@ static ASS_Track *ass_track[MAX_STREAMS];
 static uint8_t *ass_extra_data[MAX_STREAMS];
 static size_t ass_extra_data_size[MAX_STREAMS];
 static slock_t *ass_lock;
-#endif
 
 struct attachment
 {
@@ -109,12 +101,10 @@ struct attachment
 static struct attachment *attachments;
 static size_t attachments_size;
 
-#ifdef HAVE_GL_FFT
 static fft_t *fft;
 unsigned fft_width;
 unsigned fft_height;
 unsigned fft_multisample;
-#endif
 
 /* A/V timing. */
 static uint64_t frame_cnt;
@@ -183,7 +173,6 @@ static struct
 
 } media;
 
-#ifdef HAVE_SSA
 static void ass_msg_cb(int level, const char *fmt, va_list args, void *data)
 {
    char buffer[4096];
@@ -195,7 +184,6 @@ static void ass_msg_cb(int level, const char *fmt, va_list args, void *data)
       log_cb(RETRO_LOG_INFO, "[FFMPEG] %s\n", buffer);
    }
 }
-#endif
 
 static int get_media_type()
 {
@@ -317,14 +305,12 @@ void CORE_PREFIX(retro_get_system_av_info)(struct retro_system_av_info *info)
          option_height = 240;
       }
    }
-#ifdef HAVE_GL_FFT
    if (audio_streams_num > 0 && video_stream_index < 0)
    {
       width = fft_width;
       height = fft_height;
       aspect = (float)fft_width / (float)fft_height;
    }
-#endif
    info->timing.fps = media.interpolate_fps;
    info->timing.sample_rate = actx[0] ? media.sample_rate : 32000.0;
 
@@ -398,7 +384,6 @@ void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
             {NULL, NULL}
          }, "disabled"
       },
-#ifdef HAVE_GL_FFT
       {
          "mplayer_fft_resolution", "Visualizer Resolution", NULL, NULL, NULL, "music",
          {
@@ -416,7 +401,6 @@ void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
             {NULL, NULL}
          }, "1x"
       },
-#endif
       { NULL, NULL, NULL, NULL, NULL, NULL, {{NULL, NULL}}, NULL }
    };
 
@@ -482,10 +466,8 @@ static void check_variables(bool firststart)
    struct retro_variable loop_content  = {0};
    struct retro_variable replay_is_crt  = {0};
    struct retro_variable var        = {0};
-#ifdef HAVE_GL_FFT
    struct retro_variable fft_var    = {0};
    struct retro_variable fft_ms_var = {0};
-#endif
 
    var.key = "mplayer_temporal_interp";
 
@@ -497,7 +479,6 @@ static void check_variables(bool firststart)
          temporal_interpolation = false;
    }
 
-#ifdef HAVE_GL_FFT
    fft_var.key = "mplayer_fft_resolution";
 
    fft_width       = 320;
@@ -517,7 +498,6 @@ static void check_variables(bool firststart)
 
    if (CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_GET_VARIABLE, &fft_ms_var) && fft_ms_var.value)
       fft_multisample = strtoul(fft_ms_var.value, NULL, 0);
-#endif
 
    loop_content.key = "mplayer_loop_content";
    if (CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_GET_VARIABLE, &loop_content) && loop_content.value)
@@ -770,16 +750,13 @@ void CORE_PREFIX(retro_run)(void)
    size_t to_read_frames        = 0;
    int seek_frames              = 0;
    bool updated                 = false;
-#ifdef HAVE_GL_FFT
    unsigned old_fft_width       = fft_width;
    unsigned old_fft_height      = fft_height;
    unsigned old_fft_multisample = fft_multisample;
-#endif
 
    if (CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
       check_variables(false);
 
-#ifdef HAVE_GL_FFT
    if (fft_width != old_fft_width || fft_height != old_fft_height)
    {
       struct retro_system_av_info info;
@@ -793,7 +770,6 @@ void CORE_PREFIX(retro_run)(void)
 
    if (fft && (old_fft_multisample != fft_multisample))
       fft_init_multisample(fft, fft_width, fft_height, fft_multisample);
-#endif
 
    CORE_PREFIX(input_poll_cb)();
 
@@ -1088,7 +1064,6 @@ void CORE_PREFIX(retro_run)(void)
       CORE_PREFIX(video_cb)(RETRO_HW_FRAME_BUFFER_VALID,
             option_width, option_height, option_width * sizeof(uint32_t));
    }
-#if defined(HAVE_GL_FFT)
    else if (fft)
    {
       unsigned       frames = to_read_frames;
@@ -1113,7 +1088,6 @@ void CORE_PREFIX(retro_run)(void)
       CORE_PREFIX(video_cb)(RETRO_HW_FRAME_BUFFER_VALID,
             fft_width, fft_height, fft_width * sizeof(uint32_t));
    }
-#endif
    else
    {
       /* Draw music not using FFT and not using OGL */
@@ -1312,7 +1286,6 @@ static bool codec_id_is_ttf(enum AVCodecID id)
    return false;
 }
 
-#ifdef HAVE_SSA
 static bool codec_id_is_ass(enum AVCodecID id)
 {
    switch (id)
@@ -1326,7 +1299,6 @@ static bool codec_id_is_ass(enum AVCodecID id)
 
    return false;
 }
-#endif
 
 static bool open_codecs(void)
 {
@@ -1370,7 +1342,6 @@ static bool open_codecs(void)
             break;
 
          case AVMEDIA_TYPE_SUBTITLE:
-#ifdef HAVE_SSA
             if (subtitle_streams_num < MAX_STREAMS
                   && codec_id_is_ass(fctx->streams[i]->codecpar->codec_id))
             {
@@ -1392,7 +1363,6 @@ static bool open_codecs(void)
 
                subtitle_streams_num++;
             }
-#endif
             break;
 
          case AVMEDIA_TYPE_ATTACHMENT:
@@ -1478,7 +1448,6 @@ static bool init_media_info(void)
 
    display_media_title();
 
-#ifdef HAVE_SSA
    if (sctx[0])
    {
       unsigned i;
@@ -1503,7 +1472,6 @@ static bool init_media_info(void)
                ass_extra_data_size[i]);
       }
    }
-#endif
 
    return true;
 }
@@ -1540,7 +1508,6 @@ static void set_colorspace(struct SwsContext *sws,
    }
 }
 
-#ifdef HAVE_SSA
 /* Straight CPU alpha blending.
  * Should probably do in GL. */
 static void render_ass_img(AVFrame *conv_frame, ASS_Image *img)
@@ -1589,7 +1556,6 @@ static void render_ass_img(AVFrame *conv_frame, ASS_Image *img)
       }
    }
 }
-#endif
 
 static void sws_worker_thread(void *arg)
 {
@@ -1620,7 +1586,6 @@ static void sws_worker_thread(void *arg)
 
    ctx->pts = ctx->source->best_effort_timestamp;
 
-#ifdef HAVE_SSA
    double video_time = ctx->pts * av_q2d(fctx->streams[video_stream_index]->time_base);
    slock_lock(ass_lock);
    if (ass_render && ctx->ass_track_active)
@@ -1631,18 +1596,13 @@ static void sws_worker_thread(void *arg)
       render_ass_img(ctx->target, img);
    }
    slock_unlock(ass_lock);
-#endif
 
    av_frame_unref(ctx->source);
    av_frame_unref(ctx->hw_source);
    video_buffer_finish_slot(video_buffer, ctx);
 }
 
-#ifdef HAVE_SSA
 static void decode_video(AVCodecContext *ctx, AVPacket *pkt, size_t frame_size, ASS_Track *ass_track_active)
-#else
-static void decode_video(AVCodecContext *ctx, AVPacket *pkt, size_t frame_size)
-#endif
 {
    int ret = 0;
    video_decoder_context_t *decoder_ctx = NULL;
@@ -1720,9 +1680,7 @@ static void decode_video(AVCodecContext *ctx, AVPacket *pkt, size_t frame_size)
          break;
       }
 
-#ifdef HAVE_SSA
       decoder_ctx->ass_track_active = ass_track_active;
-#endif
       /* Submit to worker thread which does sws_scale, etc. */
       tpool_add_work(tpool, sws_worker_thread, decoder_ctx);
    }
@@ -1820,10 +1778,8 @@ static void decode_thread_seek(double time)
       avcodec_flush_buffers(vctx);
    if (sctx[subtitle_streams_ptr])
       avcodec_flush_buffers(sctx[subtitle_streams_ptr]);
-#ifdef HAVE_SSA
    if (ass_track[subtitle_streams_ptr])
       ass_flush_events(ass_track[subtitle_streams_ptr]);
-#endif
 }
 
 /**
@@ -1893,10 +1849,7 @@ static void decode_thread(void *data)
       pkt = av_packet_alloc();
       AVCodecContext *actx_active = NULL;
       AVCodecContext *sctx_active = NULL;
-
-#ifdef HAVE_SSA
       ASS_Track *ass_track_active = NULL;
-#endif
 
       slock_lock(fifo_lock);
       seek             = do_seek;
@@ -1931,9 +1884,7 @@ static void decode_thread(void *data)
       subtitle_stream             = subtitle_streams[subtitle_streams_ptr];
       actx_active                 = actx[audio_streams_ptr];
       sctx_active                 = sctx[subtitle_streams_ptr];
-#ifdef HAVE_SSA
       ass_track_active            = ass_track[subtitle_streams_ptr];
-#endif
       audio_timebase = av_q2d(fctx->streams[audio_stream_index]->time_base);
       if (video_stream_index >= 0)
          video_timebase = av_q2d(fctx->streams[video_stream_index]->time_base);
@@ -1983,11 +1934,7 @@ static void decode_thread(void *data)
       {
          packet_buffer_get_packet(video_packet_buffer, pkt);
 
-         #ifdef HAVE_SSA
          decode_video(vctx, pkt, frame_size, ass_track_active);
-         #else
-         decode_video(vctx, pkt, frame_size);
-         #endif
 
          av_packet_unref(pkt);
       }
@@ -2046,7 +1993,6 @@ static void decode_thread(void *data)
                break;
             }
          }
-#ifdef HAVE_SSA
          for (i = 0; i < sub.num_rects; i++)
          {
             slock_lock(ass_lock);
@@ -2055,7 +2001,6 @@ static void decode_thread(void *data)
                      sub.rects[i]->ass, strlen(sub.rects[i]->ass));
             slock_unlock(ass_lock);
          }
-#endif
          avsubtitle_free(&sub);
          av_packet_unref(pkt);
       }
@@ -2082,13 +2027,11 @@ static void decode_thread(void *data)
 
 static void context_destroy(void)
 {
-#ifdef HAVE_GL_FFT
    if (fft)
    {
       fft_free(fft);
       fft = NULL;
    }
-#endif
 }
 
 #include "gl_shaders/ffmpeg.glsl.vert.h"
@@ -2109,7 +2052,6 @@ static void context_reset(void)
    GLuint vert, frag;
    unsigned i;
 
-#ifdef HAVE_GL_FFT
    if (audio_streams_num > 0 && video_stream_index < 0)
    {
       fft = fft_new(11, hw_render.get_proc_address);
@@ -2119,7 +2061,6 @@ static void context_reset(void)
 
    /* Already inits symbols. */
    if (!fft)
-#endif
       rglgen_resolve_symbols(hw_render.get_proc_address);
 
    prog = glCreateProgram();
@@ -2190,10 +2131,8 @@ void CORE_PREFIX(retro_unload_game)(void)
       slock_free(fifo_lock);
    if (decode_thread_lock)
       slock_free(decode_thread_lock);
-#ifdef HAVE_SSA
    if (ass_lock)
       slock_free(ass_lock);
-#endif
 
    if (audio_decode_fifo)
       fifo_free(audio_decode_fifo);
@@ -2203,9 +2142,7 @@ void CORE_PREFIX(retro_unload_game)(void)
    fifo_lock = NULL;
    decode_thread_lock = NULL;
    audio_decode_fifo = NULL;
-#ifdef HAVE_SSA
    ass_lock = NULL;
-#endif
 
    decode_last_audio_time = 0.0;
 
@@ -2241,7 +2178,6 @@ void CORE_PREFIX(retro_unload_game)(void)
    av_freep(&attachments);
    attachments_size = 0;
 
-#ifdef HAVE_SSA
    for (i = 0; i < MAX_STREAMS; i++)
    {
       if (ass_track[i])
@@ -2258,7 +2194,6 @@ void CORE_PREFIX(retro_unload_game)(void)
 
    ass_render = NULL;
    ass = NULL;
-#endif
 
    av_freep(&video_frame_temp_buffer);
 }
@@ -2339,9 +2274,7 @@ bool CORE_PREFIX(retro_load_game)(const struct retro_game_info *info)
       goto error;
    }
 
-#ifdef HAVE_GL_FFT
    is_fft = video_stream_index < 0 && audio_streams_num > 0;
-#endif
 
    if (video_stream_index >= 0 || is_fft)
    {
@@ -2367,9 +2300,7 @@ bool CORE_PREFIX(retro_load_game)(const struct retro_game_info *info)
    fifo_cond        = scond_new();
    fifo_decode_cond = scond_new();
    fifo_lock        = slock_new();
-#ifdef HAVE_SSA
    ass_lock         = slock_new();
-#endif
 
    slock_lock(fifo_lock);
    decode_thread_dead = false;
