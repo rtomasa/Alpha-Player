@@ -5,12 +5,6 @@
 #include <stdio.h>
 #include <stdarg.h>
 
-#ifdef RARCH_INTERNAL
-#ifdef HAVE_CONFIG_H
-#include "../../config.h"
-#endif
-#endif
-
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libswscale/swscale.h>
@@ -46,12 +40,7 @@
 #include "include/video_buffer.h"
 
 #include <libretro.h>
-#ifdef RARCH_INTERNAL
-#include "include/internal_cores.h"
-#define CORE_PREFIX(s) libretro_ffmpeg_##s
-#else
 #define CORE_PREFIX(s) s
-#endif
 
 #define PRINT_VERSION(s) log_cb(RETRO_LOG_INFO, "[FFMPEG] lib%s version:\t%d.%d.%d\n", #s, \
    s ##_version() >> 16 & 0xFF, \

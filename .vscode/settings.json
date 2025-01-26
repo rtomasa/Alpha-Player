@@ -13,6 +13,9 @@
         "cstdlib": "c",
         "rthreads.h": "c",
         "compare": "c",
-        "random": "c"
+        "random": "c",
+        "stdarg.h": "c",
+        "stdlib.h": "c",
+        "retro_common_api.h": "c"
     }
 }
