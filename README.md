@@ -20,10 +20,10 @@ https://docs.libretro.com/library/ffmpeg/
 https://github.com/libretro/docs/blob/master/docs/library/ffmpeg.md
 
 # Compilation
-just execute `make` or make DEBUG=1 if you want a more verbose execution
+just execute `make` or `make DEBUG=1` if you want a more verbose execution
 
 # IMPORTANT NOTE!!!
-This core has been tested only in Raspberry Pi devices using a development version of RePlay OS
+This core has been modified focusing on Raspberry Pi devices using a development version of RePlay OS, so it is not guarantee that it works in other systems or platforms.
 
 # Controls
 
@@ -43,12 +43,6 @@ This core has been tested only in Raspberry Pi devices using a development versi
 # Changelog
 
 - [X] Added libretro API core option v2 support (removed v0)
-- [X] Added new option to select video output resolution (refresh rate keeps native)
-    * Native
-    * PAL (576)
-    * NTSC (480)
-    * VGA (240)
-- [X] Added internal variable to prevent CRT TV from setting Native video resolution (works only with RePlay OS)
 - [X] Added new option to enable loop content
 - [X] Added compilation flag to enable/disable FFmpeg debug messages
 - [X] Added ability to display video title on start
@@ -74,8 +68,7 @@ This core has been tested only in Raspberry Pi devices using a development versi
 
 - [ ] Add M3U support
 - [ ] Add L2/R2 functionality to do next/last song/video in m3u lists
-- [ ] Add ffmpeg HW h264 acceleration (h264_v4l2m2m???)
-- [ ] Fix deadlock when seeking in some movies
+- [ ] Fix crash happening some times when unloading core
 
 <!--
 ## TODO
