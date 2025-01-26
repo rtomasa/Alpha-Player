@@ -24,10 +24,7 @@
 #include "include/ffmpeg_fft.h"
 #endif
 
-#if defined(HAVE_OPENGLES)
 #include <glsym/glsym.h>
-#endif
-
 #include <features/features_cpu.h>
 #include <retro_miscellaneous.h>
 #include <rthreads/rthreads.h>
@@ -150,12 +147,7 @@ static double seek_time;
 /* GL stuff */
 struct frame
 {
-#if defined(HAVE_OPENGLES)
    GLuint tex;
-#if !defined(HAVE_OPENGLES)
-   GLuint pbo;
-#endif
-#endif
    double pts;
 };
 
@@ -163,16 +155,13 @@ struct frame
 
 static struct frame frames[2];
 
-#if defined(HAVE_OPENGLES)
 static bool temporal_interpolation;
-static bool use_gl;
 static struct retro_hw_render_callback hw_render;
 static GLuint prog;
 static GLuint vbo;
 static GLint vertex_loc;
 static GLint tex_loc;
 static GLint mix_loc;
-#endif
 
 enum media_type {
     MEDIA_TYPE_UNKNOWN = -1,
@@ -433,7 +422,6 @@ void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
             {NULL, NULL}
          }, "auto"
       },
-#if defined(HAVE_OPENGLES)
       {
          "mplayer_temporal_interp", "Temporal Interpolation", NULL, NULL, NULL, "music",
          {
@@ -460,7 +448,6 @@ void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
             {NULL, NULL}
          }, "1x"
       },
-#endif
 #endif
       { NULL, NULL, NULL, NULL, NULL, NULL, {{NULL, NULL}}, NULL }
    };
@@ -527,15 +514,12 @@ static void check_variables(bool firststart)
    struct retro_variable color_var  = {0};
    struct retro_variable loop_content  = {0};
    struct retro_variable replay_is_crt  = {0};
-#if defined(HAVE_OPENGLES)
    struct retro_variable var        = {0};
-#endif
 #ifdef HAVE_GL_FFT
    struct retro_variable fft_var    = {0};
    struct retro_variable fft_ms_var = {0};
 #endif
 
-#if defined(HAVE_OPENGLES)
    var.key = "mplayer_temporal_interp";
 
    if (CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
@@ -566,7 +550,6 @@ static void check_variables(bool firststart)
 
    if (CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_GET_VARIABLE, &fft_ms_var) && fft_ms_var.value)
       fft_multisample = strtoul(fft_ms_var.value, NULL, 0);
-#endif
 #endif
 
    color_var.key = "mplayer_color_space";
@@ -1099,144 +1082,86 @@ void CORE_PREFIX(retro_run)(void)
          frames[0] = tmp;
       }
 
-#if defined(HAVE_OPENGLES)
-      if (use_gl)
+      float mix_factor;
+
+      while (!decode_thread_dead && min_pts > frames[1].pts)
       {
-         float mix_factor;
+         int64_t pts = 0;
 
-         while (!decode_thread_dead && min_pts > frames[1].pts)
+         if (!decode_thread_dead)
+            video_buffer_wait_for_finished_slot(video_buffer);
+
+         if (!decode_thread_dead)
          {
-            int64_t pts = 0;
+            unsigned y;
+            int stride, width;
+            const uint8_t *src           = NULL;
+            video_decoder_context_t *ctx = NULL;
+            uint32_t               *data = NULL;
 
-            if (!decode_thread_dead)
-               video_buffer_wait_for_finished_slot(video_buffer);
+            video_buffer_get_finished_slot(video_buffer, &ctx);
+            pts                          = ctx->pts;
+            data                         = video_frame_temp_buffer;
+            src                          = ctx->target->data[0];
+            stride                       = ctx->target->linesize[0];
+            width                        = media.width * sizeof(uint32_t);
+            for (y = 0; y < media.height; y++, src += stride, data += width/4)
+               memcpy(data, src, width);
 
-            if (!decode_thread_dead)
-            {
-               unsigned y;
-               int stride, width;
-               const uint8_t *src           = NULL;
-               video_decoder_context_t *ctx = NULL;
-               uint32_t               *data = NULL;
-
-               video_buffer_get_finished_slot(video_buffer, &ctx);
-               pts                          = ctx->pts;
-
-#ifdef HAVE_OPENGLES
-               data                         = video_frame_temp_buffer;
-#else
-               glBindBuffer(GL_PIXEL_UNPACK_BUFFER, frames[1].pbo);
-               data                         = (uint32_t*)glMapBufferRange(GL_PIXEL_UNPACK_BUFFER,
-                     0, media.width * media.height * sizeof(uint32_t), GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
-#endif
-               src                          = ctx->target->data[0];
-               stride                       = ctx->target->linesize[0];
-               width                        = media.width * sizeof(uint32_t);
-               for (y = 0; y < media.height; y++, src += stride, data += width/4)
-                  memcpy(data, src, width);
-
-#ifndef HAVE_OPENGLES
-               glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
-#endif
-               glBindTexture(GL_TEXTURE_2D, frames[1].tex);
-#if defined(HAVE_OPENGLES)
-               glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
-                     media.width, media.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, video_frame_temp_buffer);
-#else
-               glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
-                     media.width, media.height, 0, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, NULL);
-#endif
-               glBindTexture(GL_TEXTURE_2D, 0);
-#ifndef HAVE_OPENGLES
-               glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-#endif
-               video_buffer_open_slot(video_buffer, ctx);
-            }
-
-            frames[1].pts = av_q2d(fctx->streams[video_stream_index]->time_base) * pts;
+            glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+            glBindTexture(GL_TEXTURE_2D, frames[1].tex);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
+                  media.width, media.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, video_frame_temp_buffer);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            video_buffer_open_slot(video_buffer, ctx);
          }
 
-         mix_factor = (min_pts - frames[0].pts) / (frames[1].pts - frames[0].pts);
-
-         if (!temporal_interpolation)
-            mix_factor = 1.0f;
-
-         glBindFramebuffer(GL_FRAMEBUFFER, hw_render.get_current_framebuffer());
-
-         glClearColor(0, 0, 0, 1);
-         glClear(GL_COLOR_BUFFER_BIT);
-         glViewport(0, 0, option_width, option_height);
-
-         glUseProgram(prog);
-
-         glUniform1f(mix_loc, mix_factor);
-         glActiveTexture(GL_TEXTURE1);
-         glBindTexture(GL_TEXTURE_2D, frames[1].tex);
-         glActiveTexture(GL_TEXTURE0);
-         glBindTexture(GL_TEXTURE_2D, frames[0].tex);
-
-         glBindBuffer(GL_ARRAY_BUFFER, vbo);
-         glVertexAttribPointer(vertex_loc, 2, GL_FLOAT, GL_FALSE,
-               4 * sizeof(GLfloat), (const GLvoid*)(0 * sizeof(GLfloat)));
-         glVertexAttribPointer(tex_loc, 2, GL_FLOAT, GL_FALSE,
-               4 * sizeof(GLfloat), (const GLvoid*)(2 * sizeof(GLfloat)));
-         glEnableVertexAttribArray(vertex_loc);
-         glEnableVertexAttribArray(tex_loc);
-         glBindBuffer(GL_ARRAY_BUFFER, 0);
-
-         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-         glDisableVertexAttribArray(vertex_loc);
-         glDisableVertexAttribArray(tex_loc);
-
-         glUseProgram(0);
-         glActiveTexture(GL_TEXTURE1);
-         glBindTexture(GL_TEXTURE_2D, 0);
-         glActiveTexture(GL_TEXTURE0);
-         glBindTexture(GL_TEXTURE_2D, 0);
-
-         /* Draw video using OGL*/
-         CORE_PREFIX(video_cb)(RETRO_HW_FRAME_BUFFER_VALID,
-               option_width, option_height, option_width * sizeof(uint32_t));
+         frames[1].pts = av_q2d(fctx->streams[video_stream_index]->time_base) * pts;
       }
-      else
-#endif
-      {
-         while (!decode_thread_dead && min_pts > frames[1].pts)
-         {
-            int64_t pts = 0;
 
-            if (!decode_thread_dead)
-               video_buffer_wait_for_finished_slot(video_buffer);
+      mix_factor = (min_pts - frames[0].pts) / (frames[1].pts - frames[0].pts);
 
-            if (!decode_thread_dead)
-            {
-               unsigned y;
-               const uint8_t *src;
-               int stride, width;
-               uint32_t *data               = video_frame_temp_buffer;
-               video_decoder_context_t *ctx = NULL;
+      if (!temporal_interpolation)
+         mix_factor = 1.0f;
 
-               video_buffer_get_finished_slot(video_buffer, &ctx);
-               pts                          = ctx->pts;
-               src                          = ctx->target->data[0];
-               stride                       = ctx->target->linesize[0];
-               width                        = media.width * sizeof(uint32_t);
-               for (y = 0; y < media.height; y++, src += stride, data += width/4)
-                  memcpy(data, src, width);
+      glBindFramebuffer(GL_FRAMEBUFFER, hw_render.get_current_framebuffer());
 
-               dupe                         = false;
-               video_buffer_open_slot(video_buffer, ctx);
-            }
+      glClearColor(0, 0, 0, 1);
+      glClear(GL_COLOR_BUFFER_BIT);
+      glViewport(0, 0, option_width, option_height);
 
-            frames[1].pts = av_q2d(fctx->streams[video_stream_index]->time_base) * pts;
-         }
+      glUseProgram(prog);
 
-         /* Draw video not using OGL */
-         CORE_PREFIX(video_cb)(dupe ? NULL : video_frame_temp_buffer,
-               option_width, option_height, option_width * sizeof(uint32_t));
-      }
+      glUniform1f(mix_loc, mix_factor);
+      glActiveTexture(GL_TEXTURE1);
+      glBindTexture(GL_TEXTURE_2D, frames[1].tex);
+      glActiveTexture(GL_TEXTURE0);
+      glBindTexture(GL_TEXTURE_2D, frames[0].tex);
+
+      glBindBuffer(GL_ARRAY_BUFFER, vbo);
+      glVertexAttribPointer(vertex_loc, 2, GL_FLOAT, GL_FALSE,
+            4 * sizeof(GLfloat), (const GLvoid*)(0 * sizeof(GLfloat)));
+      glVertexAttribPointer(tex_loc, 2, GL_FLOAT, GL_FALSE,
+            4 * sizeof(GLfloat), (const GLvoid*)(2 * sizeof(GLfloat)));
+      glEnableVertexAttribArray(vertex_loc);
+      glEnableVertexAttribArray(tex_loc);
+      glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+      glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+      glDisableVertexAttribArray(vertex_loc);
+      glDisableVertexAttribArray(tex_loc);
+
+      glUseProgram(0);
+      glActiveTexture(GL_TEXTURE1);
+      glBindTexture(GL_TEXTURE_2D, 0);
+      glActiveTexture(GL_TEXTURE0);
+      glBindTexture(GL_TEXTURE_2D, 0);
+
+      /* Draw video using OGL*/
+      CORE_PREFIX(video_cb)(RETRO_HW_FRAME_BUFFER_VALID,
+            option_width, option_height, option_width * sizeof(uint32_t));
    }
-#if defined(HAVE_GL_FFT) && defined(HAVE_OPENGLES)
+#if defined(HAVE_GL_FFT)
    else if (fft)
    {
       unsigned       frames = to_read_frames;
@@ -2262,7 +2187,6 @@ static void decode_thread(void *data)
    slock_unlock(fifo_lock);
 }
 
-#if defined(HAVE_OPENGLES)
 static void context_destroy(void)
 {
 #ifdef HAVE_GL_FFT
@@ -2279,11 +2203,7 @@ static void context_destroy(void)
 /* OpenGL ES note about main() -  Get format as GL_RGBA/GL_UNSIGNED_BYTE.
  * Assume little endian, so we get ARGB -> BGRA byte order, and
  * we have to swizzle to .BGR. */
-#ifdef HAVE_OPENGLES
 #include "gl_shaders/ffmpeg_es.glsl.frag.h"
-#else
-#include "gl_shaders/ffmpeg.glsl.frag.h"
-#endif
 
 static void context_reset(void)
 {
@@ -2340,14 +2260,6 @@ static void context_reset(void)
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-#if !defined(HAVE_OPENGLES)
-      glGenBuffers(1, &frames[i].pbo);
-      glBindBuffer(GL_PIXEL_UNPACK_BUFFER, frames[i].pbo);
-      glBufferData(GL_PIXEL_UNPACK_BUFFER, media.width
-            * media.height * sizeof(uint32_t), NULL, GL_STREAM_DRAW);
-      glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-#endif
    }
 
    glGenBuffers(1, &vbo);
@@ -2358,7 +2270,6 @@ static void context_reset(void)
    glBindBuffer(GL_ARRAY_BUFFER, 0);
    glBindTexture(GL_TEXTURE_2D, 0);
 }
-#endif
 
 void CORE_PREFIX(retro_unload_game)(void)
 {
@@ -2541,24 +2452,16 @@ bool CORE_PREFIX(retro_load_game)(const struct retro_game_info *info)
 
    if (video_stream_index >= 0 || is_fft)
    {
-#if defined(HAVE_OPENGLES)
-      use_gl = true;
       hw_render.context_reset      = context_reset;
       hw_render.context_destroy    = context_destroy;
       hw_render.bottom_left_origin = is_fft;
       hw_render.depth              = is_fft;
       hw_render.stencil            = is_fft;
-#if defined(HAVE_OPENGLES)
       hw_render.context_type = RETRO_HW_CONTEXT_OPENGLES3;
-#else
-      hw_render.context_type = RETRO_HW_CONTEXT_OPENGL;
-#endif
       if (!CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw_render))
       {
-         use_gl = false;
          log_cb(RETRO_LOG_ERROR, "[FFMPEG] Cannot initialize HW render.\n");
       }
-#endif
    }
    if (audio_streams_num > 0)
    {
