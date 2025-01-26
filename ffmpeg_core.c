@@ -197,6 +197,9 @@ static int get_media_type()
 
 static void display_media_title()
 {
+   if (!fctx || decode_thread_dead)
+    return;
+
    if (media.title)
    {
       char msg[256];
@@ -587,6 +590,9 @@ static void seek_frame(int seek_frames)
 
 static void dispaly_time()
 {
+   if (!fctx || decode_thread_dead)
+    return;
+
    char msg[256];
    struct retro_message_ext msg_obj = {0};
    
@@ -2023,17 +2029,24 @@ void CORE_PREFIX(retro_unload_game)(void)
 
    if (decode_thread_handle)
    {
+      /* Stop the decode thread first */
       slock_lock(fifo_lock);
-
-      tpool_wait(tpool);
-      video_buffer_clear(video_buffer);
       decode_thread_dead = true;
       scond_signal(fifo_decode_cond);
-
       slock_unlock(fifo_lock);
+
+      /* Join the decode thread – no more tasks will be enqueued */
       sthread_join(decode_thread_handle);
+      decode_thread_handle = NULL;
    }
-   decode_thread_handle = NULL;
+   
+   /* Now that decode_thread is done, wait for all worker tasks */
+   if (tpool)
+      tpool_wait(tpool);
+
+   /* Safe to clear buffer now, since no thread references it anymore */
+   if (video_buffer)
+      video_buffer_clear(video_buffer);
 
    if (fifo_cond)
       scond_free(fifo_cond);
