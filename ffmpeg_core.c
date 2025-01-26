@@ -1877,16 +1877,46 @@ static void decode_video(AVCodecContext *ctx, AVPacket *pkt, size_t frame_size)
       }
    }
 
-   if ((ret = avcodec_send_packet(ctx, pkt)) < 0)
+   /* 1) Send the packet. */
+   ret = avcodec_send_packet(ctx, pkt);
+   if (ret == AVERROR(EAGAIN))
    {
-#ifdef __cplusplus
-      log_cb(RETRO_LOG_ERROR, "[FFMPEG] Can't decode video packet: %d\n", ret);
-#else
-      log_cb(RETRO_LOG_ERROR, "[FFMPEG] Can't decode video packet: %s\n", av_err2str(ret));
-#endif
+      /* Means the decoder is full, so we must read (receive) frames first. */
+      while (true)
+      {
+         AVFrame *tmpframe = av_frame_alloc();
+         ret = avcodec_receive_frame(ctx, tmpframe);
+         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+         {
+            av_frame_free(&tmpframe);
+            break;
+         }
+         else if (ret < 0)
+         {
+            /* Real error. */
+            log_cb(RETRO_LOG_ERROR,
+               "[FFMPEG] Error draining frames: %s\n", av_err2str(ret));
+            av_frame_free(&tmpframe);
+            return;
+         }
+
+         /* We got a frame; if needed we can queue it, or just discard. */
+         av_frame_free(&tmpframe);
+      }
+      /* Now try sending the packet again. */
+      ret = avcodec_send_packet(ctx, pkt);
+   }
+
+   /* If still an error that is NOT EAGAIN/EOF, we give up. */
+   if (ret < 0 && ret != AVERROR_EOF)
+   {
+      /* Real error. */
+      log_cb(RETRO_LOG_ERROR,
+         "[FFMPEG] Can't decode video packet: %s\n", av_err2str(ret));
       return;
    }
 
+   /* 2) Receive frames in a loop. */
    while (!decode_thread_dead && video_buffer_has_open_slot(video_buffer))
    {
       video_buffer_get_open_slot(video_buffer, &decoder_ctx);
@@ -1894,48 +1924,25 @@ static void decode_video(AVCodecContext *ctx, AVPacket *pkt, size_t frame_size)
       ret = avcodec_receive_frame(ctx, decoder_ctx->source);
       if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
       {
-         ret = -42;
-         goto end;
+         /* No more frames now, so break. */
+         video_buffer_return_open_slot(video_buffer, decoder_ctx);
+         break;
       }
       else if (ret < 0)
       {
-#ifdef __cplusplus
-         log_cb(RETRO_LOG_ERROR, "[FFMPEG] Error while reading video frame: %d\n", ret);
-#else
-         log_cb(RETRO_LOG_ERROR, "[FFMPEG] Error while reading video frame: %s\n", av_err2str(ret));
-#endif
-         goto end;
+         /* Real error. */
+         log_cb(RETRO_LOG_ERROR,
+            "[FFMPEG] Error while reading video frame: %s\n", av_err2str(ret));
+         video_buffer_return_open_slot(video_buffer, decoder_ctx);
+         break;
       }
-
-#if ENABLE_HW_ACCEL
-      if (hw_decoding_enabled)
-         /* Copy data from VRAM to RAM */
-         if ((ret = av_hwframe_transfer_data(decoder_ctx->hw_source, decoder_ctx->source, 0)) < 0)
-         {
-#ifdef __cplusplus
-               log_cb(RETRO_LOG_ERROR, "[FFMPEG] Error transferring the data to system memory: %d\n", ret);
-#else
-               log_cb(RETRO_LOG_ERROR, "[FFMPEG] Error transferring the data to system memory: %s\n", av_err2str(ret));
-#endif
-               goto end;
-         }
-#endif
 
 #ifdef HAVE_SSA
       decoder_ctx->ass_track_active = ass_track_active;
 #endif
-
+      /* Submit to worker thread which does sws_scale, etc. */
       tpool_add_work(tpool, sws_worker_thread, decoder_ctx);
-
-   end:
-      if (ret < 0)
-      {
-         video_buffer_return_open_slot(video_buffer, decoder_ctx);
-         break;
-      }
    }
-
-   return;
 }
 
 static int16_t *decode_audio(AVCodecContext *ctx, AVPacket *pkt,

@@ -10,6 +10,9 @@
         "cstdint": "c",
         "string": "c",
         "string_view": "c",
-        "cstdlib": "c"
+        "cstdlib": "c",
+        "rthreads.h": "c",
+        "compare": "c",
+        "random": "c"
     }
 }

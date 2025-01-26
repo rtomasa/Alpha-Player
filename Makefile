@@ -65,7 +65,7 @@ else ifneq ($(findstring Darwin,$(shell uname -a)),)
    platform = osx
 else ifneq ($(findstring win,$(shell uname -a)),)
    platform = win
-else ifneq ($(findstring raspberrypi,$(shell uname -a)),)
+else ifneq ($(findstring aarch64,$(shell uname -a)),)
    platform = raspberrypi
 endif
 endif
