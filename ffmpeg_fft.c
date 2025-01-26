@@ -513,7 +513,7 @@ error:
    return NULL;
 }
 
-void fft_init_multisample(fft_t *fft, unsigned width, unsigned height, unsigned samples)
+void fft_init_multisample(fft_t *fft)
 {
    if (fft->ms_rb_color)
       glDeleteRenderbuffers(1, &fft->ms_rb_color);
@@ -525,35 +525,12 @@ void fft_init_multisample(fft_t *fft, unsigned width, unsigned height, unsigned 
       glDeleteFramebuffers(1, &fft->ms_fbo);
    fft->ms_fbo      = 0;
 
-   if (samples > 1)
-   {
-      glGenRenderbuffers(1, &fft->ms_rb_color);
-      glGenRenderbuffers(1, &fft->ms_rb_ds);
-      glGenFramebuffers (1, &fft->ms_fbo);
-
-      glBindRenderbuffer(GL_RENDERBUFFER, fft->ms_rb_color);
-      glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples,
-            GL_RGBA8, width, height);
-      glBindRenderbuffer(GL_RENDERBUFFER, fft->ms_rb_ds);
-      glRenderbufferStorageMultisample(GL_RENDERBUFFER, samples,
-            GL_DEPTH24_STENCIL8, width, height);
-      glBindRenderbuffer(GL_RENDERBUFFER, 0);
-
-      glBindFramebuffer(GL_FRAMEBUFFER, fft->ms_fbo);
-      glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-            GL_RENDERBUFFER, fft->ms_rb_color);
-      glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT,
-            GL_RENDERBUFFER, fft->ms_rb_ds);
-      if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
-         fft_init_multisample(fft, 0, 0, 0);
-   }
-
    glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
 static void fft_context_destroy(fft_t *fft)
 {
-   fft_init_multisample(fft, 0, 0, 0);
+   fft_init_multisample(fft);
    if (fft->passes)
       free(fft->passes);
    fft->passes = NULL;

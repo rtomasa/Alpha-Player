@@ -13,7 +13,7 @@ fft_t *fft_new(unsigned fft_steps, rglgen_proc_address_t proc);
 
 void fft_free(fft_t *fft);
 
-void fft_init_multisample(fft_t *fft, unsigned width, unsigned height, unsigned samples);
+void fft_init_multisample(fft_t *fft);
 
 void fft_step_fft(fft_t *fft, const GLshort *buffer, unsigned frames);
 

@@ -104,7 +104,6 @@ static size_t attachments_size;
 static fft_t *fft;
 unsigned fft_width;
 unsigned fft_height;
-unsigned fft_multisample;
 
 /* A/V timing. */
 static uint64_t frame_cnt;
@@ -139,7 +138,6 @@ struct frame
 
 static struct frame frames[2];
 
-static bool temporal_interpolation;
 static struct retro_hw_render_callback hw_render;
 static GLuint prog;
 static GLuint vbo;
@@ -353,36 +351,14 @@ void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
          }, "auto"
       },
       {
-         "mplayer_loop_content", "Loop", NULL, NULL, NULL, NULL,
-         {
-            {"disabled", "Disabled"},
-            {"enabled", "Enabled"},
-            {NULL, NULL}
-         }, "disabled"
-      },
-      {
          "mplayer_sw_decoder_threads", "Software Decoder Threads (restart)", NULL, INFO_RESTART, NULL, "video",
          {
             {"auto", "Automatic"},
             {"1", NULL},
             {"2", NULL},
             {"4", NULL},
-            {"6", NULL},
-            {"8", NULL},
-            {"10", NULL},
-            {"12", NULL},
-            {"14", NULL},
-            {"16", NULL},
             {NULL, NULL}
          }, "auto"
-      },
-      {
-         "mplayer_temporal_interp", "Temporal Interpolation", NULL, NULL, NULL, "music",
-         {
-            {"disabled", "Disabled"},
-            {"enabled", "Enabled"},
-            {NULL, NULL}
-         }, "disabled"
       },
       {
          "mplayer_fft_resolution", "Visualizer Resolution", NULL, NULL, NULL, "music",
@@ -393,13 +369,12 @@ void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
          }, "320x240"
       },
       {
-         "mplayer_fft_multisample", "Visualizer Multisample", NULL, NULL, NULL, "music",
+         "mplayer_loop_content", "Loop", NULL, NULL, NULL, NULL,
          {
-            {"1x", NULL},
-            {"2x", NULL},
-            {"4x", NULL},
+            {"disabled", "Disabled"},
+            {"enabled", "Enabled"},
             {NULL, NULL}
-         }, "1x"
+         }, "disabled"
       },
       { NULL, NULL, NULL, NULL, NULL, NULL, {{NULL, NULL}}, NULL }
    };
@@ -465,25 +440,12 @@ static void check_variables(bool firststart)
    struct retro_variable sw_threads_var = {0};
    struct retro_variable loop_content  = {0};
    struct retro_variable replay_is_crt  = {0};
-   struct retro_variable var        = {0};
    struct retro_variable fft_var    = {0};
-   struct retro_variable fft_ms_var = {0};
-
-   var.key = "mplayer_temporal_interp";
-
-   if (CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
-   {
-      if (memcmp(var.value, "enabled", 7) == 0)
-         temporal_interpolation = true;
-      else if (memcmp(var.value, "disabled", 8) == 0)
-         temporal_interpolation = false;
-   }
 
    fft_var.key = "mplayer_fft_resolution";
 
    fft_width       = 320;
    fft_height      = 240;
-   fft_multisample = 1;
    if (CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_GET_VARIABLE, &fft_var) && fft_var.value)
    {
       unsigned w, h;
@@ -493,11 +455,6 @@ static void check_variables(bool firststart)
          fft_height = h;
       }
    }
-
-   fft_ms_var.key = "mplayer_fft_multisample";
-
-   if (CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_GET_VARIABLE, &fft_ms_var) && fft_ms_var.value)
-      fft_multisample = strtoul(fft_ms_var.value, NULL, 0);
 
    loop_content.key = "mplayer_loop_content";
    if (CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_GET_VARIABLE, &loop_content) && loop_content.value)
@@ -752,7 +709,6 @@ void CORE_PREFIX(retro_run)(void)
    bool updated                 = false;
    unsigned old_fft_width       = fft_width;
    unsigned old_fft_height      = fft_height;
-   unsigned old_fft_multisample = fft_multisample;
 
    if (CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
       check_variables(false);
@@ -767,9 +723,6 @@ void CORE_PREFIX(retro_run)(void)
          fft_height = old_fft_height;
       }
    }
-
-   if (fft && (old_fft_multisample != fft_multisample))
-      fft_init_multisample(fft, fft_width, fft_height, fft_multisample);
 
    CORE_PREFIX(input_poll_cb)();
 
@@ -1022,10 +975,7 @@ void CORE_PREFIX(retro_run)(void)
          frames[1].pts = av_q2d(fctx->streams[video_stream_index]->time_base) * pts;
       }
 
-      mix_factor = (min_pts - frames[0].pts) / (frames[1].pts - frames[0].pts);
-
-      if (!temporal_interpolation)
-         mix_factor = 1.0f;
+      mix_factor = 1.0f;
 
       glBindFramebuffer(GL_FRAMEBUFFER, hw_render.get_current_framebuffer());
 
@@ -2056,7 +2006,7 @@ static void context_reset(void)
    {
       fft = fft_new(11, hw_render.get_proc_address);
       if (fft)
-         fft_init_multisample(fft, fft_width, fft_height, fft_multisample);
+         fft_init_multisample(fft);
    }
 
    /* Already inits symbols. */
