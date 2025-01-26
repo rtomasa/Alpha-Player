@@ -65,7 +65,6 @@ static retro_input_state_t CORE_PREFIX(input_state_cb);
 static AVFormatContext *fctx;
 static AVCodecContext *vctx;
 static int video_stream_index;
-static enum AVColorSpace colorspace;
 static bool loopcontent;
 static bool is_crt = false;
 AVPacket *pkt;
@@ -76,9 +75,6 @@ static unsigned sw_decoder_threads;
 static unsigned sw_sws_threads;
 static video_buffer_t *video_buffer;
 static tpool_t *tpool;
-
-#define FFMPEG3 ((LIBAVUTIL_VERSION_INT < (56, 6, 100)) || \
-      (LIBAVCODEC_VERSION_INT < AV_VERSION_INT(58, 10, 100)))
 
 static enum AVHWDeviceType hw_decoder;
 static bool hw_decoding_enabled;
@@ -253,10 +249,6 @@ void CORE_PREFIX(retro_init)(void)
 {
    reset_triggered = false;
 
-#if FFMPEG3
-   av_register_all();
-#endif
-
    if (CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_GET_INPUT_BITMASKS, NULL))
       libretro_supports_bitmasks = true;
 }
@@ -368,10 +360,11 @@ void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
       {
          "mplayer_hw_decoder", "Hardware Decoder (restart)", NULL, INFO_RESTART, NULL, "video",
          {
+            {"auto", "Automatic"},
             {"off", "Disabled"},
             {"drm", "DRM"},
             {NULL, NULL}
-         }, "off"
+         }, "auto"
       },
       {
          "mplayer_loop_content", "Loop", NULL, NULL, NULL, NULL,
@@ -394,17 +387,6 @@ void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
             {"12", NULL},
             {"14", NULL},
             {"16", NULL},
-            {NULL, NULL}
-         }, "auto"
-      },
-      {
-         "mplayer_color_space", "Colorspace", NULL, NULL, NULL, "video",
-         {
-            {"auto", "Automatic"},
-            {"BT.709", NULL},
-            {"BT.601", NULL},
-            {"FCC", NULL},
-            {"SMPTE240M", NULL},
             {NULL, NULL}
          }, "auto"
       },
@@ -497,7 +479,6 @@ static void check_variables(bool firststart)
 {
    struct retro_variable hw_var  = {0};
    struct retro_variable sw_threads_var = {0};
-   struct retro_variable color_var  = {0};
    struct retro_variable loop_content  = {0};
    struct retro_variable replay_is_crt  = {0};
    struct retro_variable var        = {0};
@@ -538,24 +519,6 @@ static void check_variables(bool firststart)
       fft_multisample = strtoul(fft_ms_var.value, NULL, 0);
 #endif
 
-   color_var.key = "mplayer_color_space";
-
-   if (CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_GET_VARIABLE, &color_var) && color_var.value)
-   {
-      slock_lock(decode_thread_lock);
-      if (string_is_equal(color_var.value, "BT.709"))
-         colorspace = AVCOL_SPC_BT709;
-      else if (string_is_equal(color_var.value, "BT.601"))
-         colorspace = AVCOL_SPC_BT470BG;
-      else if (memcmp(color_var.value, "FCC", 3) == 0)
-         colorspace = AVCOL_SPC_FCC;
-      else if (string_is_equal(color_var.value, "SMPTE240M"))
-         colorspace = AVCOL_SPC_SMPTE240M;
-      else
-         colorspace = AVCOL_SPC_UNSPECIFIED;
-      slock_unlock(decode_thread_lock);
-   }
-
    loop_content.key = "mplayer_loop_content";
    if (CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_GET_VARIABLE, &loop_content) && loop_content.value)
    {
@@ -585,28 +548,8 @@ static void check_variables(bool firststart)
       {
          if (string_is_equal(hw_var.value, "off"))
             force_sw_decoder = true;
-         else if (string_is_equal(hw_var.value, "cuda"))
-            hw_decoder = AV_HWDEVICE_TYPE_CUDA;
-         else if (string_is_equal(hw_var.value, "d3d11va"))
-            hw_decoder = AV_HWDEVICE_TYPE_D3D11VA;
          else if (string_is_equal(hw_var.value, "drm"))
             hw_decoder = AV_HWDEVICE_TYPE_DRM;
-         else if (string_is_equal(hw_var.value, "dxva2"))
-            hw_decoder = AV_HWDEVICE_TYPE_DXVA2;
-#if !FFMPEG3
-         else if (string_is_equal(hw_var.value, "mediacodec"))
-            hw_decoder = AV_HWDEVICE_TYPE_MEDIACODEC;
-         else if (string_is_equal(hw_var.value, "opencl"))
-            hw_decoder = AV_HWDEVICE_TYPE_OPENCL;
-#endif
-         else if (string_is_equal(hw_var.value, "qsv"))
-            hw_decoder = AV_HWDEVICE_TYPE_QSV;
-         else if (string_is_equal(hw_var.value, "vaapi"))
-            hw_decoder = AV_HWDEVICE_TYPE_VAAPI;
-         else if (string_is_equal(hw_var.value, "vdpau"))
-            hw_decoder = AV_HWDEVICE_TYPE_VDPAU;
-         else if (string_is_equal(hw_var.value, "videotoolbox"))
-            hw_decoder = AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
       }
    }
 
@@ -1192,7 +1135,6 @@ static enum AVPixelFormat init_hw_decoder(struct AVCodecContext *ctx,
    enum AVPixelFormat decoder_pix_fmt = AV_PIX_FMT_NONE;
    const AVCodec *codec = avcodec_find_decoder(fctx->streams[video_stream_index]->codecpar->codec_id);
 
-#if !FFMPEG3
    for (int i = 0;; i++)
    {
       const AVCodecHWConfig *config = avcodec_get_hw_config(codec, i);
@@ -1206,10 +1148,7 @@ static enum AVPixelFormat init_hw_decoder(struct AVCodecContext *ctx,
          config->device_type == type)
       {
          enum AVPixelFormat device_pix_fmt = config->pix_fmt;
-#else
-   enum AVPixelFormat device_pix_fmt =
-      pix_fmts ? ctx->get_format(ctx, pix_fmts) : decoder_pix_fmt;
-#endif
+
          log_cb(RETRO_LOG_INFO, "[FFMPEG] Selected HW decoder %s.\n",
                   av_hwdevice_get_type_name(type));
          log_cb(RETRO_LOG_INFO, "[FFMPEG] Selected HW pixel format %s.\n",
@@ -1232,10 +1171,8 @@ static enum AVPixelFormat init_hw_decoder(struct AVCodecContext *ctx,
             decoder_pix_fmt = device_pix_fmt;
             goto exit;
          }
-#if !FFMPEG3
       }
    }
-#endif
 
 exit:
    if (decoder_pix_fmt != AV_PIX_FMT_NONE)
@@ -1577,17 +1514,12 @@ static void set_colorspace(struct SwsContext *sws,
 {
    const int *coeffs = NULL;
 
-   if (colorspace == AVCOL_SPC_UNSPECIFIED)
-   {
-      if (default_color != AVCOL_SPC_UNSPECIFIED)
-         coeffs = sws_getCoefficients(default_color);
-      else if (width >= 1280 || height > 576)
-         coeffs = sws_getCoefficients(AVCOL_SPC_BT709);
-      else
-         coeffs = sws_getCoefficients(AVCOL_SPC_BT470BG);
-   }
+   if (default_color != AVCOL_SPC_UNSPECIFIED)
+      coeffs = sws_getCoefficients(default_color);
+   else if (width >= 1280 || height > 576)
+      coeffs = sws_getCoefficients(AVCOL_SPC_BT709);
    else
-      coeffs = sws_getCoefficients(colorspace);
+      coeffs = sws_getCoefficients(AVCOL_SPC_BT470BG);
 
    if (coeffs)
    {
