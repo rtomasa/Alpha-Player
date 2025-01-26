@@ -14,9 +14,7 @@
 #include <libavutil/time.h>
 #include <libavutil/opt.h>
 #include <libavutil/log.h>
-#ifdef HAVE_SWRESAMPLE
 #include <libswresample/swresample.h>
-#endif
 
 #ifdef HAVE_SSA
 #include <ass/ass.h>
@@ -26,7 +24,7 @@
 #include "include/ffmpeg_fft.h"
 #endif
 
-#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+#if defined(HAVE_OPENGLES)
 #include <glsym/glsym.h>
 #endif
 
@@ -152,7 +150,7 @@ static double seek_time;
 /* GL stuff */
 struct frame
 {
-#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+#if defined(HAVE_OPENGLES)
    GLuint tex;
 #if !defined(HAVE_OPENGLES)
    GLuint pbo;
@@ -165,7 +163,7 @@ struct frame
 
 static struct frame frames[2];
 
-#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+#if defined(HAVE_OPENGLES)
 static bool temporal_interpolation;
 static bool use_gl;
 static struct retro_hw_render_callback hw_render;
@@ -435,7 +433,7 @@ void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
             {NULL, NULL}
          }, "auto"
       },
-#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+#if defined(HAVE_OPENGLES)
       {
          "mplayer_temporal_interp", "Temporal Interpolation", NULL, NULL, NULL, "music",
          {
@@ -529,7 +527,7 @@ static void check_variables(bool firststart)
    struct retro_variable color_var  = {0};
    struct retro_variable loop_content  = {0};
    struct retro_variable replay_is_crt  = {0};
-#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+#if defined(HAVE_OPENGLES)
    struct retro_variable var        = {0};
 #endif
 #ifdef HAVE_GL_FFT
@@ -537,7 +535,7 @@ static void check_variables(bool firststart)
    struct retro_variable fft_ms_var = {0};
 #endif
 
-#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+#if defined(HAVE_OPENGLES)
    var.key = "mplayer_temporal_interp";
 
    if (CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
@@ -1101,7 +1099,7 @@ void CORE_PREFIX(retro_run)(void)
          frames[0] = tmp;
       }
 
-#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+#if defined(HAVE_OPENGLES)
       if (use_gl)
       {
          float mix_factor;
@@ -1128,12 +1126,8 @@ void CORE_PREFIX(retro_run)(void)
                data                         = video_frame_temp_buffer;
 #else
                glBindBuffer(GL_PIXEL_UNPACK_BUFFER, frames[1].pbo);
-#ifdef __MACH__
-               data                         = (uint32_t*)glMapBuffer(GL_PIXEL_UNPACK_BUFFER, GL_WRITE_ONLY);
-#else
                data                         = (uint32_t*)glMapBufferRange(GL_PIXEL_UNPACK_BUFFER,
                      0, media.width * media.height * sizeof(uint32_t), GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
-#endif
 #endif
                src                          = ctx->target->data[0];
                stride                       = ctx->target->linesize[0];
@@ -1242,7 +1236,7 @@ void CORE_PREFIX(retro_run)(void)
                option_width, option_height, option_width * sizeof(uint32_t));
       }
    }
-#if defined(HAVE_GL_FFT) && (defined(HAVE_OPENGL) || defined(HAVE_OPENGLES))
+#if defined(HAVE_GL_FFT) && defined(HAVE_OPENGLES)
    else if (fft)
    {
       unsigned       frames = to_read_frames;
@@ -2268,7 +2262,7 @@ static void decode_thread(void *data)
    slock_unlock(fifo_lock);
 }
 
-#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+#if defined(HAVE_OPENGLES)
 static void context_destroy(void)
 {
 #ifdef HAVE_GL_FFT
@@ -2547,7 +2541,7 @@ bool CORE_PREFIX(retro_load_game)(const struct retro_game_info *info)
 
    if (video_stream_index >= 0 || is_fft)
    {
-#if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
+#if defined(HAVE_OPENGLES)
       use_gl = true;
       hw_render.context_reset      = context_reset;
       hw_render.context_destroy    = context_destroy;
@@ -2652,13 +2646,3 @@ void CORE_PREFIX(retro_cheat_set)(unsigned index, bool enabled, const char *code
    (void)enabled;
    (void)code;
 }
-
-#if defined(LIBRETRO_SWITCH)
-
-#ifdef ARCH_X86
-#include "../libswresample/resample.h"
-void swri_resample_dsp_init(ResampleContext *c)
-{}
-#endif
-
-#endif

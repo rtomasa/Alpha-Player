@@ -16,6 +16,8 @@
         "random": "c",
         "stdarg.h": "c",
         "stdlib.h": "c",
-        "retro_common_api.h": "c"
+        "retro_common_api.h": "c",
+        "retro_miscellaneous.h": "c",
+        "stdstring.h": "c"
     }
 }

@@ -1,11 +1,5 @@
-#ifdef __cplusplus
-extern "C" {
-#endif
 #include <libavformat/avformat.h>
 #include <libavutil/imgutils.h>
-#ifdef __cplusplus
-}
-#endif
 
 #include <rthreads/rthreads.h>
 
