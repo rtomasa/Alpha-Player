@@ -80,12 +80,10 @@ static tpool_t *tpool;
 #define FFMPEG3 ((LIBAVUTIL_VERSION_INT < (56, 6, 100)) || \
       (LIBAVCODEC_VERSION_INT < AV_VERSION_INT(58, 10, 100)))
 
-#if ENABLE_HW_ACCEL
 static enum AVHWDeviceType hw_decoder;
 static bool hw_decoding_enabled;
 static enum AVPixelFormat pix_fmt;
 static bool force_sw_decoder;
-#endif
 
 #define MAX_STREAMS 8
 static AVCodecContext *actx[MAX_STREAMS];
@@ -367,26 +365,14 @@ void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
             {"vga", "VGA (240)"}
          }, "native"
       },
-#if ENABLE_HW_ACCEL
       {
          "mplayer_hw_decoder", "Hardware Decoder (restart)", NULL, INFO_RESTART, NULL, "video",
          {
             {"off", "Disabled"},
-            {"auto", "Automatic"},
-            {"cuda", "CUDA"},
-            {"d3d11va", "D3D11VA"},
-            {"dxva2", "DXVA2"},
             {"drm", "DRM"},
-            {"mediacodec", "MediaCodec"},
-            {"opencl", "OpenCL"},
-            {"qsv", "QSV"},
-            {"vaapi", "VAAPI"},
-            {"vdpau", "VDPAU"},
-            {"videotoolbox", "VideoToolbox"},
             {NULL, NULL}
          }, "off"
       },
-#endif
       {
          "mplayer_loop_content", "Loop", NULL, NULL, NULL, NULL,
          {
@@ -588,7 +574,6 @@ static void check_variables(bool firststart)
          is_crt = false;
    }
 
-#if ENABLE_HW_ACCEL
    if (firststart)
    {
       hw_var.key = "mplayer_hw_decoder";
@@ -624,7 +609,6 @@ static void check_variables(bool firststart)
             hw_decoder = AV_HWDEVICE_TYPE_VIDEOTOOLBOX;
       }
    }
-#endif
 
    if (firststart)
    {
@@ -1196,7 +1180,6 @@ void CORE_PREFIX(retro_run)(void)
       CORE_PREFIX(audio_batch_cb)(audio_buffer, to_read_frames);
 }
 
-#if ENABLE_HW_ACCEL
 /*
  * Try to initialize a specific HW decoder defined by type.
  * Optionaly tests the pixel format list for a compatible pixel format.
@@ -1287,14 +1270,12 @@ static enum AVPixelFormat auto_hw_decoder(AVCodecContext *ctx,
 
    return decoder_pix_fmt;
 }
-#endif
 
 static enum AVPixelFormat select_decoder(AVCodecContext *ctx,
                                     const enum AVPixelFormat *pix_fmts)
 {
    enum AVPixelFormat format = AV_PIX_FMT_NONE;
 
-#if ENABLE_HW_ACCEL
    if (!force_sw_decoder)
    {
       if (hw_decoder == AV_HWDEVICE_TYPE_NONE)
@@ -1306,27 +1287,20 @@ static enum AVPixelFormat select_decoder(AVCodecContext *ctx,
    /* Fallback to SW rendering */
    if (format == AV_PIX_FMT_NONE)
    {
-#endif
-
       log_cb(RETRO_LOG_INFO, "[FFMPEG] Using SW decoding.\n");
 
       ctx->thread_type       = FF_THREAD_FRAME;
       ctx->thread_count      = sw_decoder_threads;
       log_cb(RETRO_LOG_INFO, "[FFMPEG] Configured software decoding threads: %d\n", sw_decoder_threads);
-
       format                 = (enum AVPixelFormat)fctx->streams[video_stream_index]->codecpar->format;
-
-#if ENABLE_HW_ACCEL
       hw_decoding_enabled    = false;
    }
    else
       hw_decoding_enabled    = true;
-#endif
 
    return format;
 }
 
-#if ENABLE_HW_ACCEL
 /* Callback used by ffmpeg to configure the pixelformat to use. */
 static enum AVPixelFormat get_format(AVCodecContext *ctx,
                                      const enum AVPixelFormat *pix_fmts)
@@ -1342,7 +1316,6 @@ static enum AVPixelFormat get_format(AVCodecContext *ctx,
 
    return pix_fmt;
 }
-#endif
 
 static bool open_codec(AVCodecContext **ctx, enum AVMediaType type, unsigned index)
 {
@@ -1360,13 +1333,8 @@ static bool open_codec(AVCodecContext **ctx, enum AVMediaType type, unsigned ind
    if (type == AVMEDIA_TYPE_VIDEO)
    {
       video_stream_index = index;
-
-#if ENABLE_HW_ACCEL
       vctx->get_format  = get_format;
       pix_fmt = select_decoder((*ctx), NULL);
-#else
-      select_decoder((*ctx), NULL);
-#endif
    }
 
    if ((ret = avcodec_open2(*ctx, codec, NULL)) < 0)
@@ -1697,11 +1665,9 @@ static void sws_worker_thread(void *arg)
    AVFrame *tmp_frame = NULL;
    video_decoder_context_t *ctx = (video_decoder_context_t*) arg;
 
-#if ENABLE_HW_ACCEL
    if (hw_decoding_enabled)
       tmp_frame = ctx->hw_source;
    else
-#endif
       tmp_frame = ctx->source;
 
    ctx->sws = sws_getCachedContext(ctx->sws,
@@ -1736,10 +1702,7 @@ static void sws_worker_thread(void *arg)
 #endif
 
    av_frame_unref(ctx->source);
-#if ENABLE_HW_ACCEL
    av_frame_unref(ctx->hw_source);
-#endif
-
    video_buffer_finish_slot(video_buffer, ctx);
 }
 
@@ -2170,10 +2133,8 @@ static void decode_thread(void *data)
    for (i = 0; (int)i < audio_streams_num; i++)
       swr_free(&swr[i]);
 
-#if ENABLE_HW_ACCEL
    if (vctx && vctx->hw_device_ctx)
       av_buffer_unref(&vctx->hw_device_ctx);
-#endif
 
    packet_buffer_destroy(audio_packet_buffer);
    packet_buffer_destroy(video_packet_buffer);
