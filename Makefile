@@ -26,7 +26,7 @@ GLFLAGS   :=
 
 BAKE_IN_FFMPEG := 0
 
-DEBUG := 1
+DEBUG := 0
 
 #CPU Optimization flags
 HAVE_SSE2 = 0
