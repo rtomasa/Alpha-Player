@@ -62,8 +62,6 @@ static int video_stream_index;
 static bool loopcontent;
 static bool is_crt = false;
 AVPacket *pkt;
-static int option_width = 320;
-static int option_height = 240;
 
 static unsigned sw_decoder_threads;
 static unsigned sw_sws_threads;
@@ -282,27 +280,6 @@ void CORE_PREFIX(retro_get_system_av_info)(struct retro_system_av_info *info)
    unsigned height = vctx ? media.height : 240;
    float aspect    = vctx ? media.aspect : (float)width / (float)height;
 
-   struct retro_variable video_resolution  = {0};
-   video_resolution.key = "mplayer_video_resolution";
-   if (CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_GET_VARIABLE, &video_resolution) && video_resolution.value)
-   {
-      if (string_is_equal(video_resolution.value, "native") && !is_crt) {
-         option_width = width;
-         option_height = height;
-      }
-      else if (string_is_equal(video_resolution.value, "pal")) {
-         option_width = 576.0 * aspect;
-         option_height = 576;
-      }
-      else if (string_is_equal(video_resolution.value, "ntsc")) {
-         option_width = 480.0 * aspect;
-         option_height = 480;
-      }
-      else { // fallback to "vga"
-         option_width = 240.0 * aspect;
-         option_height = 240;
-      }
-   }
    if (audio_streams_num > 0 && video_stream_index < 0)
    {
       width = fft_width;
@@ -312,11 +289,11 @@ void CORE_PREFIX(retro_get_system_av_info)(struct retro_system_av_info *info)
    info->timing.fps = media.interpolate_fps;
    info->timing.sample_rate = actx[0] ? media.sample_rate : 32000.0;
 
-   info->geometry.base_width   = option_width;
-   info->geometry.base_height  = option_height;
-   info->geometry.max_width    = option_width;
-   info->geometry.max_height   = option_height;
-   info->geometry.aspect_ratio = (float)option_width / (float)option_height;
+   info->geometry.base_width   = media.width;
+   info->geometry.base_height  = media.height;
+   info->geometry.max_width    = media.width;
+   info->geometry.max_height   = media.height;
+   info->geometry.aspect_ratio = (float)media.width / (float)media.height;
 }
 
 void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
@@ -332,15 +309,6 @@ void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
 
    struct retro_core_option_v2_definition option_definitions[] =
    {
-      {
-         "mplayer_video_resolution", "Resolution (restart)", NULL, INFO_RESTART, NULL, "video",
-         {
-            {"native", "Native (LCD)"},
-            {"pal", "PAL (576)"},
-            {"ntsc", "NTSC (480)"},
-            {"vga", "VGA (240)"}
-         }, "native"
-      },
       {
          "mplayer_hw_decoder", "Hardware Decoder (restart)", NULL, INFO_RESTART, NULL, "video",
          {
@@ -964,7 +932,6 @@ void CORE_PREFIX(retro_run)(void)
             for (y = 0; y < media.height; y++, src += stride, data += width/4)
                memcpy(data, src, width);
 
-            glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
             glBindTexture(GL_TEXTURE_2D, frames[1].tex);
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
                   media.width, media.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, video_frame_temp_buffer);
@@ -981,7 +948,7 @@ void CORE_PREFIX(retro_run)(void)
 
       glClearColor(0, 0, 0, 1);
       glClear(GL_COLOR_BUFFER_BIT);
-      glViewport(0, 0, option_width, option_height);
+      glViewport(0, 0, media.width, media.height);
 
       glUseProgram(prog);
 
@@ -1012,7 +979,7 @@ void CORE_PREFIX(retro_run)(void)
 
       /* Draw video using OGL*/
       CORE_PREFIX(video_cb)(RETRO_HW_FRAME_BUFFER_VALID,
-            option_width, option_height, option_width * sizeof(uint32_t));
+            media.width, media.height, media.width * sizeof(uint32_t));
    }
    else if (fft)
    {
@@ -1344,12 +1311,6 @@ static bool init_media_info(void)
       media.height = vctx->height;
       media.aspect = (float)vctx->width *
          av_q2d(vctx->sample_aspect_ratio) / vctx->height;
-      
-      if (option_width == 0 || option_height == 0)
-      {
-         option_width = media.width;
-         option_height = media.height;
-      }
    }
 
    if (fctx)
@@ -2053,6 +2014,7 @@ static void context_reset(void)
 
    glBindBuffer(GL_ARRAY_BUFFER, 0);
    glBindTexture(GL_TEXTURE_2D, 0);
+   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 }
 
 void CORE_PREFIX(retro_unload_game)(void)
