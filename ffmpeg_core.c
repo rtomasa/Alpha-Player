@@ -61,7 +61,10 @@ static AVCodecContext *vctx;
 static int video_stream_index;
 static bool loopcontent;
 static bool is_crt = false;
-AVPacket *pkt;
+
+static double g_current_time = 0.0;  // PTS in seconds
+static slock_t *time_lock    = NULL; // Protects g_current_time
+
 
 static unsigned sw_decoder_threads;
 static unsigned sw_sws_threads;
@@ -588,68 +591,58 @@ static void seek_frame(int seek_frames)
    slock_unlock(fifo_lock);
 }
 
-static void dispaly_time()
+static void dispaly_time(void)
 {
+   // Early-out checks to avoid doing anything if we are shut down or done
    if (!fctx || decode_thread_dead)
-    return;
+      return;
 
+   // Local buffer for the message, plus the RetroArch message object
    char msg[256];
    struct retro_message_ext msg_obj = {0};
-   
    msg[0] = '\0';
 
-   // Getting total duration
+   // 1. Read the shared "current time" in seconds from a protected variable
+   double current_time = 0.0;
+   slock_lock(time_lock);
+   current_time = g_current_time;   // The decode thread sets this
+   slock_unlock(time_lock);
+
+   // 2. Get total duration of the file (already in fctx->duration)
    double total_duration = (double)fctx->duration / AV_TIME_BASE;
 
-   int media_type = get_media_type();
-   double current_time = 0.0;
+   // (Optional) If current_time <= 0 or uninitialized, you could decide to return
+   // or skip the rest. That is up to your design.
+   if (current_time < 0.0)
+      current_time = 0.0;
 
-   if (media_type == MEDIA_TYPE_VIDEO)
-   {
-      AVRational time_base = fctx->streams[video_stream_index]->time_base;
-      // Convert the 'pts' to seconds
-      current_time = av_q2d(time_base) * pkt->pts;
-   }
-   else if (media_type == MEDIA_TYPE_AUDIO)
-   {
-      int audio_stream_index = audio_streams[audio_streams_ptr];
-      AVRational time_base = fctx->streams[audio_stream_index]->time_base;
-      // Convert the 'pts' to seconds
-      current_time = av_q2d(time_base) * pkt->pts;
-   }
-   else
-      return;
-
-   // If you need to handle the case where 'pts' is AV_NOPTS_VALUE (unspecified)
-   if (pkt->pts == AV_NOPTS_VALUE) {
-      // Handle this case as needed, e.g., by using another timestamp or a default value
-      return;
-   }
-
-   // Calculate hours, minutes, and seconds for current time
-   int current_hours = (int)current_time / 3600;
+   // 3. Convert current_time to HH:MM:SS
+   int current_hours   = (int)(current_time / 3600);
    int current_minutes = ((int)current_time % 3600) / 60;
    int current_seconds = (int)current_time % 60;
 
-   // Calculate hours, minutes, and seconds for total duration
-   int total_hours = (int)total_duration / 3600;
-   int total_minutes = ((int)total_duration % 3600) / 60;
-   int total_seconds = (int)total_duration % 60;
+   // 4. Convert total_duration to HH:MM:SS
+   int total_hours     = (int)(total_duration / 3600);
+   int total_minutes   = ((int)total_duration % 3600) / 60;
+   int total_seconds   = (int)total_duration % 60;
 
-   // Calculate Progress
+   // 5. Compute progress percentage (0..100)
    double progress = 0.0;
-   if (total_duration > 0) {
+   if (total_duration > 0.0)
+   {
       progress = (current_time / total_duration) * 100.0;
+      if (progress < 0.0)   progress = 0.0;
+      if (progress > 100.0) progress = 100.0;
    }
-   if (progress < 0.0) progress = 0.0;
-   if (progress > 100.0) progress = 100.0;
 
-   // Print the formatted time
-   snprintf(msg, sizeof(msg), "%02d:%02d:%02d / %02d:%02d:%02d (%d%%)",
-            current_hours, current_minutes, current_seconds,
-            total_hours, total_minutes, total_seconds, (int)progress);
+   // 6. Build the message string
+   snprintf(msg, sizeof(msg),
+         "%02d:%02d:%02d / %02d:%02d:%02d (%d%%)",
+         current_hours, current_minutes, current_seconds,
+         total_hours,   total_minutes,   total_seconds,
+         (int)progress);
 
-   /* Send message to frontend */
+   // 7. Fill in the retro_message_ext object and send to frontend
    msg_obj.msg      = msg;
    msg_obj.duration = 2000;
    msg_obj.priority = 3;
@@ -657,6 +650,7 @@ static void dispaly_time()
    msg_obj.target   = RETRO_MESSAGE_TARGET_ALL;
    msg_obj.type     = RETRO_MESSAGE_TYPE_PROGRESS;
    msg_obj.progress = progress;
+
    CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
 }
 
@@ -1752,7 +1746,7 @@ static void decode_thread(void *data)
    }
 
    while (!decode_thread_dead)
-   {
+   {      
       bool seek;
       int subtitle_stream;
       double seek_time_thread;
@@ -1763,7 +1757,12 @@ static void decode_thread(void *data)
       double next_video_end   = 0.0;
       double next_audio_start = 0.0;
 
-      pkt = av_packet_alloc();
+      AVPacket *pkt_local = av_packet_alloc();  // <--- local AVPacket pointer
+      if (!pkt_local)
+      {
+         // handle error or break
+         break;
+      }
       AVCodecContext *actx_active = NULL;
       AVCodecContext *sctx_active = NULL;
       ASS_Track *ass_track_active = NULL;
@@ -1827,12 +1826,12 @@ static void decode_thread(void *data)
             )
          )
       {
-         packet_buffer_get_packet(audio_packet_buffer, pkt);
-         last_audio_end = audio_timebase * (pkt->pts + pkt->duration);
-         audio_buffer = decode_audio(actx_active, pkt, aud_frame,
+         packet_buffer_get_packet(audio_packet_buffer, pkt_local);
+         last_audio_end = audio_timebase * (pkt_local->pts + pkt_local->duration);
+         audio_buffer = decode_audio(actx_active, pkt_local, aud_frame,
                                     audio_buffer, &audio_buffer_cap,
                                     swr[audio_stream_ptr]);
-         av_packet_unref(pkt);
+         av_packet_unref(pkt_local);
       }
 
       /*
@@ -1849,11 +1848,11 @@ static void decode_thread(void *data)
             )
          )
       {
-         packet_buffer_get_packet(video_packet_buffer, pkt);
+         packet_buffer_get_packet(video_packet_buffer, pkt_local);
 
-         decode_video(vctx, pkt, frame_size, ass_track_active);
+         decode_video(vctx, pkt_local, frame_size, ass_track_active);
 
-         av_packet_unref(pkt);
+         av_packet_unref(pkt_local);
       }
 
       if (packet_buffer_empty(audio_packet_buffer) && packet_buffer_empty(video_packet_buffer) && eof)
@@ -1873,55 +1872,70 @@ static void decode_thread(void *data)
             last_audio_end = 0.0;
             // Possibly clear and reset packet buffers, etc.
 
-            av_packet_free(&pkt);
+            av_packet_free(&pkt_local);
             continue;  // Continue the loop instead of breaking
          }
          else
          {
-            av_packet_free(&pkt);
+            av_packet_free(&pkt_local);
             break;  // Keep existing behavior when loopcontent is false
          }
       }
 
       // Read the next frame and stage it in case of audio or video frame.
-      if (av_read_frame(fctx, pkt) < 0)
-         eof = true;
-      else if (pkt->stream_index == audio_stream_index && actx_active)
-         packet_buffer_add_packet(audio_packet_buffer, pkt);
-      else if (pkt->stream_index == video_stream_index)
-         packet_buffer_add_packet(video_packet_buffer, pkt);
-      else if (pkt->stream_index == subtitle_stream && sctx_active)
+      if (av_read_frame(fctx, pkt_local) < 0)
       {
-         /**
-          * Decode subtitle packets right away, since SSA/ASS can operate this way.
-          * If we ever support other subtitles, we need to handle this with a
-          * buffer too
-          **/
-         AVSubtitle sub;
-         int finished = 0;
-
-         memset(&sub, 0, sizeof(sub));
-
-         while (!finished)
-         {
-            if (avcodec_decode_subtitle2(sctx_active, &sub, &finished, pkt) < 0)
-            {
-               log_cb(RETRO_LOG_ERROR, "[FFMPEG] Decode subtitles failed.\n");
-               break;
-            }
-         }
-         for (i = 0; i < sub.num_rects; i++)
-         {
-            slock_lock(ass_lock);
-            if (sub.rects[i]->ass && ass_track_active)
-               ass_process_data(ass_track_active,
-                     sub.rects[i]->ass, strlen(sub.rects[i]->ass));
-            slock_unlock(ass_lock);
-         }
-         avsubtitle_free(&sub);
-         av_packet_unref(pkt);
+         eof = true;
       }
-      av_packet_free(&pkt);
+      else
+      {
+         // Update g_current_time if not NOPTS
+         if (pkt_local->pts != AV_NOPTS_VALUE)
+         {
+            double this_pts_seconds = pkt_local->pts * av_q2d(fctx->streams[pkt_local->stream_index]->time_base);
+
+            slock_lock(time_lock);
+            g_current_time = this_pts_seconds;
+            slock_unlock(time_lock);
+         }
+
+         if (pkt_local->stream_index == audio_stream_index && actx_active)
+            packet_buffer_add_packet(audio_packet_buffer, pkt_local);
+         else if (pkt_local->stream_index == video_stream_index)
+            packet_buffer_add_packet(video_packet_buffer, pkt_local);
+         else if (pkt_local->stream_index == subtitle_stream && sctx_active)
+         {
+            /**
+             * Decode subtitle packets right away, since SSA/ASS can operate this way.
+             * If we ever support other subtitles, we need to handle this with a
+             * buffer too
+             **/
+            AVSubtitle sub;
+            int finished = 0;
+
+            memset(&sub, 0, sizeof(sub));
+
+            while (!finished)
+            {
+               if (avcodec_decode_subtitle2(sctx_active, &sub, &finished, pkt_local) < 0)
+               {
+                  log_cb(RETRO_LOG_ERROR, "[FFMPEG] Decode subtitles failed.\n");
+                  break;
+               }
+            }
+            for (i = 0; i < sub.num_rects; i++)
+            {
+               slock_lock(ass_lock);
+               if (sub.rects[i]->ass && ass_track_active)
+                  ass_process_data(ass_track_active,
+                        sub.rects[i]->ass, strlen(sub.rects[i]->ass));
+               slock_unlock(ass_lock);
+            }
+            avsubtitle_free(&sub);
+            av_packet_unref(pkt_local);
+         }
+      }
+      av_packet_free(&pkt_local);
    }
 
    for (i = 0; (int)i < audio_streams_num; i++)
@@ -2058,7 +2072,8 @@ void CORE_PREFIX(retro_unload_game)(void)
       slock_free(decode_thread_lock);
    if (ass_lock)
       slock_free(ass_lock);
-
+   if (time_lock)
+      slock_free(time_lock);
    if (audio_decode_fifo)
       fifo_free(audio_decode_fifo);
 
@@ -2068,6 +2083,7 @@ void CORE_PREFIX(retro_unload_game)(void)
    decode_thread_lock = NULL;
    audio_decode_fifo = NULL;
    ass_lock = NULL;
+   time_lock = NULL;
 
    decode_last_audio_time = 0.0;
 
@@ -2226,6 +2242,7 @@ bool CORE_PREFIX(retro_load_game)(const struct retro_game_info *info)
    fifo_decode_cond = scond_new();
    fifo_lock        = slock_new();
    ass_lock         = slock_new();
+   time_lock        = slock_new();
 
    slock_lock(fifo_lock);
    decode_thread_dead = false;
