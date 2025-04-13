@@ -5,7 +5,7 @@
 	"autoDelete": false,
 	"checkGitignore": false,
 	"activeTargets": [
-		"media-player"
+		"alpha-player"
 	],
 	"concurrency": 5,
 	"ignore": [
@@ -14,13 +14,13 @@
 	],
 	"targets": [
 		{
-			"name": "media-player",
+			"name": "alpha-player",
 			"type": "sftp",
 			"host": "192.168.0.41",
 			"port": 22,
 			"user": "root",
 			"password": "replayos",
-			"dir": "/opt/media-player",
+			"dir": "/opt/alpha-player",
 			"transferDataType": "binary"
 		}
 	]

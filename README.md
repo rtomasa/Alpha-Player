@@ -1,4 +1,4 @@
-# Media-Player
+# Alpha-Player
 
 A port of the powerful audio/video encoding/decoding library FFmpeg to libretro. This core allows playback of a variety of audio and video formats, with a fancy audio visualizer and the ability to do interframe blending for smoother scrolling of non-native framerates.
 
@@ -23,7 +23,7 @@ https://github.com/libretro/docs/blob/master/docs/library/ffmpeg.md
 just execute `make` or `make DEBUG=1` if you want a more verbose execution
 
 # IMPORTANT NOTE!!!
-This core has been modified focusing on Raspberry Pi devices using a development version of RePlay OS, so it is not guarantee that it works in other systems or platforms.
+This core has been modified focusing on Raspberry Pi devices using a development version of RePlay OS, so it is not guarantee that it works in other systems or platforms (Linux only).
 
 # Controls
 
@@ -31,6 +31,7 @@ This core has been modified focusing on Raspberry Pi devices using a development
 * JOYPAD_RIGHT - seek +15s
 * JOYPAD_UP - seek +180s
 * JOYPAD_DOWN - seek -180s
+* JOYPAD_START - play/pause
 * JOYPAD_A - display progress
 * JOYPAD_B - display media title
 * JOYPAD_X - enable/disable video subtitles
@@ -42,7 +43,9 @@ This core has been modified focusing on Raspberry Pi devices using a development
 
 # Changelog
 
-- [X] Added libretro API core option v2 support (removed v0)
+# v2.0.0
+- [X] Upgraded code base to make use of modern ffmpeg API
+- [X] Upgraded code base to make use of modern libretro API v2 instead of old v0
 - [X] Added new option to enable loop content
 - [X] Added compilation flag to enable/disable FFmpeg debug messages
 - [X] Added ability to display video title on start
@@ -52,6 +55,7 @@ This core has been modified focusing on Raspberry Pi devices using a development
 - [X] Added ability to display current progress time when pressing A
 - [X] Added ability to display current progress % in addition to time stamps
 - [X] Disabled audio and subtitle track change when playing music
+- [X] Changed default software decoder threads to 1 since it performs the same as multitrhead and avoids crashes
 - [X] Changed API shutdown request on media finish to blank screen
 - [X] Changed video audio track button mapping from L1 to Y
 - [X] Changed video subtitle track button mapping from R1 to X
@@ -64,16 +68,21 @@ This core has been modified focusing on Raspberry Pi devices using a development
 - [X] Changed audio track OSD message to also display the track name
 - [X] Fixed Fast Fourier Transform (FFT) bug preventing frontend from being displayed
 
+# v1.0.0
+
+- This version was based on the original media player from retroarch with some quick fixes
+
 # TODO
 
 - [ ] Add M3U support
 - [ ] Add L2/R2 functionality to do next/last song/video in m3u lists
-- [ ] Fix crash happening some times when unloading core
+- [ ] Add aspect ratio for CRT
 
 <!--
 ## TODO
+- [ ] Fix issue in CRT when videos do not follow standards (e.g. 288@60Hz). This causes A/V desync due to timings generated with different refresh rates (e.g. 288@60Hz is transformed to 288@50Hz)
 - [ ] Check HW h264 `decoders "ffmpeg -decoders | grep h264` -> h264_v4l2m2m
-- [ ] Fix bug
+- [?] Fix bug
     [dca @ 0x558a792630] Not a valid DCA frame
     ERROR] [LRCORE] [FFMPEG] Can't decode audio packet: Invalid data found when processing input
 -->

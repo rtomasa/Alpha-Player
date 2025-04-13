@@ -29,6 +29,11 @@
 #include "include/video_buffer.h"
 
 #include <libretro.h>
+#include <unistd.h>
+static void sthread_sleep_ms(unsigned ms) {
+    usleep(ms * 1000);  // Convert milliseconds to microseconds
+}
+
 #define CORE_PREFIX(s) s
 
 #define PRINT_VERSION(s) log_cb(RETRO_LOG_INFO, "[FFMPEG] lib%s version:\t%d.%d.%d\n", #s, \
@@ -124,9 +129,10 @@ static bool main_sleeping;
 
 static uint32_t *video_frame_temp_buffer;
 
-/* Seeking. */
+/* Seeking, play, pause */
 static bool do_seek;
 static double seek_time;
+static bool paused = false;
 
 /* GL stuff */
 struct frame
@@ -274,7 +280,7 @@ void CORE_PREFIX(retro_set_controller_port_device)(unsigned port, unsigned devic
 void CORE_PREFIX(retro_get_system_info)(struct retro_system_info *info)
 {
    memset(info, 0, sizeof(*info));
-   info->library_name     = "Media Player";
+   info->library_name     = "Alpha Player";
    info->library_version  = "v2";
    info->need_fullpath    = true;
    info->valid_extensions = "mkv|avi|f4v|f4f|3gp|ogm|flv|mp4|mp3|flac|ogg|m4a|webm|3g2|mov|wmv|mpg|mpeg|vob|asf|divx|m2p|m2ts|ps|ts|mxf|wma|wav";
@@ -295,11 +301,11 @@ void CORE_PREFIX(retro_get_system_av_info)(struct retro_system_av_info *info)
    info->timing.fps = media.interpolate_fps;
    info->timing.sample_rate = actx[0] ? media.sample_rate : 32000.0;
 
-   info->geometry.base_width   = media.width;
-   info->geometry.base_height  = media.height;
-   info->geometry.max_width    = media.width;
-   info->geometry.max_height   = media.height;
-   info->geometry.aspect_ratio = (float)media.width / (float)media.height;
+   info->geometry.base_width   = width;
+   info->geometry.base_height  = height;
+   info->geometry.max_width    = width;
+   info->geometry.max_height   = height;
+   info->geometry.aspect_ratio = aspect;
 }
 
 void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
@@ -316,7 +322,7 @@ void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
    struct retro_core_option_v2_definition option_definitions[] =
    {
       {
-         "mplayer_hw_decoder", "Hardware Decoder (restart)", NULL, INFO_RESTART, NULL, "video",
+         "aplayer_hw_decoder", "Hardware Decoder (restart)", NULL, INFO_RESTART, NULL, "video",
          {
             {"auto", "Automatic"},
             {"off", "Disabled"},
@@ -325,17 +331,17 @@ void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
          }, "auto"
       },
       {
-         "mplayer_sw_decoder_threads", "Software Decoder Threads (restart)", NULL, INFO_RESTART, NULL, "video",
+         "aplayer_sw_decoder_threads", "Software Decoder Threads (restart)", NULL, INFO_RESTART, NULL, "video",
          {
             {"auto", "Automatic"},
             {"1", NULL},
             {"2", NULL},
             {"4", NULL},
             {NULL, NULL}
-         }, "auto"
+         }, "1"
       },
       {
-         "mplayer_fft_resolution", "Visualizer Resolution", NULL, NULL, NULL, "music",
+         "aplayer_fft_resolution", "Visualizer Resolution", NULL, NULL, NULL, "music",
          {
             {"320x240", NULL},
             {"320x180", NULL},
@@ -343,7 +349,7 @@ void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
          }, "320x240"
       },
       {
-         "mplayer_loop_content", "Loop", NULL, NULL, NULL, NULL,
+         "aplayer_loop_content", "Loop", NULL, NULL, NULL, NULL,
          {
             {"disabled", "Disabled"},
             {"enabled", "Enabled"},
@@ -416,7 +422,7 @@ static void check_variables(bool firststart)
    struct retro_variable replay_is_crt  = {0};
    struct retro_variable fft_var    = {0};
 
-   fft_var.key = "mplayer_fft_resolution";
+   fft_var.key = "aplayer_fft_resolution";
 
    fft_width       = 320;
    fft_height      = 240;
@@ -430,7 +436,7 @@ static void check_variables(bool firststart)
       }
    }
 
-   loop_content.key = "mplayer_loop_content";
+   loop_content.key = "aplayer_loop_content";
    if (CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_GET_VARIABLE, &loop_content) && loop_content.value)
    {
       if (string_is_equal(loop_content.value, "enabled"))
@@ -450,7 +456,7 @@ static void check_variables(bool firststart)
 
    if (firststart)
    {
-      hw_var.key = "mplayer_hw_decoder";
+      hw_var.key = "aplayer_hw_decoder";
 
       force_sw_decoder = false;
       hw_decoder = AV_HWDEVICE_TYPE_NONE;
@@ -466,7 +472,7 @@ static void check_variables(bool firststart)
 
    if (firststart)
    {
-      sw_threads_var.key = "mplayer_sw_decoder_threads";
+      sw_threads_var.key = "aplayer_sw_decoder_threads";
       if (CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_GET_VARIABLE, &sw_threads_var) && sw_threads_var.value)
       {
          if (string_is_equal(sw_threads_var.value, "auto"))
@@ -660,6 +666,7 @@ void CORE_PREFIX(retro_run)(void)
    static bool last_right;
    static bool last_up;
    static bool last_down;
+   static bool last_start;
    static bool last_a;
    static bool last_b;
    static bool last_x;
@@ -670,7 +677,7 @@ void CORE_PREFIX(retro_run)(void)
    static bool last_r2;
    double min_pts;
    int16_t audio_buffer[2048];
-   bool left, right, up, down, a, b, x, y, l, r, l2, r2;
+   bool left, right, up, down, start, a, b, x, y, l, r, l2, r2;
    int16_t ret                  = 0;
    size_t to_read_frames        = 0;
    int seek_frames              = 0;
@@ -714,6 +721,7 @@ void CORE_PREFIX(retro_run)(void)
    right = ret & (1 << RETRO_DEVICE_ID_JOYPAD_RIGHT);
    up    = ret & (1 << RETRO_DEVICE_ID_JOYPAD_UP);
    down  = ret & (1 << RETRO_DEVICE_ID_JOYPAD_DOWN);
+   start = ret & (1 << RETRO_DEVICE_ID_JOYPAD_START);
    a     = ret & (1 << RETRO_DEVICE_ID_JOYPAD_A);
    b     = ret & (1 << RETRO_DEVICE_ID_JOYPAD_B);
    x     = ret & (1 << RETRO_DEVICE_ID_JOYPAD_X);
@@ -725,6 +733,40 @@ void CORE_PREFIX(retro_run)(void)
 
    if (!decode_thread_dead)
    {
+      /* Play/Pause */
+      if (start && !last_start) {
+         // Toggle the pause state.
+         paused = !paused;
+         {
+            // Send an on-screen message informing the user.
+            char msg[32];
+            struct retro_message_ext msg_obj = {0};
+            
+            if (paused) {
+               snprintf(msg, sizeof(msg), "Paused");
+               // Flush pending audio (optional: clear the audio FIFO so audio won’t catch up unexpectedly)
+               slock_lock(fifo_lock);
+               if (audio_decode_fifo)
+                  fifo_clear(audio_decode_fifo);
+               scond_signal(fifo_decode_cond);
+               slock_unlock(fifo_lock);
+            } else {
+               snprintf(msg, sizeof(msg), "Resumed");
+               // Signal in case the decode thread is waiting for a resume
+               scond_signal(fifo_decode_cond);
+            }
+            
+            msg_obj.msg      = msg;
+            msg_obj.duration = 2000;  // Duration in ms for the message display
+            msg_obj.priority = 1;
+            msg_obj.level    = RETRO_LOG_INFO;
+            msg_obj.target   = RETRO_MESSAGE_TARGET_ALL;
+            msg_obj.type     = RETRO_MESSAGE_TYPE_NOTIFICATION;
+            msg_obj.progress = -1;
+            CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
+         }
+      }
+
       /* Display info */
 
       if (b && !last_b)
@@ -819,6 +861,7 @@ void CORE_PREFIX(retro_run)(void)
    last_right = right;
    last_up    = up;
    last_down  = down;
+   last_start = start;
    last_a     = a;
    last_b     = b;
    last_x     = x;
@@ -827,6 +870,13 @@ void CORE_PREFIX(retro_run)(void)
    last_r     = r;
    last_l2    = l2;
    last_r2    = r2;
+
+   // If paused, simply display the last rendered video frame and skip further processing.
+   if (paused) {
+      CORE_PREFIX(video_cb)(RETRO_HW_FRAME_BUFFER_VALID, media.width, media.height, media.width * sizeof(uint32_t));
+      // Do not process audio or advance frames.
+      return;
+   }
 
    if (reset_triggered)
    {
@@ -896,8 +946,6 @@ void CORE_PREFIX(retro_run)(void)
 
    if (video_stream_index >= 0)
    {
-      bool dupe = true; /* unused if GL enabled */
-
       /* Video */
       if (min_pts > frames[1].pts)
       {
@@ -1746,7 +1794,15 @@ static void decode_thread(void *data)
    }
 
    while (!decode_thread_dead)
-   {      
+   {
+      // If paused, simply sleep a little and then check again.
+      if (paused)
+      {
+         // You may use a thread sleep utility if available in your threading library:
+         sthread_sleep_ms(50);  // Sleep for about 50ms
+         continue;
+      }
+
       bool seek;
       int subtitle_stream;
       double seek_time_thread;
