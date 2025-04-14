@@ -30,13 +30,10 @@
 
 #include <libretro.h>
 #include <unistd.h>
-static void sthread_sleep_ms(unsigned ms) {
-    usleep(ms * 1000);  // Convert milliseconds to microseconds
-}
 
 #define CORE_PREFIX(s) s
 
-#define PRINT_VERSION(s) log_cb(RETRO_LOG_INFO, "[FFMPEG] lib%s version:\t%d.%d.%d\n", #s, \
+#define PRINT_VERSION(s) log_cb(RETRO_LOG_INFO, "[APLAYER] lib%s version:\t%d.%d.%d\n", #s, \
    s ##_version() >> 16 & 0xFF, \
    s ##_version() >> 8 & 0xFF, \
    s ##_version() & 0xFF);
@@ -186,7 +183,7 @@ static void ass_msg_cb(int level, const char *fmt, va_list args, void *data)
    if (level < 6)
    {
       vsnprintf(buffer, sizeof(buffer), fmt, args);
-      log_cb(RETRO_LOG_INFO, "[FFMPEG] %s\n", buffer);
+      log_cb(RETRO_LOG_INFO, "[APLAYER] %s\n", buffer);
    }
 }
 
@@ -336,9 +333,10 @@ void CORE_PREFIX(retro_set_environment)(retro_environment_t cb)
             {"auto", "Automatic"},
             {"1", NULL},
             {"2", NULL},
+            {"3", NULL},
             {"4", NULL},
             {NULL, NULL}
-         }, "1"
+         }, "auto"
       },
       {
          "aplayer_fft_resolution", "Visualizer Resolution", NULL, NULL, NULL, "music",
@@ -577,7 +575,7 @@ static void seek_frame(int seek_frames)
 
    if (seek_frames_capped < 0)
    {
-      log_cb(RETRO_LOG_INFO, "[FFMPEG] Resetting PTS.\n");
+      log_cb(RETRO_LOG_INFO, "[APLAYER] Resetting PTS.\n");
       frames[0].pts = 0.0;
       frames[1].pts = 0.0;
    }
@@ -744,16 +742,8 @@ void CORE_PREFIX(retro_run)(void)
             
             if (paused) {
                snprintf(msg, sizeof(msg), "Paused");
-               // Flush pending audio (optional: clear the audio FIFO so audio won’t catch up unexpectedly)
-               slock_lock(fifo_lock);
-               if (audio_decode_fifo)
-                  fifo_clear(audio_decode_fifo);
-               scond_signal(fifo_decode_cond);
-               slock_unlock(fifo_lock);
             } else {
                snprintf(msg, sizeof(msg), "Resumed");
-               // Signal in case the decode thread is waiting for a resume
-               scond_signal(fifo_decode_cond);
             }
             
             msg_obj.msg      = msg;
@@ -929,7 +919,7 @@ void CORE_PREFIX(retro_run)(void)
 
       if (pts_bias < old_pts_bias - 1.0)
       {
-         log_cb(RETRO_LOG_INFO, "[FFMPEG] Resetting PTS (bias).\n");
+         log_cb(RETRO_LOG_INFO, "[APLAYER] Resetting PTS (bias).\n");
          frames[0].pts = 0.0;
          frames[1].pts = 0.0;
       }
@@ -1079,7 +1069,7 @@ static enum AVPixelFormat init_hw_decoder(struct AVCodecContext *ctx,
       const AVCodecHWConfig *config = avcodec_get_hw_config(codec, i);
       if (!config)
       {
-         log_cb(RETRO_LOG_ERROR, "[FFMPEG] Codec %s is not supported by HW video decoder %s.\n",
+         log_cb(RETRO_LOG_ERROR, "[APLAYER] Codec %s is not supported by HW video decoder %s.\n",
                   codec->name, av_hwdevice_get_type_name(type));
          break;
       }
@@ -1088,9 +1078,9 @@ static enum AVPixelFormat init_hw_decoder(struct AVCodecContext *ctx,
       {
          enum AVPixelFormat device_pix_fmt = config->pix_fmt;
 
-         log_cb(RETRO_LOG_INFO, "[FFMPEG] Selected HW decoder %s.\n",
+         log_cb(RETRO_LOG_INFO, "[APLAYER] Selected HW decoder %s.\n",
                   av_hwdevice_get_type_name(type));
-         log_cb(RETRO_LOG_INFO, "[FFMPEG] Selected HW pixel format %s.\n",
+         log_cb(RETRO_LOG_INFO, "[APLAYER] Selected HW pixel format %s.\n",
                   av_get_pix_fmt_name(device_pix_fmt));
 
          if (pix_fmts != NULL)
@@ -1102,7 +1092,7 @@ static enum AVPixelFormat init_hw_decoder(struct AVCodecContext *ctx,
                   decoder_pix_fmt = pix_fmts[i];
                   goto exit;
                }
-            log_cb(RETRO_LOG_ERROR, "[FFMPEG] Codec %s does not support device pixel format %s.\n",
+            log_cb(RETRO_LOG_ERROR, "[APLAYER] Codec %s does not support device pixel format %s.\n",
                   codec->name, av_get_pix_fmt_name(device_pix_fmt));
          }
          else
@@ -1120,7 +1110,7 @@ exit:
       if ((ret = av_hwdevice_ctx_create(&hw_device_ctx,
                                        type, NULL, NULL, 0)) < 0)
       {
-         log_cb(RETRO_LOG_ERROR, "[FFMPEG] Failed to create specified HW device: %s\n", av_err2str(ret));
+         log_cb(RETRO_LOG_ERROR, "[APLAYER] Failed to create specified HW device: %s\n", av_err2str(ret));
          decoder_pix_fmt = AV_PIX_FMT_NONE;
       }
       else
@@ -1163,11 +1153,11 @@ static enum AVPixelFormat select_decoder(AVCodecContext *ctx,
    /* Fallback to SW rendering */
    if (format == AV_PIX_FMT_NONE)
    {
-      log_cb(RETRO_LOG_INFO, "[FFMPEG] Using SW decoding.\n");
+      log_cb(RETRO_LOG_INFO, "[APLAYER] Using SW decoding.\n");
 
       ctx->thread_type       = FF_THREAD_FRAME;
       ctx->thread_count      = sw_decoder_threads;
-      log_cb(RETRO_LOG_INFO, "[FFMPEG] Configured software decoding threads: %d\n", sw_decoder_threads);
+      log_cb(RETRO_LOG_INFO, "[APLAYER] Configured software decoding threads: %d\n", sw_decoder_threads);
       format                 = (enum AVPixelFormat)fctx->streams[video_stream_index]->codecpar->format;
       hw_decoding_enabled    = false;
    }
@@ -1199,7 +1189,7 @@ static bool open_codec(AVCodecContext **ctx, enum AVMediaType type, unsigned ind
    const AVCodec *codec = avcodec_find_decoder(fctx->streams[index]->codecpar->codec_id);
    if (!codec)
    {
-      log_cb(RETRO_LOG_ERROR, "[FFMPEG] Couldn't find suitable decoder\n");
+      log_cb(RETRO_LOG_ERROR, "[APLAYER] Couldn't find suitable decoder\n");
       return false;
    }
 
@@ -1215,7 +1205,7 @@ static bool open_codec(AVCodecContext **ctx, enum AVMediaType type, unsigned ind
 
    if ((ret = avcodec_open2(*ctx, codec, NULL)) < 0)
    {
-      log_cb(RETRO_LOG_ERROR, "[FFMPEG] Could not open codec: %s\n", av_err2str(ret));
+      log_cb(RETRO_LOG_ERROR, "[APLAYER] Could not open codec: %s\n", av_err2str(ret));
       return false;
    }
 
@@ -1379,7 +1369,7 @@ static bool init_media_info(void)
          media.duration.hours   = 0;
          media.duration.minutes = 0;
          media.duration.seconds = 0;
-         log_cb(RETRO_LOG_ERROR, "[FFMPEG] Could not determine media duration\n");
+         log_cb(RETRO_LOG_ERROR, "[APLAYER] Could not determine media duration\n");
       }
    }
 
@@ -1540,7 +1530,7 @@ static void sws_worker_thread(void *arg)
          tmp_frame->linesize, 0, media.height,
          (uint8_t * const*)ctx->target->data, ctx->target->linesize)) < 0)
    {
-      log_cb(RETRO_LOG_ERROR, "[FFMPEG] Error while scaling image: %s\n", av_err2str(ret));
+      log_cb(RETRO_LOG_ERROR, "[APLAYER] Error while scaling image: %s\n", av_err2str(ret));
    }
 
    ctx->pts = ctx->source->best_effort_timestamp;
@@ -1572,7 +1562,7 @@ static void decode_video(AVCodecContext *ctx, AVPacket *pkt, size_t frame_size, 
       if (main_sleeping)
       {
          if (!do_seek)
-            log_cb(RETRO_LOG_ERROR, "[FFMPEG] Thread: Video deadlock detected.\n");
+            log_cb(RETRO_LOG_ERROR, "[APLAYER] Thread: Video deadlock detected.\n");
          tpool_wait(tpool);
          video_buffer_clear(video_buffer);
          return;
@@ -1597,7 +1587,7 @@ static void decode_video(AVCodecContext *ctx, AVPacket *pkt, size_t frame_size, 
          {
             /* Real error. */
             log_cb(RETRO_LOG_ERROR,
-               "[FFMPEG] Error draining frames: %s\n", av_err2str(ret));
+               "[APLAYER] Error draining frames: %s\n", av_err2str(ret));
             av_frame_free(&tmpframe);
             return;
          }
@@ -1614,7 +1604,7 @@ static void decode_video(AVCodecContext *ctx, AVPacket *pkt, size_t frame_size, 
    {
       /* Real error. */
       log_cb(RETRO_LOG_ERROR,
-         "[FFMPEG] Can't decode video packet: %s\n", av_err2str(ret));
+         "[APLAYER] Can't decode video packet: %s\n", av_err2str(ret));
       return;
    }
 
@@ -1634,7 +1624,7 @@ static void decode_video(AVCodecContext *ctx, AVPacket *pkt, size_t frame_size, 
       {
          /* Real error. */
          log_cb(RETRO_LOG_ERROR,
-            "[FFMPEG] Error while reading video frame: %s\n", av_err2str(ret));
+            "[APLAYER] Error while reading video frame: %s\n", av_err2str(ret));
          video_buffer_return_open_slot(video_buffer, decoder_ctx);
          break;
       }
@@ -1655,7 +1645,7 @@ static int16_t *decode_audio(AVCodecContext *ctx, AVPacket *pkt,
 
    if ((ret = avcodec_send_packet(ctx, pkt)) < 0)
    {
-      log_cb(RETRO_LOG_ERROR, "[FFMPEG] Can't decode audio packet: %s\n", av_err2str(ret));
+      log_cb(RETRO_LOG_ERROR, "[APLAYER] Can't decode audio packet: %s\n", av_err2str(ret));
       return buffer;
    }
 
@@ -1666,7 +1656,7 @@ static int16_t *decode_audio(AVCodecContext *ctx, AVPacket *pkt,
          break;
       else if (ret < 0)
       {
-         log_cb(RETRO_LOG_ERROR, "[FFMPEG] Error while reading audio frame: %s\n", av_err2str(ret));
+         log_cb(RETRO_LOG_ERROR, "[APLAYER] Error while reading audio frame: %s\n", av_err2str(ret));
          break;
       }
 
@@ -1693,7 +1683,7 @@ static int16_t *decode_audio(AVCodecContext *ctx, AVPacket *pkt,
             scond_wait(fifo_decode_cond, fifo_lock);
          else
          {
-            log_cb(RETRO_LOG_ERROR, "[FFMPEG] Thread: Audio deadlock detected.\n");
+            log_cb(RETRO_LOG_ERROR, "[APLAYER] Thread: Audio deadlock detected.\n");
             fifo_clear(audio_decode_fifo);
             break;
          }
@@ -1723,7 +1713,7 @@ static void decode_thread_seek(double time)
    decode_last_audio_time = time;
 
    if (avformat_seek_file(fctx, -1, INT64_MIN, seek_to, INT64_MAX, 0) < 0)
-      log_cb(RETRO_LOG_ERROR, "[FFMPEG] av_seek_frame() failed.\n");
+      log_cb(RETRO_LOG_ERROR, "[APLAYER] av_seek_frame() failed.\n");
 
    if (video_stream_index >= 0)
    {
@@ -1790,16 +1780,13 @@ static void decode_thread(void *data)
       frame_size = av_image_get_buffer_size(AV_PIX_FMT_RGB32, media.width, media.height, 1);
       video_buffer = video_buffer_create(4, frame_size, media.width, media.height);
       tpool = tpool_create(sw_sws_threads);
-      log_cb(RETRO_LOG_INFO, "[FFMPEG] Configured worker threads: %d\n", sw_sws_threads);
+      log_cb(RETRO_LOG_INFO, "[APLAYER] Configured worker threads: %d\n", sw_sws_threads);
    }
 
    while (!decode_thread_dead)
    {
-      // If paused, simply sleep a little and then check again.
-      if (paused)
-      {
-         // You may use a thread sleep utility if available in your threading library:
-         sthread_sleep_ms(50);  // Sleep for about 50ms
+      // If paused, check again.
+      if (paused) {
          continue;
       }
 
@@ -1975,7 +1962,7 @@ static void decode_thread(void *data)
             {
                if (avcodec_decode_subtitle2(sctx_active, &sub, &finished, pkt_local) < 0)
                {
-                  log_cb(RETRO_LOG_ERROR, "[FFMPEG] Decode subtitles failed.\n");
+                  log_cb(RETRO_LOG_ERROR, "[APLAYER] Decode subtitles failed.\n");
                   break;
                }
             }
@@ -2217,15 +2204,15 @@ bool CORE_PREFIX(retro_load_game)(const struct retro_game_info *info)
    enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
 
    struct retro_input_descriptor desc[] = {
+      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START, "Play/Pause" },
       { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT,  "Seek -10 seconds" },
       { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP,    "Seek +60 seconds" },
       { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN,  "Seek -60 seconds" },
       { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT, "Seek +10 seconds" },
-      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L,     "Cycle Audio Track" },
-      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R,     "Cycle Subtitle Track" },
       { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L2,    "Seek -5 minutes" },
       { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R2,    "Seek +5 minutes" },
-
+      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L,     "Cycle Audio Track" },
+      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R,     "Cycle Subtitle Track" },
       { 0 },
    };
 
@@ -2238,13 +2225,13 @@ bool CORE_PREFIX(retro_load_game)(const struct retro_game_info *info)
 
    if (!CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt))
    {
-      log_cb(RETRO_LOG_ERROR, "[FFMPEG] Cannot set pixel format.");
+      log_cb(RETRO_LOG_ERROR, "[APLAYER] Cannot set pixel format.");
       goto error;
    }
 
    if ((ret = avformat_open_input(&fctx, info->path, NULL, NULL)) < 0)
    {
-      log_cb(RETRO_LOG_ERROR, "[FFMPEG] Failed to open input: %s\n", av_err2str(ret));
+      log_cb(RETRO_LOG_ERROR, "[APLAYER] Failed to open input: %s\n", av_err2str(ret));
       goto error;
    }
 
@@ -2252,22 +2239,22 @@ bool CORE_PREFIX(retro_load_game)(const struct retro_game_info *info)
 
    if ((ret = avformat_find_stream_info(fctx, NULL)) < 0)
    {
-      log_cb(RETRO_LOG_ERROR, "[FFMPEG] Failed to find stream info: %s\n", av_err2str(ret));
+      log_cb(RETRO_LOG_ERROR, "[APLAYER] Failed to find stream info: %s\n", av_err2str(ret));
       goto error;
    }
 
-   log_cb(RETRO_LOG_INFO, "[FFMPEG] Media information:\n");
+   log_cb(RETRO_LOG_INFO, "[APLAYER] Media information:\n");
    av_dump_format(fctx, 0, info->path, 0);
 
    if (!open_codecs())
    {
-      log_cb(RETRO_LOG_ERROR, "[FFMPEG] Failed to find codec.");
+      log_cb(RETRO_LOG_ERROR, "[APLAYER] Failed to find codec.");
       goto error;
    }
 
    if (!init_media_info())
    {
-      log_cb(RETRO_LOG_ERROR, "[FFMPEG] Failed to init media info.");
+      log_cb(RETRO_LOG_ERROR, "[APLAYER] Failed to init media info.");
       goto error;
    }
 
@@ -2283,7 +2270,7 @@ bool CORE_PREFIX(retro_load_game)(const struct retro_game_info *info)
       hw_render.context_type = RETRO_HW_CONTEXT_OPENGLES3;
       if (!CORE_PREFIX(environ_cb)(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw_render))
       {
-         log_cb(RETRO_LOG_ERROR, "[FFMPEG] Cannot initialize HW render.\n");
+         log_cb(RETRO_LOG_ERROR, "[APLAYER] Cannot initialize HW render.\n");
       }
    }
    if (audio_streams_num > 0)

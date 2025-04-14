@@ -27,6 +27,7 @@ GLFLAGS   :=
 BAKE_IN_FFMPEG := 0
 
 DEBUG := 0
+SANITIZE := 0
 
 #CPU Optimization flags
 HAVE_SSE2 = 0
@@ -89,6 +90,9 @@ ifneq (,$(findstring unix,$(platform)))
    TARGET := $(TARGET_NAME)_libretro.so
    fpic := -fPIC
    SHARED := -shared -Wl,--version-script=link.T -Wl,--no-undefined -fPIC
+   ifeq ($(SANITIZE),1)
+      LIBS += -lasan
+   endif
 ifeq ($(OPENGL),1)
    GL_LIB := -lGL
 	HAVE_OPENGL = 1
@@ -238,9 +242,15 @@ CFLAGS += $(DEFINES) $(INCFLAGS) $(GLFLAGS) $(DEF_FLAGS)
 CFLAGS += -Wall $(fpic)
 
 ifeq ($(DEBUG), 1)
-   CFLAGS += -O0 -g
+    CFLAGS += -O0 -g
+else ifeq ($(SANITIZE), 1)
+    # Sanitizer needs -O1 or -O0 and frame pointers
+    CFLAGS  += -fsanitize=address -fno-omit-frame-pointer -g -O1
+    LDFLAGS += -fsanitize=address
+    # Disable static linking when using sanitizers
+    SHARED := $(filter-out -static-libgcc -static-libstdc++,$(SHARED))
 else
-   CFLAGS += -O3
+    CFLAGS += -O3
 endif
 
 OBJECTS := $(SOURCES_C:.c=.o) $(SOURCES_CXX:.cpp=.o) ./libretro-common/features/features_cpu.o
@@ -257,7 +267,7 @@ $(TARGET): $(OBJECTS)
 ifeq ($(STATIC_LINKING),1)
 	$(AR) rcs $@ $(OBJECTS)
 else
-	$(CXX) -o $@ $^ $(LIBS) $(SHARED)
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS) $(SHARED)  # Added $(LDFLAGS)
 endif
 
 clean:

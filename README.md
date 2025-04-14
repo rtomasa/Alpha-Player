@@ -55,7 +55,6 @@ This core has been modified focusing on Raspberry Pi devices using a development
 - [X] Added ability to display current progress time when pressing A
 - [X] Added ability to display current progress % in addition to time stamps
 - [X] Disabled audio and subtitle track change when playing music
-- [X] Changed default software decoder threads to 1 since it performs the same as multitrhead and avoids crashes
 - [X] Changed API shutdown request on media finish to blank screen
 - [X] Changed video audio track button mapping from L1 to Y
 - [X] Changed video subtitle track button mapping from R1 to X
