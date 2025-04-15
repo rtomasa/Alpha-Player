@@ -258,6 +258,7 @@ void retro_deinit(void)
 
    if (tpool)
    {
+      tpool_wait(tpool); // Wait for tasks to finish
       tpool_destroy(tpool);
       tpool = NULL;
    }
@@ -2099,11 +2100,18 @@ void retro_unload_game(void)
    
    /* Now that decode_thread is done, wait for all worker tasks */
    if (tpool)
-      tpool_wait(tpool);
+   {
+      tpool_wait(tpool); // Wait for tasks to finish
+      tpool_destroy(tpool);
+      tpool = NULL;
+   }
 
    /* Safe to clear buffer now, since no thread references it anymore */
    if (video_buffer)
-      video_buffer_clear(video_buffer);
+   {
+      video_buffer_destroy(video_buffer);
+      video_buffer = NULL;
+   }
 
    if (fifo_cond)
       scond_free(fifo_cond);
@@ -2138,9 +2146,9 @@ void retro_unload_game(void)
    for (i = 0; i < MAX_STREAMS; i++)
    {
       if (sctx[i])
-         avcodec_close(sctx[i]);
+         avcodec_free_context(&sctx[i]);
       if (actx[i])
-         avcodec_close(actx[i]);
+         avcodec_free_context(&actx[i]);
       sctx[i] = NULL;
       actx[i] = NULL;
    }
@@ -2157,9 +2165,10 @@ void retro_unload_game(void)
       fctx = NULL;
    }
 
-   for (i = 0; i < attachments_size; i++)
+   for (i = 0; i < attachments_size; i++) {
       av_freep(&attachments[i].data);
-   av_freep(&attachments);
+   }
+   av_freep(&attachments); // Free the array itself
    attachments_size = 0;
 
    for (i = 0; i < MAX_STREAMS; i++)
@@ -2171,10 +2180,14 @@ void retro_unload_game(void)
       av_freep(&ass_extra_data[i]);
       ass_extra_data_size[i] = 0;
    }
-   if (ass_render)
+   if (ass_render) {
       ass_renderer_done(ass_render);
-   if (ass)
+      ass_render = NULL;
+   }
+   if (ass) {
       ass_library_done(ass);
+      ass = NULL;
+   }
 
    ass_render = NULL;
    ass = NULL;
