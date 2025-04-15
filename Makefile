@@ -80,11 +80,6 @@ endif
 
 TARGET_NAME := alpha_player
 
-GIT_VERSION ?= " $(shell git rev-parse --short HEAD || echo unknown)"
-ifneq ($(GIT_VERSION)," unknown")
-       CFLAGS += -DGIT_VERSION=\"$(GIT_VERSION)\"
-endif
-
 ifneq (,$(findstring unix,$(platform)))
 	ARCH_X86 = 1
    TARGET := $(TARGET_NAME)_libretro.so
@@ -244,13 +239,16 @@ CFLAGS += -Wall $(fpic)
 ifeq ($(DEBUG), 1)
     CFLAGS += -O0 -g
 else ifeq ($(SANITIZE), 1)
-    # Sanitizer needs -O1 or -O0 and frame pointers
-    CFLAGS  += -fsanitize=address -fno-omit-frame-pointer -g -O1
-    LDFLAGS += -fsanitize=address
-    # Disable static linking when using sanitizers
-    SHARED := $(filter-out -static-libgcc -static-libstdc++,$(SHARED))
+# ASan
+   #CFLAGS  += -fsanitize=address -fno-omit-frame-pointer -g -O1
+   #LDFLAGS += -fsanitize=address -fno-omit-frame-pointer -g -O1
+# TSan
+	CFLAGS  += -fsanitize=thread -fno-omit-frame-pointer -g -O1
+	LDFLAGS += -fsanitize=thread -fno-omit-frame-pointer -g -O1
+   # Disable static linking when using sanitizers
+   SHARED := $(filter-out -static-libgcc -static-libstdc++,$(SHARED))
 else
-    CFLAGS += -O3
+   CFLAGS += -O3
 endif
 
 OBJECTS := $(SOURCES_C:.c=.o) $(SOURCES_CXX:.cpp=.o) ./libretro-common/features/features_cpu.o
