@@ -71,6 +71,7 @@ This core has been modified focusing on Raspberry Pi devices using a development
 - [X] Changed audio track OSD message to also display the track name
 - [X] Fixed Fast Fourier Transform (FFT) OpenGL bug preventing the frontend from being displayed
 - [X] Fixed critical memory leak causing crashes randomly
+- [X] Fixed random crash when changing audio tracks
 
 # v1.0.0
 
@@ -78,10 +79,4 @@ This core has been modified focusing on Raspberry Pi devices using a development
 
 # TODO
 
-- [ ] Fix random crash when changing audio tracks
 - [ ] Find workaround for videos using non standard timings (i.e 288p PAL 60Hz) when played in CRT
-
-<!--
-## TODO
-- [ ] Workaround issue in CRT when videos do not follow standards (e.g. 288@60Hz). This causes A/V desync due to timings generated with
--->

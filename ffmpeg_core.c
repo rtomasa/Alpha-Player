@@ -137,6 +137,7 @@ static uint32_t *video_frame_temp_buffer;
 static bool do_seek;
 static double seek_time;
 static bool paused = false;
+static volatile bool audio_switch_requested = false;
 
 /* GL stuff */
 static struct frame frames[2];
@@ -745,11 +746,6 @@ void retro_run(void)
             ret |= (1 << i);
    }
 
-   if (input_state_cb(0, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_WHEELUP))
-      ret |= (1 << RETRO_DEVICE_ID_JOYPAD_UP);
-   if (input_state_cb(0, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_WHEELDOWN))
-      ret |= (1 << RETRO_DEVICE_ID_JOYPAD_DOWN);
-
    left  = ret & (1 << RETRO_DEVICE_ID_JOYPAD_LEFT);
    right = ret & (1 << RETRO_DEVICE_ID_JOYPAD_RIGHT);
    up    = ret & (1 << RETRO_DEVICE_ID_JOYPAD_UP);
@@ -884,44 +880,41 @@ void retro_run(void)
 
       if (media_type == MEDIA_TYPE_VIDEO && y && !last_y && audio_streams_num > 0)
       {
-         char msg[256];
-         struct retro_message_ext msg_obj = {0};
-
-         msg[0] = '\0';
-
+         // Safely update the new audio track index.
          slock_lock(decode_thread_lock);
          audio_streams_ptr = (audio_streams_ptr + 1) % audio_streams_num;
          slock_unlock(decode_thread_lock);
 
-         int audio_stream_index = audio_streams[audio_streams_ptr];
+         // In addition to updating the index, trigger a full flush of the pipelines.
+         slock_lock(fifo_lock);
+         do_seek = true;
+         // Set the new seek time to the current playback time.
+         // (You can choose to keep the playback time unchanged or compute a new one.)
+         slock_lock(time_lock);
+         seek_time = g_current_time;  // Alternatively, use 0 if you wish to restart the stream.
+         slock_unlock(time_lock);
+         scond_signal(fifo_cond);
+         slock_unlock(fifo_lock);
 
-         AVDictionaryEntry *tag = NULL;
-
-         if (fctx->streams[audio_stream_index]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+         // Display a message for the new audio track.
          {
-               tag = av_dict_get(fctx->streams[audio_stream_index]->metadata, "title", NULL, 0);
-               if (tag)
-               {
-                  snprintf(msg, sizeof(msg), "%s #%d", tag->value, audio_streams_ptr);
-               }
-               else
-               {
-                  snprintf(msg, sizeof(msg), "Audio Track #%d", audio_streams_ptr);
-               }
+            char msg[256];
+            struct retro_message_ext msg_obj = {0};
+            int audio_stream_index = audio_streams[audio_streams_ptr];
+            AVDictionaryEntry *tag = av_dict_get(fctx->streams[audio_stream_index]->metadata, "title", NULL, 0);
+            if (tag)
+               snprintf(msg, sizeof(msg), "%s #%d", tag->value, audio_streams_ptr);
+            else
+               snprintf(msg, sizeof(msg), "Audio Track #%d", audio_streams_ptr);
+            msg_obj.msg      = msg;
+            msg_obj.duration = 3000;
+            msg_obj.priority = 1;
+            msg_obj.level    = RETRO_LOG_INFO;
+            msg_obj.target   = RETRO_MESSAGE_TARGET_ALL;
+            msg_obj.type     = RETRO_MESSAGE_TYPE_NOTIFICATION;
+            msg_obj.progress = -1;
+            environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
          }
-         else
-         {
-            snprintf(msg, sizeof(msg), "Audio Track #%d", audio_streams_ptr);
-         }
-
-         msg_obj.msg      = msg;
-         msg_obj.duration = 3000;
-         msg_obj.priority = 1;
-         msg_obj.level    = RETRO_LOG_INFO;
-         msg_obj.target   = RETRO_MESSAGE_TARGET_ALL;
-         msg_obj.type     = RETRO_MESSAGE_TYPE_NOTIFICATION;
-         msg_obj.progress = -1;
-         environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
       }
       else if (media_type == MEDIA_TYPE_VIDEO && x && !last_x)
       {
@@ -2145,6 +2138,35 @@ static void decode_thread(void *data)
 
          if (break_out_loop)
             break;
+      }
+
+      // Check if an audio track switch has been requested.
+      if (audio_switch_requested)
+      {
+         // Acquire the FIFO lock if necessary (or other audio state lock)
+         slock_lock(fifo_lock);
+
+         // Flush FIFO to drop any packets from the old track.
+         if (audio_decode_fifo) {
+            fifo_clear(audio_decode_fifo);
+         }
+
+         // Flush the audio codec buffers for the old track.
+         if (actx[audio_streams_ptr]) {
+            avcodec_flush_buffers(actx[audio_streams_ptr]);
+         }
+         
+         // Reset timing variables (as an example; adjust to your logic).
+         decode_last_audio_time = 0;
+         audio_frames = 0;
+         
+         // Signal any condition variable to re-awaken waiting threads.
+         scond_signal(fifo_cond);
+
+         // Clear the switch request flag.
+         audio_switch_requested = false;
+         
+         slock_unlock(fifo_lock);
       }
 
       // Read the next frame and stage it in case of audio or video frame.
