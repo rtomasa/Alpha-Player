@@ -46,6 +46,9 @@ This core has been modified focusing on Raspberry Pi devices using a development
 
 # Changelog
 
+# v2.0.2
+- [X] Fixed crash when seeking in many videos
+
 # v2.0.1
 - [X] Fixed crash when music contains embeded image information in GIF or BMP formats
 
