@@ -8,10 +8,13 @@ This is a project based on libretro FFmpeg core used by Retroarch. Since the ori
 
 # Author/License
 
-Media-Player FFmpeg based project is authored by
+Original Media-Player FFmpeg based project is authored by
 
 * Fabrice Bellard
 * FFmpeg team
+
+An fully refactored by
+
 * Rubén Tomás (RTA)
 
 # Original FFmpeg Core Information
@@ -27,35 +30,36 @@ This core has been modified focusing on Raspberry Pi devices using a development
 
 # Controls
 
-* JOYPAD_LEFT - seek -15s
-* JOYPAD_RIGHT - seek +15s
-* JOYPAD_UP - seek +180s
-* JOYPAD_DOWN - seek -180s
 * JOYPAD_START - play/pause
 * JOYPAD_A - display progress
 * JOYPAD_B - display media title
 * JOYPAD_X - enable/disable video subtitles
 * JOYPAD_Y - change video lang audio track
-* JOYPAD_L - NOT SET (reserved for future m3u functionality)
-* JOYPAD_R - NOT SET (reserved for future m3u functionality)
-* JOYPAD_L2 - seek -300s
-* JOYPAD_R2 - seek +300s
+* JOYPAD_L - previous track (m3u)
+* JOYPAD_R - next track (m3u)
+* JOYPAD_LEFT - seek -15s
+* JOYPAD_RIGHT - seek +15s
+* JOYPAD_UP - seek +180s (3 min)
+* JOYPAD_DOWN - seek -180s (3 min)
+* JOYPAD_L2 - seek -300s (5 min)
+* JOYPAD_R2 - seek +300s (5 min)
 
 # Changelog
 
 # v2.0.0
-- [X] Upgraded code base to make use of modern ffmpeg API
-- [X] Upgraded code base to make use of modern libretro API v2 instead of old v0
-- [X] Added new option to enable loop content
+- [X] Upgraded code base to make use of modern FFmpeg API
+- [X] Upgraded code base to make use of modern libretro API v2
+- [X] Added M3U support for creating playlists
+- [X] Added new option to enable different loop modes (track, loop and shuffle)
 - [X] Added compilation flag to enable/disable FFmpeg debug messages
-- [X] Added ability to display video title on start
-- [X] Added ability to display music title on start
+- [X] Added ability to display video title on start (when available)
+- [X] Added ability to display music title on start (when available)
 - [X] Added ability to display video audio track title when changing
-- [X] Added ability to display music or video title when pressing B
+- [X] Added ability to display music or video title when pressing B (when available)
 - [X] Added ability to display current progress time when pressing A
 - [X] Added ability to display current progress % in addition to time stamps
 - [X] Disabled audio and subtitle track change when playing music
-- [X] Changed API shutdown request on media finish to blank screen
+- [X] Changed API shutdown request on media finish to blank screen / last frame
 - [X] Changed video audio track button mapping from L1 to Y
 - [X] Changed video subtitle track button mapping from R1 to X
 - [X] Changed some option labels and categorized by Music and Video
@@ -63,9 +67,10 @@ This core has been modified focusing on Raspberry Pi devices using a development
     * 320x240 for 4:3
     * 320x180 for 16:9
 - [X] Changed HW decoder default value to Auto
-- [X] Changed seek time from 10 to 15 (left/right) and from 60 to 180 (up/down)
+- [X] Changed seek time from 10s to 15s (left/right) and from 60s to 180s (up/down) and added new one 300s (L2/R2)
 - [X] Changed audio track OSD message to also display the track name
-- [X] Fixed Fast Fourier Transform (FFT) bug preventing frontend from being displayed
+- [X] Fixed Fast Fourier Transform (FFT) OpenGL bug preventing the frontend from being displayed
+- [X] Fixed critical memory leak causing crashes randomly
 
 # v1.0.0
 
@@ -73,15 +78,10 @@ This core has been modified focusing on Raspberry Pi devices using a development
 
 # TODO
 
-- [ ] Add M3U support
-- [ ] Add L2/R2 functionality to do next/last song/video in m3u lists
-- [ ] Add aspect ratio for CRT
+- [ ] Fix random crash when changing audio tracks
+- [ ] Find workaround for videos using non standard timings (i.e 288p PAL 60Hz) when played in CRT
 
 <!--
 ## TODO
-- [ ] Fix issue in CRT when videos do not follow standards (e.g. 288@60Hz). This causes A/V desync due to timings generated with different refresh rates (e.g. 288@60Hz is transformed to 288@50Hz)
-- [ ] Check HW h264 `decoders "ffmpeg -decoders | grep h264` -> h264_v4l2m2m
-- [?] Fix bug
-    [dca @ 0x558a792630] Not a valid DCA frame
-    ERROR] [LRCORE] [FFMPEG] Can't decode audio packet: Invalid data found when processing input
+- [ ] Workaround issue in CRT when videos do not follow standards (e.g. 288@60Hz). This causes A/V desync due to timings generated with
 -->

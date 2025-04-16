@@ -16,6 +16,7 @@
 #include <libavutil/log.h>
 #include <libswresample/swresample.h>
 #include <ass/ass.h>
+#include "include/ffmpeg_core.h"
 #include "include/ffmpeg_fft.h"
 
 #include <glsym/glsym.h>
@@ -31,6 +32,11 @@
 #include <libretro.h>
 #include <unistd.h>
 
+#include <string.h>
+#include <ctype.h>
+#include <libgen.h> // for dirname()
+#include <limits.h> // for PATH_MAX
+
 // Retro callbacks
 static retro_environment_t environ_cb;
 static retro_video_refresh_t video_cb;
@@ -40,10 +46,17 @@ static retro_input_poll_t input_poll_cb;
 static retro_input_state_t input_state_cb;
 retro_log_printf_t log_cb;
 
+#define INFO_RESTART "Requires Restart"
+
 #define PRINT_VERSION(s) log_cb(RETRO_LOG_INFO, "[APLAYER] lib%s version:\t%d.%d.%d\n", #s, \
    s ##_version() >> 16 & 0xFF, \
    s ##_version() >> 8 & 0xFF, \
    s ##_version() & 0xFF);
+
+#define MAX_PLAYLIST_ENTRIES 256
+static char playlist[MAX_PLAYLIST_ENTRIES][PATH_MAX];
+static unsigned playlist_count = 0;
+static unsigned playlist_index = 0;  
 
 static bool reset_triggered;
 static bool libretro_supports_bitmasks = false;
@@ -61,12 +74,11 @@ static void fallback_log(enum retro_log_level level, const char *fmt, ...)
 static AVFormatContext *fctx;
 static AVCodecContext *vctx;
 static int video_stream_index;
-static bool loopcontent;
+static int loopcontent;
 static bool is_crt = false;
 
 static double g_current_time = 0.0;  // PTS in seconds
 static slock_t *time_lock    = NULL; // Protects g_current_time
-
 
 static unsigned sw_decoder_threads;
 static unsigned sw_sws_threads;
@@ -96,11 +108,6 @@ static uint8_t *ass_extra_data[MAX_STREAMS];
 static size_t ass_extra_data_size[MAX_STREAMS];
 static slock_t *ass_lock;
 
-struct attachment
-{
-   uint8_t *data;
-   size_t size;
-};
 static struct attachment *attachments;
 static size_t attachments_size;
 
@@ -126,20 +133,12 @@ static bool main_sleeping;
 
 static uint32_t *video_frame_temp_buffer;
 
-/* Seeking, play, pause */
+/* Seeking, play, pause, loop */
 static bool do_seek;
 static double seek_time;
 static bool paused = false;
 
 /* GL stuff */
-struct frame
-{
-   GLuint tex;
-   double pts;
-};
-
-#define INFO_RESTART "Requires Restart"
-
 static struct frame frames[2];
 
 static struct retro_hw_render_callback hw_render;
@@ -149,31 +148,60 @@ static GLint vertex_loc;
 static GLint tex_loc;
 static GLint mix_loc;
 
-enum media_type {
-    MEDIA_TYPE_UNKNOWN = -1,
-    MEDIA_TYPE_VIDEO,
-    MEDIA_TYPE_AUDIO
-};
-
-static struct
+static bool parse_m3u_playlist(const char* path)
 {
-   double interpolate_fps;
-   unsigned width;
-   unsigned height;
-   unsigned sample_rate;
-   AVDictionaryEntry *title;
+   log_cb(RETRO_LOG_INFO, "[APLAYER] Opening M3U playlist: %s\n", path);
 
-   float aspect;
-
-   struct
+   FILE* file = fopen(path, "r");
+   if (!file)
    {
-      double time;
-      unsigned hours;
-      unsigned minutes;
-      unsigned seconds;
-   } duration;
+      log_cb(RETRO_LOG_ERROR, "[APLAYER] Unable to open M3U playlist: %s\n", path);
+      return false;
+   }
 
-} media;
+   char line[PATH_MAX];
+   char playlist_dir[PATH_MAX];
+   strncpy(playlist_dir, path, PATH_MAX - 1);
+   playlist_dir[PATH_MAX - 1] = '\0';
+
+   // Get the directory path of the playlist
+   char *dir = dirname(playlist_dir);
+
+   playlist_count = 0;
+
+   while (fgets(line, sizeof(line), file) && playlist_count < MAX_PLAYLIST_ENTRIES)
+   {
+      char* trimmed = line;
+      while (isspace(*trimmed)) trimmed++;
+
+      if (*trimmed == '#' || *trimmed == '\0')
+         continue; // Skip comments and empty lines
+
+      size_t len = strlen(trimmed);
+      while (len > 0 && (trimmed[len-1] == '\r' || trimmed[len-1] == '\n'))
+         trimmed[--len] = '\0';
+
+      // Build full path
+      char full_path[PATH_MAX];
+      snprintf(full_path, PATH_MAX, "%s/%s", dir, trimmed);
+
+      // Copy the full path into playlist
+      strncpy(playlist[playlist_count++], full_path, PATH_MAX - 1);
+
+      log_cb(RETRO_LOG_INFO, "[APLAYER] Found: %s\n", full_path);
+   }
+
+   fclose(file);
+
+   if (playlist_count == 0)
+   {
+      log_cb(RETRO_LOG_ERROR, "[APLAYER] No valid entries in playlist: %s\n", path);
+      return false;
+   }
+
+   playlist_index = 0;
+   return true;
+}
 
 static void ass_msg_cb(int level, const char *fmt, va_list args, void *data)
 {
@@ -204,26 +232,26 @@ static int get_media_type()
 static void display_media_title()
 {
    if (!fctx || decode_thread_dead)
-    return;
+      return;
 
-   if (media.title)
-   {
-      char msg[256];
-      struct retro_message_ext msg_obj = {0};
+   char msg[256];
+   struct retro_message_ext msg_obj = {0};
+   msg[0] = '\0';
 
-      msg[0] = '\0';
-
+   if (media.title) {
       snprintf(msg, sizeof(msg), "%s", media.title->value);
-
-      msg_obj.msg      = msg;
-      msg_obj.duration = 5000;
-      msg_obj.priority = 1;
-      msg_obj.level    = RETRO_LOG_INFO;
-      msg_obj.target   = RETRO_MESSAGE_TARGET_ALL;
-      msg_obj.type     = RETRO_MESSAGE_TYPE_NOTIFICATION;
-      msg_obj.progress = -1;
-      environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
+   } else {
+      snprintf(msg, sizeof(msg), "%s", "Title not available");
    }
+
+   msg_obj.msg      = msg;
+   msg_obj.duration = 3000;
+   msg_obj.priority = 1;
+   msg_obj.level    = RETRO_LOG_INFO;
+   msg_obj.target   = RETRO_MESSAGE_TARGET_ALL;
+   msg_obj.type     = RETRO_MESSAGE_TYPE_NOTIFICATION;
+   msg_obj.progress = -1;
+   environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
 }
 
 static void append_attachment(const uint8_t *data, size_t size)
@@ -281,7 +309,7 @@ void retro_get_system_info(struct retro_system_info *info)
    info->library_name     = "Alpha Player";
    info->library_version  = "v2";
    info->need_fullpath    = true;
-   info->valid_extensions = "mkv|avi|f4v|f4f|3gp|ogm|flv|mp4|mp3|flac|ogg|m4a|webm|3g2|mov|wmv|mpg|mpeg|vob|asf|divx|m2p|m2ts|ps|ts|mxf|wma|wav";
+   info->valid_extensions = "mkv|avi|f4v|f4f|3gp|ogm|flv|mp4|mp3|flac|ogg|m4a|webm|3g2|mov|wmv|mpg|mpeg|vob|asf|divx|m2p|m2ts|ps|ts|mxf|wma|wav|m3u";
 }
 
 void retro_get_system_av_info(struct retro_system_av_info *info)
@@ -348,12 +376,14 @@ void retro_set_environment(retro_environment_t cb)
          }, "320x240"
       },
       {
-         "aplayer_loop_content", "Loop", NULL, NULL, NULL, NULL,
+         "aplayer_loop_content", "Loop Mode", NULL, NULL, NULL, NULL,
          {
-            {"disabled", "Disabled"},
-            {"enabled", "Enabled"},
+            {"0", "Play Track"},
+            {"1", "Loop Track"},
+            {"2", "Loop All"},
+            {"3", "Shuffle All"},
             {NULL, NULL}
-         }, "disabled"
+         }, "0"
       },
       { NULL, NULL, NULL, NULL, NULL, NULL, {{NULL, NULL}}, NULL }
    };
@@ -434,14 +464,18 @@ static void check_variables(bool firststart)
          fft_height = h;
       }
    }
-
+   /* M3U */
    loop_content.key = "aplayer_loop_content";
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &loop_content) && loop_content.value)
    {
-      if (string_is_equal(loop_content.value, "enabled"))
-         loopcontent = true;
-      else
-         loopcontent = false;
+      if (string_is_equal(loop_content.value, "0"))
+         loopcontent = PLAY_TRACK;
+      else if (string_is_equal(loop_content.value, "1"))
+         loopcontent = LOOP_TRACK;
+      else if (string_is_equal(loop_content.value, "2"))
+         loopcontent = LOOP_ALL;
+      else if (string_is_equal(loop_content.value, "3"))
+         loopcontent = SHUFFLE_ALL;    
    }
 
    replay_is_crt.key = "replay_is_crt";
@@ -566,7 +600,7 @@ static void seek_frame(int seek_frames)
 
    /* Send message to frontend */
    msg_obj.msg      = msg;
-   msg_obj.duration = 2000;
+   msg_obj.duration = 3000;
    msg_obj.priority = 3;
    msg_obj.level    = RETRO_LOG_INFO;
    msg_obj.target   = RETRO_MESSAGE_TARGET_OSD;
@@ -649,7 +683,7 @@ static void dispaly_time(void)
 
    // 7. Fill in the retro_message_ext object and send to frontend
    msg_obj.msg      = msg;
-   msg_obj.duration = 2000;
+   msg_obj.duration = 3000;
    msg_obj.priority = 3;
    msg_obj.level    = RETRO_LOG_INFO;
    msg_obj.target   = RETRO_MESSAGE_TARGET_ALL;
@@ -748,13 +782,78 @@ void retro_run(void)
             }
             
             msg_obj.msg      = msg;
-            msg_obj.duration = 2000;  // Duration in ms for the message display
+            msg_obj.duration = 3000;  // Duration in ms for the message display
             msg_obj.priority = 1;
             msg_obj.level    = RETRO_LOG_INFO;
             msg_obj.target   = RETRO_MESSAGE_TARGET_ALL;
             msg_obj.type     = RETRO_MESSAGE_TYPE_NOTIFICATION;
             msg_obj.progress = -1;
             environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
+         }
+      }
+      /* M3U */
+      /* Handle Next/Previous Track with L/R buttons */
+      if (playlist_count > 0)
+      {
+         if (r && !last_r)
+         {
+            slock_lock(decode_thread_lock);
+            unsigned new_index = (playlist_index + 1) % playlist_count;
+            if (new_index != playlist_index)
+            {
+               playlist_index = new_index;
+               do_seek = true;
+               seek_time = 0.0;
+               // Display track change message with file name only
+               char msg[256];
+               struct retro_message_ext msg_obj = {0};
+
+               // Extract the file name from the full path
+               const char *full_path = playlist[playlist_index];
+               const char *filename = strrchr(full_path, '/');
+               if (filename)
+                  filename++;  // Skip the '/' character
+               else
+                  filename = full_path;
+
+               snprintf(msg, sizeof(msg), "%d/%d %s", playlist_index + 1, playlist_count, filename);
+               msg_obj.msg = msg;
+               msg_obj.duration = 3000;
+               msg_obj.priority = 1;
+               msg_obj.level = RETRO_LOG_INFO;
+               environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
+            }
+            slock_unlock(decode_thread_lock);
+         }
+         else if (l && !last_l)
+         {
+            slock_lock(decode_thread_lock);
+            unsigned new_index = (playlist_index - 1 + playlist_count) % playlist_count;
+            if (new_index != playlist_index)
+            {
+               playlist_index = new_index;
+               do_seek = true;
+               seek_time = 0.0;
+               // Display track change message with file name only
+               char msg[256];
+               struct retro_message_ext msg_obj = {0};
+
+               // Extract the file name from the full path
+               const char *full_path = playlist[playlist_index];
+               const char *filename = strrchr(full_path, '/');
+               if (filename)
+                  filename++;  // Skip the '/' character
+               else
+                  filename = full_path;
+
+               snprintf(msg, sizeof(msg), "%d/%d %s", playlist_index + 1, playlist_count, filename);
+               msg_obj.msg = msg;
+               msg_obj.duration = 3000;
+               msg_obj.priority = 1;
+               msg_obj.level = RETRO_LOG_INFO;
+               environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
+            }
+            slock_unlock(decode_thread_lock);
          }
       }
 
@@ -824,18 +923,23 @@ void retro_run(void)
          msg_obj.progress = -1;
          environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
       }
-      else if (media_type == MEDIA_TYPE_VIDEO && x && !last_x && subtitle_streams_num > 0)
+      else if (media_type == MEDIA_TYPE_VIDEO && x && !last_x)
       {
          char msg[256];
          struct retro_message_ext msg_obj = {0};
-
          msg[0] = '\0';
 
-         slock_lock(decode_thread_lock);
-         subtitle_streams_ptr = (subtitle_streams_ptr + 1) % subtitle_streams_num;
-         slock_unlock(decode_thread_lock);
-
-         snprintf(msg, sizeof(msg), "Subtitle Track #%d", subtitle_streams_ptr);
+         if (subtitle_streams_num > 0)
+         {
+            slock_lock(decode_thread_lock);
+            subtitle_streams_ptr = (subtitle_streams_ptr + 1) % subtitle_streams_num;
+            slock_unlock(decode_thread_lock);
+            snprintf(msg, sizeof(msg), "Subtitle Track #%d", subtitle_streams_ptr);
+         }
+         else
+         {
+            snprintf(msg, sizeof(msg), "Subtitles not available");
+         }
 
          msg_obj.msg      = msg;
          msg_obj.duration = 3000;
@@ -867,6 +971,22 @@ void retro_run(void)
       video_cb(RETRO_HW_FRAME_BUFFER_VALID, media.width, media.height, media.width * sizeof(uint32_t));
       // Do not process audio or advance frames.
       return;
+   }
+   /* M3U */
+   if (do_seek && seek_time == 0.0 && playlist_count > 0)
+   {
+      retro_unload_game();
+      struct retro_game_info next_info = {0};
+      next_info.path = playlist[playlist_index];
+      if (!retro_load_game(&next_info))
+      {
+         // Handle error
+      }
+      do_seek = false;
+
+      struct retro_system_av_info info;
+      retro_get_system_av_info(&info);
+      environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &info);
    }
 
    if (reset_triggered)
@@ -952,15 +1072,14 @@ void retro_run(void)
          int64_t pts = 0;
 
          if (!decode_thread_dead)
-            video_buffer_wait_for_finished_slot(video_buffer);
-
-         if (!decode_thread_dead)
          {
             unsigned y;
             int stride, width;
             const uint8_t *src           = NULL;
             video_decoder_context_t *ctx = NULL;
             uint32_t               *data = NULL;
+
+            video_buffer_wait_for_finished_slot(video_buffer);
 
             video_buffer_get_finished_slot(video_buffer, &ctx);
             pts                          = ctx->pts;
@@ -1763,7 +1882,10 @@ static void decode_thread(void *data)
    {
       swr[i] = swr_alloc();
 
-      av_opt_set_int(swr[i], "in_channel_layout", actx[i]->channel_layout, 0);
+      uint64_t in_layout = actx[i]->channel_layout;
+      if (!in_layout)
+         in_layout = av_get_default_channel_layout(actx[i]->channels);
+      av_opt_set_int(swr[i], "in_channel_layout", in_layout, 0);
       av_opt_set_int(swr[i], "out_channel_layout", AV_CH_LAYOUT_STEREO, 0);
       av_opt_set_int(swr[i], "in_sample_rate", actx[i]->sample_rate, 0);
       av_opt_set_int(swr[i], "out_sample_rate", media.sample_rate, 0);
@@ -1899,31 +2021,130 @@ static void decode_thread(void *data)
          av_packet_unref(pkt_local);
       }
 
-      if (packet_buffer_empty(audio_packet_buffer) && packet_buffer_empty(video_packet_buffer) && eof)
+      bool break_out_loop = false;
+
+      if (packet_buffer_empty(audio_packet_buffer) &&
+         packet_buffer_empty(video_packet_buffer) && eof)
       {
-         if (loopcontent)  // Check if loopcontent is true
+         switch (loopcontent)
          {
-            // Reset playback to the start of the media
-            slock_lock(fifo_lock);
-            do_seek = true;
-            seek_time = 0.0;
-            eof = false;  // Reset EOF flag
-            slock_unlock(fifo_lock);
+            case PLAY_TRACK:
+               if (playlist_count > 0)
+               {
+                  // For an M3U playlist, if there is a next track then advance;
+                  // if already at the last track, finish playback.
+                  if (playlist_index + 1 < playlist_count)
+                  {
+                     slock_lock(fifo_lock);
+                     playlist_index++; 
+                     do_seek = true;
+                     seek_time = 0.0;
+                     eof = false;
+                     slock_unlock(fifo_lock);
+                     log_cb(RETRO_LOG_INFO, "[APLAYER] Advancing to playlist item #%u/%u: %s\n",
+                           playlist_index + 1, playlist_count, playlist[playlist_index]);
+                     av_packet_free(&pkt_local);
+                     break_out_loop = true;  // break out to allow media reload
+                  }
+                  else
+                  {
+                     // Last track in playlist: end playback.
+                     av_packet_free(&pkt_local);
+                     break_out_loop = true;
+                  }
+               }
+               else
+               {
+                  // Single file: do not loop, finish playback.
+                  av_packet_free(&pkt_local);
+                  break_out_loop = true;
+               }
+               break;
 
-            // Reset other necessary variables
-            next_video_end = 0.0;
-            next_audio_start = 0.0;
-            last_audio_end = 0.0;
-            // Possibly clear and reset packet buffers, etc.
+            case LOOP_TRACK:
+               // Always loop the current track, regardless of whether we're part of a playlist.
+               slock_lock(fifo_lock);
+               do_seek = true;
+               seek_time = 0.0;
+               eof = false; // Reset the EOF flag.
+               slock_unlock(fifo_lock);
+               av_packet_free(&pkt_local);
+               // Continue decoding on the same track.
+               continue;
 
-            av_packet_free(&pkt_local);
-            continue;  // Continue the loop instead of breaking
+            case LOOP_ALL:
+               if (playlist_count > 0)
+               {
+                  // If we have a playlist, advance to the next track (or wrap around).
+                  slock_lock(fifo_lock);
+                  if (playlist_index + 1 < playlist_count)
+                     playlist_index++;
+                  else
+                     playlist_index = 0;
+                  do_seek = true;
+                  seek_time = 0.0;
+                  eof = false;
+                  slock_unlock(fifo_lock);
+                  log_cb(RETRO_LOG_INFO, "[APLAYER] Looping playlist, new track #%u/%u: %s\n",
+                        playlist_index + 1, playlist_count, playlist[playlist_index]);
+                  av_packet_free(&pkt_local);
+                  // Exit the loop so that retro_run() can unload and reload the new media.
+                  break_out_loop = true;
+               }
+               else
+               {
+                  // If no playlist (single file), behave like LOOP_TRACK.
+                  slock_lock(fifo_lock);
+                  do_seek = true;
+                  seek_time = 0.0;
+                  eof = false;
+                  slock_unlock(fifo_lock);
+                  av_packet_free(&pkt_local);
+                  continue;
+               }
+               break;
+
+            case SHUFFLE_ALL:
+               if (playlist_count > 0)
+               {
+                  // In a playlist mode, pick a random track different from the current one (if possible).
+                  unsigned old_index = playlist_index;
+                  slock_lock(fifo_lock);
+                  do {
+                     playlist_index = rand() % playlist_count;
+                  } while (playlist_count > 1 && playlist_index == old_index);
+                  do_seek = true;
+                  seek_time = 0.0;
+                  eof = false;
+                  slock_unlock(fifo_lock);
+                  log_cb(RETRO_LOG_INFO, "[APLAYER] Shuffling playlist, new track #%u/%u: %s\n",
+                        playlist_index + 1, playlist_count, playlist[playlist_index]);
+                  av_packet_free(&pkt_local);
+                  // Exit the loop so that the main thread can reload the newly chosen track.
+                  break_out_loop = true;
+               }
+               else
+               {
+                  // If playing a single file, behave like LOOP_TRACK.
+                  slock_lock(fifo_lock);
+                  do_seek = true;
+                  seek_time = 0.0;
+                  eof = false;
+                  slock_unlock(fifo_lock);
+                  av_packet_free(&pkt_local);
+                  continue;
+               }
+               break;
+
+            default:
+               // Fallback: treat as PLAY_TRACK (i.e. finish).
+               av_packet_free(&pkt_local);
+               break_out_loop = true;
+               break;
          }
-         else
-         {
-            av_packet_free(&pkt_local);
-            break;  // Keep existing behavior when loopcontent is false
-         }
+
+         if (break_out_loop)
+            break;
       }
 
       // Read the next frame and stage it in case of audio or video frame.
@@ -2197,6 +2418,46 @@ void retro_unload_game(void)
 
 bool retro_load_game(const struct retro_game_info *info)
 {
+   if (!info)
+      return false;
+
+   const char* ext = strrchr(info->path, '.');
+   // Local mutable retro_game_info
+   struct retro_game_info local_info;
+
+   if (ext && strcasecmp(ext, ".m3u") == 0)
+   {
+      if (!parse_m3u_playlist(info->path))
+         return false;
+
+      // Load first media file in playlist
+      local_info.path = playlist[playlist_index];
+      local_info.size = info->size;
+      local_info.data = info->data;
+   }
+   else
+   {
+      // If not an M3U, check if we're in the middle of a playlist
+      if (playlist_count == 0)
+      {
+         // Not part of a playlist; load as single file
+         playlist_count = 0;
+         playlist_index = 0;
+         local_info.path = info->path;
+         local_info.size = info->size;
+         local_info.data = info->data;
+      }
+      else
+      {
+         // Part of an existing playlist; use the current playlist entry
+         local_info.path = playlist[playlist_index];
+         local_info.size = info->size;
+         local_info.data = info->data;
+      }
+   }
+
+   log_cb(RETRO_LOG_INFO, "[APLAYER] Loading %s", local_info.path);
+
    /*
       AV_LOG_QUIET: No messages are printed.
       AV_LOG_PANIC: Only panics, which are very serious errors like an application crash, are printed.
@@ -2218,19 +2479,20 @@ bool retro_load_game(const struct retro_game_info *info)
 
    struct retro_input_descriptor desc[] = {
       { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START, "Play/Pause" },
-      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT,  "Seek -10 seconds" },
-      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP,    "Seek +60 seconds" },
-      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN,  "Seek -60 seconds" },
-      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT, "Seek +10 seconds" },
-      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L2,    "Seek -5 minutes" },
-      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R2,    "Seek +5 minutes" },
-      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L,     "Cycle Audio Track" },
-      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R,     "Cycle Subtitle Track" },
+      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A,     "Display Time" },
+      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B,     "Display Title" },
+      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_X,     "Toggle Subtitles"},
+      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_Y,     "Cycle Audio Track"},
+      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L,     "Previous (M3U)" },
+      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R,     "Next (M3U)" },
+      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT,  "Seek -15 sec" },
+      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT, "Seek +15 sec" },
+      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN,  "Seek -3 min" },
+      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP,    "Seek +3 min" },
+      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L2,    "Seek -5 min" },
+      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R2,    "Seek +5 min" },
       { 0 },
    };
-
-   if (!info)
-      return false;
 
    check_variables(true);
 
@@ -2242,9 +2504,9 @@ bool retro_load_game(const struct retro_game_info *info)
       goto error;
    }
 
-   if ((ret = avformat_open_input(&fctx, info->path, NULL, NULL)) < 0)
+   if ((ret = avformat_open_input(&fctx, local_info.path, NULL, NULL)) < 0)
    {
-      log_cb(RETRO_LOG_ERROR, "[APLAYER] Failed to open input: %s\n", av_err2str(ret));
+      log_cb(RETRO_LOG_ERROR, "[APLAYER] Failed to open input: %s. %s\n", av_err2str(ret));
       goto error;
    }
 
@@ -2257,7 +2519,7 @@ bool retro_load_game(const struct retro_game_info *info)
    }
 
    log_cb(RETRO_LOG_INFO, "[APLAYER] Media information:\n");
-   av_dump_format(fctx, 0, info->path, 0);
+   av_dump_format(fctx, 0, local_info.path, 0);
 
    if (!open_codecs())
    {
@@ -2293,6 +2555,10 @@ bool retro_load_game(const struct retro_game_info *info)
          media.sample_rate * sizeof(int16_t) * 2 * 2
       );
    }
+
+   // Reallocate video buffer based on new media size
+   av_freep(&video_frame_temp_buffer);
+   video_frame_temp_buffer = (uint32_t*)av_malloc(media.width * media.height * sizeof(uint32_t));
 
    fifo_cond        = scond_new();
    fifo_decode_cond = scond_new();
