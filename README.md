@@ -74,7 +74,6 @@ This core has been modified focusing on Raspberry Pi devices using a development
 - [X] Fixed random crash when changing audio tracks
 
 # v1.0.0
-
 - This version was based on the original media player from retroarch with some quick fixes
 
 # TODO
