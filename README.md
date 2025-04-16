@@ -46,6 +46,9 @@ This core has been modified focusing on Raspberry Pi devices using a development
 
 # Changelog
 
+# v2.0.1
+- [X] Fixed crash when music contains embeded image information in GIF or BMP formats
+
 # v2.0.0
 - [X] Upgraded code base to make use of modern FFmpeg API
 - [X] Upgraded code base to make use of modern libretro API v2

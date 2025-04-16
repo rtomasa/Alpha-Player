@@ -1331,6 +1331,8 @@ static bool codec_is_image(enum AVCodecID id)
    {
       case AV_CODEC_ID_MJPEG:
       case AV_CODEC_ID_PNG:
+      case AV_CODEC_ID_GIF:
+      case AV_CODEC_ID_BMP:
          return true;
 
       default:
