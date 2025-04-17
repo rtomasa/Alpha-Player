@@ -1905,16 +1905,33 @@ static void decode_thread(void *data)
    {
       swr[i] = swr_alloc();
 
-      uint64_t in_layout = actx[i]->channel_layout;
-      if (!in_layout)
-         in_layout = av_get_default_channel_layout(actx[i]->channels);
-      av_opt_set_int(swr[i], "in_channel_layout", in_layout, 0);
-      av_opt_set_int(swr[i], "out_channel_layout", AV_CH_LAYOUT_STEREO, 0);
-      av_opt_set_int(swr[i], "in_sample_rate", actx[i]->sample_rate, 0);
-      av_opt_set_int(swr[i], "out_sample_rate", media.sample_rate, 0);
-      av_opt_set_int(swr[i], "in_sample_fmt", actx[i]->sample_fmt, 0);
-      av_opt_set_int(swr[i], "out_sample_fmt", AV_SAMPLE_FMT_S16, 0);
-      swr_init(swr[i]);
+      uint64_t in_layout  = actx[i]->channel_layout ?
+                      actx[i]->channel_layout :
+                      av_get_default_channel_layout(actx[i]->channels);
+      uint64_t out_layout = AV_CH_LAYOUT_STEREO;
+
+      av_opt_set_int(swr[i], "in_channel_layout",  in_layout,  0);
+      av_opt_set_int(swr[i], "out_channel_layout", out_layout, 0);
+      av_opt_set_int(swr[i], "in_sample_rate",     actx[i]->sample_rate, 0);
+      av_opt_set_int(swr[i], "out_sample_rate",    media.sample_rate,    0);
+      av_opt_set_sample_fmt(swr[i], "in_sample_fmt",  actx[i]->sample_fmt, 0);
+      av_opt_set_sample_fmt(swr[i], "out_sample_fmt", AV_SAMPLE_FMT_S16,  0);
+
+      /* matriz solo si hay 6 canales */
+      if (av_get_channel_layout_nb_channels(in_layout) == 6) {
+         double m[12] = {
+            1.0, 0.0, 1.2, 0.0, 0.5, 0.5, 
+            0.0, 1.0, 1.2, 0.0, 0.5, 0.5
+         };
+         for (int j=0;j<12;j++) m[j]*=2.0;          /* +6 dB */
+         swr_set_matrix(swr[i], m, 0);
+      }
+      
+      int ret;
+      if ((ret = swr_init(swr[i])) < 0) {
+         log_cb(RETRO_LOG_ERROR, "swr_init fallo: %s\n", av_err2str(ret));
+         continue;
+     }
    }
 
    aud_frame = av_frame_alloc();

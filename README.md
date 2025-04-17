@@ -46,6 +46,12 @@ This core has been modified focusing on Raspberry Pi devices using a development
 
 # Changelog
 
+# v2.0.4
+- [ ] Fixed random crash when changing audio tracks
+
+# v2.0.3
+- [X] Added audio gain for videos having 6 channel (5.1) audio tracks
+
 # v2.0.2
 - [X] Fixed crash when seeking in many videos
 
@@ -77,7 +83,6 @@ This core has been modified focusing on Raspberry Pi devices using a development
 - [X] Changed audio track OSD message to also display the track name
 - [X] Fixed Fast Fourier Transform (FFT) OpenGL bug preventing the frontend from being displayed
 - [X] Fixed critical memory leak causing crashes randomly
-- [X] Fixed random crash when changing audio tracks
 
 # v1.0.0
 - This version was based on the original media player from retroarch with some quick fixes
