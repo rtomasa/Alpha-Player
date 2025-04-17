@@ -579,19 +579,6 @@ static void seek_frame(int seek_frames)
    slock_lock(fifo_lock);
    seek_time      = frame_cnt / media.interpolate_fps;
 
-   // Immediately update current time for UI
-   slock_lock(time_lock);
-   g_current_time = seek_time; 
-   slock_unlock(time_lock);
-
-   // Reset synchronization variables
-   pts_bias = 0.0; // Reset audio/video sync offset
-   audio_frames = frame_cnt * media.sample_rate / media.interpolate_fps;
-
-   // Clear audio buffer to prevent stale data
-   if (audio_decode_fifo)
-      fifo_clear(audio_decode_fifo);
-
    /* Convert seek time to a printable format */
    seek_seconds  = (unsigned)seek_time;
    seek_minutes  = seek_seconds / 60;
@@ -902,9 +889,6 @@ void retro_run(void)
          slock_lock(fifo_lock);
          do_seek = true;
 
-         // Clear video buffer when switching audio tracks
-         if (video_buffer)
-            video_buffer_clear(video_buffer);
          // Set the new seek time to the current playback time.
          // (You can choose to keep the playback time unchanged or compute a new one.)
          slock_lock(time_lock);
@@ -1844,34 +1828,23 @@ static void decode_thread_seek(double time)
 
    decode_last_audio_time = time;
 
-   // Seek to the nearest keyframe before the timestamp
-   if (avformat_seek_file(fctx, -1, INT64_MIN, seek_to, INT64_MAX, AVSEEK_FLAG_BACKWARD) < 0)
+   if (avformat_seek_file(fctx, -1, INT64_MIN, seek_to, INT64_MAX, 0) < 0)
       log_cb(RETRO_LOG_ERROR, "[APLAYER] av_seek_frame() failed.\n");
 
-   // Flush all codec buffers
    if (video_stream_index >= 0)
    {
-      tpool_wait(tpool); // Wait for video processing to finish
+      tpool_wait(tpool);
       video_buffer_clear(video_buffer);
-      avcodec_flush_buffers(vctx); // Flush video decoder
    }
 
-   for (int i = 0; i < audio_streams_num; i++)
-      avcodec_flush_buffers(actx[i]); // Flush all audio decoders
-
-   for (int i = 0; i < subtitle_streams_num; i++)
-   {
-      avcodec_flush_buffers(sctx[i]); // Flush subtitle decoders
-      if (ass_track[i])
-         ass_flush_events(ass_track[i]); // Clear subtitle events
-   }
-
-   // Clear hardware decoder context if present
-   if (vctx && vctx->hw_device_ctx)
-   {
-      av_buffer_unref(&vctx->hw_device_ctx);
-      av_hwdevice_ctx_create(&vctx->hw_device_ctx, hw_decoder, NULL, NULL, 0);
-   }
+   if (actx[audio_streams_ptr])
+      avcodec_flush_buffers(actx[audio_streams_ptr]);
+   if (vctx)
+      avcodec_flush_buffers(vctx);
+   if (sctx[subtitle_streams_ptr])
+      avcodec_flush_buffers(sctx[subtitle_streams_ptr]);
+   if (ass_track[subtitle_streams_ptr])
+      ass_flush_events(ass_track[subtitle_streams_ptr]);
 }
 
 /**
@@ -1983,29 +1956,22 @@ static void decode_thread(void *data)
          decode_thread_seek(seek_time_thread);
 
          slock_lock(fifo_lock);
-         do_seek = false;
-         eof = false;
-         seek_time = 0.0;
+         do_seek          = false;
+         eof              = false;
+         seek_time        = 0.0;
+         next_video_end   = 0.0;
+         next_audio_start = 0.0;
+         last_audio_end   = 0.0;
+
+         if (audio_decode_fifo)
+            fifo_clear(audio_decode_fifo);
 
          // Reset packet buffer states
          packet_buffer_clear(&audio_packet_buffer);
          packet_buffer_clear(&video_packet_buffer);
 
-         // Reset timing trackers
-         next_video_end = 0.0;
-         next_audio_start = 0.0;
-         last_audio_end = 0.0;
-
          scond_signal(fifo_cond);
          slock_unlock(fifo_lock);
-      }
-
-      // After seeking, prioritize video packets to ensure keyframe alignment
-      if (!packet_buffer_empty(video_packet_buffer))
-      {
-         packet_buffer_get_packet(video_packet_buffer, pkt_local);
-         decode_video(vctx, pkt_local, frame_size, ass_track_active);
-         av_packet_unref(pkt_local);
       }
 
       slock_lock(decode_thread_lock);
@@ -2032,7 +1998,7 @@ static void decode_thread(void *data)
        *  2. there is a video packet for in the buffer
        *  3. EOF
        **/
-      if (!packet_buffer_empty(audio_packet_buffer) && packet_buffer_empty(video_packet_buffer) &&
+      if (!packet_buffer_empty(audio_packet_buffer) &&
             (
                next_video_end == 0.0 ||
                (!eof && earlier_or_close_enough(next_audio_start, next_video_end)) ||

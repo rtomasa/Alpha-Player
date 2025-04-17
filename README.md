@@ -46,8 +46,11 @@ This core has been modified focusing on Raspberry Pi devices using a development
 
 # Changelog
 
-# v2.0.4
+# v2.0.5
 - [ ] Fixed random crash when changing audio tracks
+
+# v2.0.4
+- [X] Reverted back changes made in v2.0.2 causing video issues
 
 # v2.0.3
 - [X] Added audio gain for videos having 6 channel (5.1) audio tracks
