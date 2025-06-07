@@ -308,7 +308,7 @@ void retro_get_system_info(struct retro_system_info *info)
 {
    memset(info, 0, sizeof(*info));
    info->library_name     = "Alpha Player";
-   info->library_version  = "v2";
+   info->library_version  = "v2.0.5";
    info->need_fullpath    = true;
    info->valid_extensions = "mkv|avi|f4v|f4f|3gp|ogm|flv|mp4|mp3|flac|ogg|m4a|webm|3g2|mov|wmv|mpg|mpeg|vob|asf|divx|m2p|m2ts|ps|ts|mxf|wma|wav|m3u";
 }
@@ -1923,6 +1923,7 @@ static void decode_thread(void *data)
    {
       // If paused, check again.
       if (paused) {
+         usleep(10 * 1000);
          continue;
       }
 
@@ -2419,8 +2420,7 @@ void retro_unload_game(void)
 
    if (vctx)
    {
-      avcodec_close(vctx);
-      vctx = NULL;
+      avcodec_free_context(&vctx);
    }
 
    if (fctx)
@@ -2598,10 +2598,6 @@ bool retro_load_game(const struct retro_game_info *info)
          media.sample_rate * sizeof(int16_t) * 2 * 2
       );
    }
-
-   // Reallocate video buffer based on new media size
-   av_freep(&video_frame_temp_buffer);
-   video_frame_temp_buffer = (uint32_t*)av_malloc(media.width * media.height * sizeof(uint32_t));
 
    fifo_cond        = scond_new();
    fifo_decode_cond = scond_new();
