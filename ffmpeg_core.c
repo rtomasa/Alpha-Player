@@ -149,6 +149,47 @@ static GLint vertex_loc;
 static GLint tex_loc;
 static GLint mix_loc;
 
+static void init_aspect_ratio(void)
+{
+   if (!vctx || video_stream_index < 0)
+      return;
+      
+   AVStream *video_stream = fctx->streams[video_stream_index];
+   AVRational sar = {0, 1}; // Default to square pixels
+   
+   // Priority order for aspect ratio sources:
+   
+   // 1. Try codec context sample aspect ratio
+   if (vctx->sample_aspect_ratio.num > 0 && vctx->sample_aspect_ratio.den > 0)
+      sar = vctx->sample_aspect_ratio;
+   
+   // 2. Try stream sample aspect ratio
+   else if (video_stream->sample_aspect_ratio.num > 0 && 
+            video_stream->sample_aspect_ratio.den > 0)
+      sar = video_stream->sample_aspect_ratio;
+   
+   // 3. Try codec parameters sample aspect ratio  
+   else if (video_stream->codecpar->sample_aspect_ratio.num > 0 &&
+            video_stream->codecpar->sample_aspect_ratio.den > 0)
+      sar = video_stream->codecpar->sample_aspect_ratio;
+   
+   // Check for display aspect ratio in metadata
+   AVDictionaryEntry *dar_tag = av_dict_get(video_stream->metadata, "DAR", NULL, 0);
+   if (dar_tag) {
+      // Parse DAR string (e.g., "16:9", "4:3")
+      log_cb(RETRO_LOG_INFO, "[APLAYER] Container DAR: %s\n", dar_tag->value);
+   }
+   
+   // Calculate display aspect ratio
+   media.aspect = (float)media.width * av_q2d(sar) / (float)media.height;
+
+   if (media.aspect == 0.0f)
+      media.aspect = (float)media.width / (float)media.height;
+   
+   log_cb(RETRO_LOG_INFO, "[APLAYER] Video aspect ratio: %.3f (SAR: %d:%d)\n", 
+          media.aspect, sar.num, sar.den);
+}
+
 static bool parse_m3u_playlist(const char* path)
 {
    log_cb(RETRO_LOG_INFO, "[APLAYER] Opening M3U playlist: %s\n", path);
@@ -1463,8 +1504,9 @@ static bool init_media_info(void)
    {
       media.width  = vctx->width;
       media.height = vctx->height;
-      media.aspect = (float)vctx->width *
-         av_q2d(vctx->sample_aspect_ratio) / vctx->height;
+      //media.aspect = (float)vctx->width *
+      //   av_q2d(vctx->sample_aspect_ratio) / vctx->height;
+      init_aspect_ratio();
    }
 
    if (fctx)

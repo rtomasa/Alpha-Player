@@ -23,6 +23,7 @@
         "packet_buffer.h": "c",
         "unistd.h": "c",
         "stdint.h": "c",
-        "ctype.h": "c"
+        "ctype.h": "c",
+        "ffmpeg_core.h": "c"
     }
 }
