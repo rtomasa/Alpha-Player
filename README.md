@@ -46,8 +46,10 @@ This core has been modified focusing on Raspberry Pi devices using a development
 
 # Changelog
 
-# v2.0.5
-- [ ] Fixed random crash when changing audio tracks
+# v2.1.0
+- [X] Changed POINT to BILINEAR scaling for better image quality
+- [X] Fixed seek functionality
+- [X] Fixed random crash when changing audio tracks
 
 # v2.0.4
 - [X] Reverted back changes made in v2.0.2 causing video issues
