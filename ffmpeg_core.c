@@ -349,7 +349,7 @@ void retro_get_system_info(struct retro_system_info *info)
 {
    memset(info, 0, sizeof(*info));
    info->library_name     = "Alpha Player";
-   info->library_version  = "v2.0.5";
+   info->library_version  = "v2.1.0";
    info->need_fullpath    = true;
    info->valid_extensions = "mkv|avi|f4v|f4f|3gp|ogm|flv|mp4|mp3|flac|ogg|m4a|webm|3g2|mov|wmv|mpg|mpeg|vob|asf|divx|m2p|m2ts|ps|ts|mxf|wma|wav|m3u";
 }
@@ -1678,7 +1678,7 @@ static void sws_worker_thread(void *arg)
    ctx->sws = sws_getCachedContext(ctx->sws,
          media.width, media.height, (enum AVPixelFormat)tmp_frame->format,
          media.width, media.height, AV_PIX_FMT_RGB32,
-         SWS_POINT, NULL, NULL, NULL);
+         SWS_FAST_BILINEAR, NULL, NULL, NULL);
 
    set_colorspace(ctx->sws, media.width, media.height,
          tmp_frame->colorspace,
@@ -1963,8 +1963,13 @@ static void decode_thread(void *data)
 
    while (!decode_thread_dead)
    {
-      // If paused, check again.
-      if (paused) {
+      /* If we are paused *and* there is no pending seek we can idle,
+      * otherwise we must handle the seek so the main thread unblocks. */
+      slock_lock(fifo_lock);
+      bool pending_seek = do_seek;
+      slock_unlock(fifo_lock);
+
+      if (paused && !pending_seek) {
          usleep(10 * 1000);
          continue;
       }
@@ -2035,19 +2040,33 @@ static void decode_thread(void *data)
       if (!packet_buffer_empty(video_packet_buffer))
          next_video_end = video_timebase * packet_buffer_peek_end_pts(video_packet_buffer);
 
-      /*
-       * Decode audio packet if:
-       *  1. it's the start of file or it's audio only media
-       *  2. there is a video packet for in the buffer
-       *  3. EOF
-       **/
-      if (!packet_buffer_empty(audio_packet_buffer) &&
-            (
-               next_video_end == 0.0 ||
-               (!eof && earlier_or_close_enough(next_audio_start, next_video_end)) ||
-               eof
-            )
-         )
+      /* Decide whether to pull one audio packet from audio_packet_buffer.
+       *
+       * We do it when:
+       *   1. There is no video yet (audio-only file or we’re still before the first
+       *      decoded video frame),                               next_video_end == 0
+       *   2. Audio PTS is not “too far” ahead of the next video PTS
+       *      (<= 500 ms tolerance),                              ahead < 0.5
+       *   3. The decoder already hit EOF,                        eof == true
+       *   4. The main thread is blocked waiting for audio data,  need_audio_now
+       *
+       * Together these rules guarantee:
+       *   – Audio never outruns video by more than half a second during normal
+       *     playback.
+       *   – The main thread can never dead-lock after a seek: if it is waiting
+       *     (`main_sleeping`), we always feed at least one packet even when the
+       *     PTS gap is large.
+       */
+
+      bool need_audio_now = false;
+      slock_lock(fifo_lock);
+      need_audio_now = main_sleeping;   /* main thread is waiting for us */
+      slock_unlock(fifo_lock);
+
+      double ahead = next_audio_start - next_video_end;   /* may be < 0 */
+      bool   okay  = (ahead < 0.5 /*s*/) || need_audio_now || eof;
+
+      if (okay && !packet_buffer_empty(audio_packet_buffer))
       {
          packet_buffer_get_packet(audio_packet_buffer, pkt_local);
          last_audio_end = audio_timebase * (pkt_local->pts + pkt_local->duration);
