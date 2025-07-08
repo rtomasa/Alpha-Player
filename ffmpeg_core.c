@@ -223,12 +223,15 @@ static bool parse_m3u_playlist(const char* path)
       while (len > 0 && (trimmed[len-1] == '\r' || trimmed[len-1] == '\n'))
          trimmed[--len] = '\0';
 
-      // Build full path
+      /* Build absolute path and verify that it exists.        */
       char full_path[PATH_MAX];
       snprintf(full_path, PATH_MAX, "%s/%s", dir, trimmed);
 
-      // Copy the full path into playlist
-      strncpy(playlist[playlist_count++], full_path, PATH_MAX - 1);
+      if (access(full_path, R_OK) == 0)
+         strncpy(playlist[playlist_count++], full_path, PATH_MAX - 1);
+      else
+         log_cb(RETRO_LOG_WARN,
+                "[APLAYER] Skipping missing entry: %s\n", full_path);
 
       log_cb(RETRO_LOG_INFO, "[APLAYER] Found: %s\n", full_path);
    }
@@ -1013,9 +1016,24 @@ void retro_run(void)
       retro_unload_game();
       struct retro_game_info next_info = {0};
       next_info.path = playlist[playlist_index];
-      if (!retro_load_game(&next_info))
+      unsigned  tries = 0;
+      while (tries < playlist_count &&
+             !retro_load_game(&next_info))
       {
-         // Handle error
+         /* Advance and try the next entry                       */
+         playlist_index = (playlist_index + 1) % playlist_count;
+         next_info.path = playlist[playlist_index];
+         tries++;
+      }
+
+      if (tries == playlist_count)
+      {
+         struct retro_message_ext m = {
+            .msg = "Playlist finished - no playable entries.",
+            .duration = 5000, .level = RETRO_LOG_ERROR
+         };
+         environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &m);
+         return;   /* stop running gracefully */
       }
       do_seek = false;
 
@@ -2099,124 +2117,139 @@ static void decode_thread(void *data)
 
       bool break_out_loop = false;
 
-      if (packet_buffer_empty(audio_packet_buffer) &&
-         packet_buffer_empty(video_packet_buffer) && eof)
+      int media_type = get_media_type();
+      bool loop_content = false;
+
+      switch (media_type)
+      {
+      case MEDIA_TYPE_AUDIO:
+         loop_content = packet_buffer_empty(audio_packet_buffer) && packet_buffer_empty(video_packet_buffer) && eof &&
+                        (!audio_decode_fifo || FIFO_READ_AVAIL(audio_decode_fifo) <= 1024 * 10);
+         break;
+      case MEDIA_TYPE_VIDEO:
+      default:
+         loop_content = packet_buffer_empty(audio_packet_buffer) && packet_buffer_empty(video_packet_buffer) && eof;
+         break;
+      }
+
+      if (loop_content)
       {
          switch (loopcontent)
          {
-            case PLAY_TRACK:
-               if (playlist_count > 0)
+         case PLAY_TRACK:
+            if (playlist_count > 0)
+            {
+               // For an M3U playlist, if there is a next track then advance;
+               // if already at the last track, finish playback.
+               if (playlist_index + 1 < playlist_count)
                {
-                  // For an M3U playlist, if there is a next track then advance;
-                  // if already at the last track, finish playback.
-                  if (playlist_index + 1 < playlist_count)
-                  {
-                     slock_lock(fifo_lock);
-                     playlist_index++; 
-                     do_seek = true;
-                     seek_time = 0.0;
-                     eof = false;
-                     slock_unlock(fifo_lock);
-                     log_cb(RETRO_LOG_INFO, "[APLAYER] Advancing to playlist item #%u/%u: %s\n",
-                           playlist_index + 1, playlist_count, playlist[playlist_index]);
-                     av_packet_free(&pkt_local);
-                     break_out_loop = true;  // break out to allow media reload
-                  }
-                  else
-                  {
-                     // Last track in playlist: end playback.
-                     av_packet_free(&pkt_local);
-                     break_out_loop = true;
-                  }
+                  slock_lock(fifo_lock);
+                  playlist_index++;
+                  do_seek = true;
+                  seek_time = 0.0;
+                  eof = false;
+                  slock_unlock(fifo_lock);
+                  log_cb(RETRO_LOG_INFO, "[APLAYER] Advancing to playlist item #%u/%u: %s\n",
+                         playlist_index + 1, playlist_count, playlist[playlist_index]);
+                  av_packet_free(&pkt_local);
+                  break_out_loop = true; // break out to allow media reload
                }
                else
                {
-                  // Single file: do not loop, finish playback.
+                  // Last track in playlist: end playback.
                   av_packet_free(&pkt_local);
                   break_out_loop = true;
                }
-               break;
+            }
+            else
+            {
+               // Single file: do not loop, finish playback.
+               av_packet_free(&pkt_local);
+               break_out_loop = true;
+            }
+            break;
 
-            case LOOP_TRACK:
-               // Always loop the current track, regardless of whether we're part of a playlist.
+         case LOOP_TRACK:
+            // Always loop the current track, regardless of whether we're part of a playlist.
+            slock_lock(fifo_lock);
+            do_seek = true;
+            seek_time = 0.0;
+            eof = false; // Reset the EOF flag.
+            slock_unlock(fifo_lock);
+            av_packet_free(&pkt_local);
+            // Continue decoding on the same track.
+            continue;
+
+         case LOOP_ALL:
+            if (playlist_count > 0)
+            {
+               // If we have a playlist, advance to the next track (or wrap around).
+               slock_lock(fifo_lock);
+               if (playlist_index + 1 < playlist_count)
+                  playlist_index++;
+               else
+                  playlist_index = 0;
+               do_seek = true;
+               seek_time = 0.0;
+               eof = false;
+               slock_unlock(fifo_lock);
+               log_cb(RETRO_LOG_INFO, "[APLAYER] Looping playlist, new track #%u/%u: %s\n",
+                      playlist_index + 1, playlist_count, playlist[playlist_index]);
+               av_packet_free(&pkt_local);
+               // Exit the loop so that retro_run() can unload and reload the new media.
+               break_out_loop = true;
+            }
+            else
+            {
+               // If no playlist (single file), behave like LOOP_TRACK.
                slock_lock(fifo_lock);
                do_seek = true;
                seek_time = 0.0;
-               eof = false; // Reset the EOF flag.
+               eof = false;
                slock_unlock(fifo_lock);
                av_packet_free(&pkt_local);
-               // Continue decoding on the same track.
                continue;
+            }
+            break;
 
-            case LOOP_ALL:
-               if (playlist_count > 0)
+         case SHUFFLE_ALL:
+            if (playlist_count > 0)
+            {
+               // In a playlist mode, pick a random track different from the current one (if possible).
+               unsigned old_index = playlist_index;
+               slock_lock(fifo_lock);
+               do
                {
-                  // If we have a playlist, advance to the next track (or wrap around).
-                  slock_lock(fifo_lock);
-                  if (playlist_index + 1 < playlist_count)
-                     playlist_index++;
-                  else
-                     playlist_index = 0;
-                  do_seek = true;
-                  seek_time = 0.0;
-                  eof = false;
-                  slock_unlock(fifo_lock);
-                  log_cb(RETRO_LOG_INFO, "[APLAYER] Looping playlist, new track #%u/%u: %s\n",
-                        playlist_index + 1, playlist_count, playlist[playlist_index]);
-                  av_packet_free(&pkt_local);
-                  // Exit the loop so that retro_run() can unload and reload the new media.
-                  break_out_loop = true;
-               }
-               else
-               {
-                  // If no playlist (single file), behave like LOOP_TRACK.
-                  slock_lock(fifo_lock);
-                  do_seek = true;
-                  seek_time = 0.0;
-                  eof = false;
-                  slock_unlock(fifo_lock);
-                  av_packet_free(&pkt_local);
-                  continue;
-               }
-               break;
-
-            case SHUFFLE_ALL:
-               if (playlist_count > 0)
-               {
-                  // In a playlist mode, pick a random track different from the current one (if possible).
-                  unsigned old_index = playlist_index;
-                  slock_lock(fifo_lock);
-                  do {
-                     playlist_index = rand() % playlist_count;
-                  } while (playlist_count > 1 && playlist_index == old_index);
-                  do_seek = true;
-                  seek_time = 0.0;
-                  eof = false;
-                  slock_unlock(fifo_lock);
-                  log_cb(RETRO_LOG_INFO, "[APLAYER] Shuffling playlist, new track #%u/%u: %s\n",
-                        playlist_index + 1, playlist_count, playlist[playlist_index]);
-                  av_packet_free(&pkt_local);
-                  // Exit the loop so that the main thread can reload the newly chosen track.
-                  break_out_loop = true;
-               }
-               else
-               {
-                  // If playing a single file, behave like LOOP_TRACK.
-                  slock_lock(fifo_lock);
-                  do_seek = true;
-                  seek_time = 0.0;
-                  eof = false;
-                  slock_unlock(fifo_lock);
-                  av_packet_free(&pkt_local);
-                  continue;
-               }
-               break;
-
-            default:
-               // Fallback: treat as PLAY_TRACK (i.e. finish).
+                  playlist_index = rand() % playlist_count;
+               } while (playlist_count > 1 && playlist_index == old_index);
+               do_seek = true;
+               seek_time = 0.0;
+               eof = false;
+               slock_unlock(fifo_lock);
+               log_cb(RETRO_LOG_INFO, "[APLAYER] Shuffling playlist, new track #%u/%u: %s\n",
+                      playlist_index + 1, playlist_count, playlist[playlist_index]);
                av_packet_free(&pkt_local);
+               // Exit the loop so that the main thread can reload the newly chosen track.
                break_out_loop = true;
-               break;
+            }
+            else
+            {
+               // If playing a single file, behave like LOOP_TRACK.
+               slock_lock(fifo_lock);
+               do_seek = true;
+               seek_time = 0.0;
+               eof = false;
+               slock_unlock(fifo_lock);
+               av_packet_free(&pkt_local);
+               continue;
+            }
+            break;
+
+         default:
+            // Fallback: treat as PLAY_TRACK (i.e. finish).
+            av_packet_free(&pkt_local);
+            break_out_loop = true;
+            break;
          }
 
          if (break_out_loop)
