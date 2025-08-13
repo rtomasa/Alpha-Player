@@ -149,6 +149,14 @@ static GLint vertex_loc;
 static GLint tex_loc;
 static GLint mix_loc;
 
+static void media_reset_defaults(void)
+{
+   memset(&media, 0, sizeof(media));
+   media.interpolate_fps = 60.0;   // your current default
+   media.sample_rate     = 32000.0; // safe default until audio stream is opened
+   media.aspect          = 0.0f;    // force recompute
+}
+
 static void init_aspect_ratio(void)
 {
    if (!vctx || video_stream_index < 0)
@@ -1522,8 +1530,6 @@ static bool init_media_info(void)
    {
       media.width  = vctx->width;
       media.height = vctx->height;
-      //media.aspect = (float)vctx->width *
-      //   av_q2d(vctx->sample_aspect_ratio) / vctx->height;
       init_aspect_ratio();
    }
 
@@ -2551,12 +2557,16 @@ void retro_unload_game(void)
    ass = NULL;
 
    av_freep(&video_frame_temp_buffer);
+
+   media_reset_defaults();
 }
 
 bool retro_load_game(const struct retro_game_info *info)
 {
    if (!info)
       return false;
+
+   media_reset_defaults();
 
    const char* ext = strrchr(info->path, '.');
    // Local mutable retro_game_info
@@ -2685,6 +2695,15 @@ bool retro_load_game(const struct retro_game_info *info)
          log_cb(RETRO_LOG_ERROR, "[APLAYER] Cannot initialize HW render.\n");
       }
    }
+
+   /* NEW: advertise geometry/timing to the frontend right after we know them */
+   {
+      struct retro_system_av_info av;
+      retro_get_system_av_info(&av);
+      if (!environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av))
+         log_cb(RETRO_LOG_WARN, "[APLAYER] Frontend did not accept SYSTEM_AV_INFO.\n");
+   }
+
    if (audio_streams_num > 0)
    {
       /* audio fifo is 2 seconds deep */
