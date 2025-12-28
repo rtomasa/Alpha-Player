@@ -76,7 +76,10 @@ static AVCodecContext *vctx;
 static int video_stream_index;
 static int loopcontent;
 static bool is_crt = false;
+static const unsigned subtitle_font_base_size = 24;
 static unsigned subtitle_font_size = 64;
+static bool subtitle_font_auto = false;
+static double subtitle_font_scale = 1.0;
 
 static double g_current_time = 0.0;  // PTS in seconds
 static slock_t *time_lock    = NULL; // Protects g_current_time
@@ -428,8 +431,9 @@ void retro_set_environment(retro_environment_t cb)
          }, "auto"
       },
       {
-         "aplayer_subtitle_font_size", "Subtitle Font Size (restart)", NULL, INFO_RESTART, NULL, "video",
+         "aplayer_subtitle_font_size", "Subtitle Font Size", NULL, NULL, NULL, "video",
          {
+            {"auto", "Auto"},
             {"24", NULL},
             {"32", NULL},
             {"40", NULL},
@@ -445,7 +449,7 @@ void retro_set_environment(retro_environment_t cb)
             {"120", NULL},
             {"128", NULL},
             {NULL, NULL}
-         }, "64"
+         }, "auto"
       },
       {
          "aplayer_fft_resolution", "Visualizer Resolution", NULL, NULL, NULL, "music",
@@ -523,6 +527,67 @@ static void print_ffmpeg_version()
    PRINT_VERSION(swscale)
 }
 
+static unsigned subtitle_font_size_auto(unsigned height)
+{
+   if (height == 0)
+      return subtitle_font_base_size;
+
+   unsigned size = (height * 7 + 99) / 100; /* ~15% of height */
+   if (size < 24)
+      size = 24;
+   if (size > 128)
+      size = 128;
+   return size;
+}
+
+static void ass_scale_track_styles(ASS_Track *track, double scale)
+{
+   if (!track || scale == 1.0)
+      return;
+
+   for (int i = 0; i < track->n_styles; i++)
+      track->styles[i].FontSize *= scale;
+}
+
+static void ass_scale_all_tracks(double scale)
+{
+   if (scale == 1.0)
+      return;
+
+   for (int i = 0; i < subtitle_streams_num; i++)
+      ass_scale_track_styles(ass_track[i], scale);
+}
+
+static void update_subtitle_font_scale(void)
+{
+   double prev_scale = subtitle_font_scale;
+   unsigned target_size = subtitle_font_size;
+   double target_scale = 1.0;
+
+   if (subtitle_font_auto)
+      target_size = subtitle_font_size_auto(media.height);
+
+   if (target_size == 0)
+      target_size = subtitle_font_base_size;
+
+   subtitle_font_size = target_size;
+   target_scale = (double)target_size / (double)subtitle_font_base_size;
+   if (target_scale <= 0.0)
+      target_scale = 1.0;
+
+   if (ass_render && ass_lock)
+   {
+      double scale_ratio = target_scale / (prev_scale > 0.0 ? prev_scale : 1.0);
+
+      slock_lock(ass_lock);
+      ass_set_font_scale(ass_render, 1.0);
+      ass_scale_all_tracks(scale_ratio);
+      slock_unlock(ass_lock);
+   }
+
+   subtitle_font_scale = target_scale;
+}
+
 static void check_variables(bool firststart)
 {
    struct retro_variable hw_var  = {0};
@@ -547,14 +612,23 @@ static void check_variables(bool firststart)
    }
 
    subtitle_font_size = 64;
+   subtitle_font_auto = false;
    subtitle_font_var.key = "aplayer_subtitle_font_size";
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &subtitle_font_var) &&
          subtitle_font_var.value)
    {
-      subtitle_font_size = strtoul(subtitle_font_var.value, NULL, 0);
-      if (subtitle_font_size == 0)
-         subtitle_font_size = 64;
+      if (string_is_equal(subtitle_font_var.value, "auto"))
+      {
+         subtitle_font_auto = true;
+      }
+      else
+      {
+         subtitle_font_size = strtoul(subtitle_font_var.value, NULL, 0);
+         if (subtitle_font_size == 0)
+            subtitle_font_size = 64;
+      }
    }
+   update_subtitle_font_scale();
    /* M3U */
    loop_content.key = "aplayer_loop_content";
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &loop_content) && loop_content.value)
@@ -1535,7 +1609,7 @@ static void ass_init_default_track(ASS_Track *track)
 {
    unsigned play_res_x = media.width ? media.width : 640;
    unsigned play_res_y = media.height ? media.height : 480;
-   unsigned font_size = subtitle_font_size ? subtitle_font_size : 24;
+   unsigned font_size = subtitle_font_base_size;
    char header[1024];
    int len = snprintf(header, sizeof(header),
          "[Script Info]\n"
@@ -1752,6 +1826,7 @@ static bool init_media_info(void)
       ass_set_extract_fonts(ass, true);
       ass_set_fonts(ass_render, NULL, NULL, 1, NULL, 1);
       ass_set_hinting(ass_render, ASS_HINTING_LIGHT);
+      update_subtitle_font_scale();
 
       for (i = 0; i < (unsigned)subtitle_streams_num; i++)
       {
@@ -1763,6 +1838,8 @@ static bool init_media_info(void)
                      ass_extra_data_size[i]);
             else
                ass_init_default_track(ass_track[i]);
+
+            ass_scale_track_styles(ass_track[i], subtitle_font_scale);
          }
       }
    }
