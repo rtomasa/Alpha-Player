@@ -5,7 +5,7 @@
 	"autoDelete": false,
 	"checkGitignore": false,
 	"activeTargets": [
-		"alpha-player"
+		"pi"
 	],
 	"concurrency": 5,
 	"ignore": [
@@ -14,9 +14,9 @@
 	],
 	"targets": [
 		{
-			"name": "alpha-player",
+			"name": "pi",
 			"type": "sftp",
-			"host": "192.168.0.22",
+			"host": "192.168.0.15",
 			"port": 22,
 			"user": "root",
 			"password": "replayos",
