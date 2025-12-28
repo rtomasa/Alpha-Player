@@ -80,6 +80,15 @@ static const unsigned subtitle_font_base_size = 24;
 static unsigned subtitle_font_size = 64;
 static bool subtitle_font_auto = false;
 static double subtitle_font_scale = 1.0;
+static const char *subtitle_font_name = "DejaVu Sans";
+static int subtitle_font_bold = 0;
+static char subtitle_style_override_font[128];
+static char subtitle_style_override_bold[64];
+static char *subtitle_style_overrides[] = {
+   subtitle_style_override_font,
+   subtitle_style_override_bold,
+   NULL
+};
 
 static double g_current_time = 0.0;  // PTS in seconds
 static slock_t *time_lock    = NULL; // Protects g_current_time
@@ -452,6 +461,18 @@ void retro_set_environment(retro_environment_t cb)
          }, "auto"
       },
       {
+         "aplayer_subtitle_font", "Subtitle Font", NULL, NULL, NULL, "video",
+         {
+            {"dejavu_sans", "DejaVu Sans"},
+            {"dejavu_sans_bold", "DejaVu Sans Bold"},
+            {"dejavu_sans_mono", "DejaVu Sans Mono"},
+            {"dejavu_sans_mono_bold", "DejaVu Sans Mono Bold"},
+            {"dejavu_serif", "DejaVu Serif"},
+            {"dejavu_serif_bold", "DejaVu Serif Bold"},
+            {NULL, NULL}
+         }, "dejavu_sans_mono_bold"
+      },
+      {
          "aplayer_fft_resolution", "Visualizer Resolution", NULL, NULL, NULL, "music",
          {
             {"320x240", NULL},
@@ -588,6 +609,49 @@ static void update_subtitle_font_scale(void)
    subtitle_font_scale = target_scale;
 }
 
+static void ass_update_track_fonts(ASS_Track *track, const char *font_name, int bold)
+{
+   if (!track || !font_name)
+      return;
+
+   for (int i = 0; i < track->n_styles; i++)
+   {
+      if (track->styles[i].FontName)
+         free(track->styles[i].FontName);
+      track->styles[i].FontName = strdup(font_name);
+      track->styles[i].Bold = bold ? -1 : 0;
+   }
+}
+
+static void ass_update_all_track_fonts(const char *font_name, int bold)
+{
+   if (!font_name)
+      return;
+
+   for (int i = 0; i < subtitle_streams_num; i++)
+      ass_update_track_fonts(ass_track[i], font_name, bold);
+}
+
+static void update_subtitle_style_overrides(void)
+{
+   if (!ass)
+      return;
+
+   snprintf(subtitle_style_override_font, sizeof(subtitle_style_override_font),
+         "FontName=%s", subtitle_font_name);
+   snprintf(subtitle_style_override_bold, sizeof(subtitle_style_override_bold),
+         "Bold=%d", subtitle_font_bold ? -1 : 0);
+
+   if (ass_lock)
+      slock_lock(ass_lock);
+   ass_set_style_overrides(ass, subtitle_style_overrides);
+   if (ass_render)
+      ass_set_fonts(ass_render, subtitle_font_name, NULL, 1, NULL, 1);
+   ass_update_all_track_fonts(subtitle_font_name, subtitle_font_bold);
+   if (ass_lock)
+      slock_unlock(ass_lock);
+}
+
 static void check_variables(bool firststart)
 {
    struct retro_variable hw_var  = {0};
@@ -596,6 +660,7 @@ static void check_variables(bool firststart)
    struct retro_variable replay_is_crt  = {0};
    struct retro_variable fft_var    = {0};
    struct retro_variable subtitle_font_var = {0};
+   struct retro_variable subtitle_font_name_var = {0};
 
    fft_var.key = "aplayer_fft_resolution";
 
@@ -628,7 +693,47 @@ static void check_variables(bool firststart)
             subtitle_font_size = 64;
       }
    }
+
+   subtitle_font_name = "DejaVu Sans";
+   subtitle_font_bold = 0;
+   subtitle_font_name_var.key = "aplayer_subtitle_font";
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &subtitle_font_name_var) &&
+         subtitle_font_name_var.value)
+   {
+      if (string_is_equal(subtitle_font_name_var.value, "dejavu_sans"))
+      {
+         subtitle_font_name = "DejaVu Sans";
+         subtitle_font_bold = 0;
+      }
+      else if (string_is_equal(subtitle_font_name_var.value, "dejavu_sans_bold"))
+      {
+         subtitle_font_name = "DejaVu Sans";
+         subtitle_font_bold = 1;
+      }
+      else if (string_is_equal(subtitle_font_name_var.value, "dejavu_sans_mono"))
+      {
+         subtitle_font_name = "DejaVu Sans Mono";
+         subtitle_font_bold = 0;
+      }
+      else if (string_is_equal(subtitle_font_name_var.value, "dejavu_sans_mono_bold"))
+      {
+         subtitle_font_name = "DejaVu Sans Mono";
+         subtitle_font_bold = 1;
+      }
+      else if (string_is_equal(subtitle_font_name_var.value, "dejavu_serif"))
+      {
+         subtitle_font_name = "DejaVu Serif";
+         subtitle_font_bold = 0;
+      }
+      else if (string_is_equal(subtitle_font_name_var.value, "dejavu_serif_bold"))
+      {
+         subtitle_font_name = "DejaVu Serif";
+         subtitle_font_bold = 1;
+      }
+   }
+
    update_subtitle_font_scale();
+   update_subtitle_style_overrides();
    /* M3U */
    loop_content.key = "aplayer_loop_content";
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &loop_content) && loop_content.value)
@@ -1609,6 +1714,8 @@ static void ass_init_default_track(ASS_Track *track)
 {
    unsigned play_res_x = media.width ? media.width : 640;
    unsigned play_res_y = media.height ? media.height : 480;
+   const char *font_name = subtitle_font_name ? subtitle_font_name : "DejaVu Sans";
+   int font_bold = subtitle_font_bold ? -1 : 0;
    unsigned font_size = subtitle_font_base_size;
    char header[1024];
    int len = snprintf(header, sizeof(header),
@@ -1619,11 +1726,11 @@ static void ass_init_default_track(ASS_Track *track)
          "\n"
          "[V4+ Styles]\n"
          "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-         "Style: Default,Arial,%u,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,0,0,0,0,100,100,0,0,1,2,0,2,20,20,20,1\n"
+         "Style: Default,%s,%u,&H00FFFFFF,&H000000FF,&H00000000,&H64000000,%d,0,0,0,100,100,0,0,1,2,0,2,20,20,20,1\n"
          "\n"
          "[Events]\n"
          "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
-         play_res_x, play_res_y, font_size);
+         play_res_x, play_res_y, font_name, font_size, font_bold);
 
    if (len <= 0)
       return;
@@ -1826,6 +1933,7 @@ static bool init_media_info(void)
       ass_set_extract_fonts(ass, true);
       ass_set_fonts(ass_render, NULL, NULL, 1, NULL, 1);
       ass_set_hinting(ass_render, ASS_HINTING_LIGHT);
+      update_subtitle_style_overrides();
       update_subtitle_font_scale();
 
       for (i = 0; i < (unsigned)subtitle_streams_num; i++)
