@@ -150,8 +150,6 @@ static sthread_t *decode_thread_handle;
 static double decode_last_audio_time;
 static bool main_sleeping;
 
-static uint32_t *video_frame_temp_buffer;
-
 /* Seeking, play, pause, loop */
 static bool do_seek;
 static double seek_time;
@@ -160,6 +158,8 @@ static volatile bool audio_switch_requested = false;
 
 /* GL stuff */
 static struct frame frames[2];
+static unsigned frames_tex_width;
+static unsigned frames_tex_height;
 
 static struct retro_hw_render_callback hw_render;
 static GLuint prog;
@@ -379,7 +379,7 @@ void retro_get_system_info(struct retro_system_info *info)
 {
    memset(info, 0, sizeof(*info));
    info->library_name     = "Alpha Player";
-   info->library_version  = "v2.1.0";
+   info->library_version  = "v2.2.0";
    info->need_fullpath    = true;
    info->valid_extensions = "mkv|avi|f4v|f4f|3gp|ogm|flv|mp4|mp3|flac|ogg|m4a|webm|3g2|mov|wmv|mpg|mpeg|vob|asf|divx|m2p|m2ts|ps|ts|mxf|wma|wav|m3u";
 }
@@ -966,6 +966,36 @@ static void dispaly_time(void)
 static void render_subtitles_on_buffer(uint32_t *buffer, unsigned width,
       unsigned height, double time_sec);
 
+static void ensure_video_textures_allocated(unsigned width, unsigned height)
+{
+   unsigned i;
+
+   if (video_stream_index < 0 || width == 0 || height == 0)
+      return;
+
+   if (!frames[0].tex || !frames[1].tex)
+      return;
+
+   if (frames_tex_width == width && frames_tex_height == height)
+      return;
+
+   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+   for (i = 0; i < 2; i++)
+   {
+      if (!frames[i].tex)
+         continue;
+
+      glBindTexture(GL_TEXTURE_2D, frames[i].tex);
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
+            (GLsizei)width, (GLsizei)height, 0,
+            GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+   }
+   glBindTexture(GL_TEXTURE_2D, 0);
+
+   frames_tex_width  = width;
+   frames_tex_height = height;
+}
+
 void retro_run(void)
 {
    static bool last_left;
@@ -1354,32 +1384,26 @@ void retro_run(void)
 
          if (!decode_thread_dead)
          {
-            unsigned y;
-            int stride, width;
-            const uint8_t *src           = NULL;
             video_decoder_context_t *ctx = NULL;
-            uint32_t               *data = NULL;
+            uint32_t               *pixels = NULL;
 
             video_buffer_wait_for_finished_slot(video_buffer);
 
             video_buffer_get_finished_slot(video_buffer, &ctx);
             pts                          = ctx->pts;
-            data                         = video_frame_temp_buffer;
-            src                          = ctx->target->data[0];
-            stride                       = ctx->target->linesize[0];
-            width                        = media.width * sizeof(uint32_t);
-            for (y = 0; y < media.height; y++, src += stride, data += width/4)
-               memcpy(data, src, width);
+            pixels                       = (uint32_t*)ctx->target->data[0];
 
             double render_time = min_pts;
             if (pts != AV_NOPTS_VALUE)
                render_time = av_q2d(fctx->streams[video_stream_index]->time_base) * pts;
-            render_subtitles_on_buffer(video_frame_temp_buffer, media.width,
+            render_subtitles_on_buffer(pixels, media.width,
                   media.height, render_time);
 
+            ensure_video_textures_allocated(media.width, media.height);
             glBindTexture(GL_TEXTURE_2D, frames[1].tex);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
-                  media.width, media.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, video_frame_temp_buffer);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
+                  (GLsizei)media.width, (GLsizei)media.height,
+                  GL_RGBA, GL_UNSIGNED_BYTE, pixels);
             glBindTexture(GL_TEXTURE_2D, 0);
             video_buffer_open_slot(video_buffer, ctx);
          }
@@ -2305,13 +2329,15 @@ static void decode_video(AVCodecContext *ctx, AVPacket *pkt, size_t frame_size, 
    if (ret == AVERROR(EAGAIN))
    {
       /* Means the decoder is full, so we must read (receive) frames first. */
+      AVFrame *drain_frame = av_frame_alloc();
+      if (!drain_frame)
+         return;
+
       while (true)
       {
-         AVFrame *tmpframe = av_frame_alloc();
-         ret = avcodec_receive_frame(ctx, tmpframe);
+         ret = avcodec_receive_frame(ctx, drain_frame);
          if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
          {
-            av_frame_free(&tmpframe);
             break;
          }
          else if (ret < 0)
@@ -2319,13 +2345,14 @@ static void decode_video(AVCodecContext *ctx, AVPacket *pkt, size_t frame_size, 
             /* Real error. */
             log_cb(RETRO_LOG_ERROR,
                "[APLAYER] Error draining frames: %s\n", av_err2str(ret));
-            av_frame_free(&tmpframe);
+            av_frame_free(&drain_frame);
             return;
          }
 
          /* We got a frame; if needed we can queue it, or just discard. */
-         av_frame_free(&tmpframe);
+         av_frame_unref(drain_frame);
       }
+      av_frame_free(&drain_frame);
       /* Now try sending the packet again. */
       ret = avcodec_send_packet(ctx, pkt);
    }
@@ -2538,8 +2565,14 @@ static void decode_thread(void *data)
       log_cb(RETRO_LOG_INFO, "[APLAYER] Configured worker threads: %d\n", sw_sws_threads);
    }
 
+   AVPacket *pkt_local = av_packet_alloc();
+   if (!pkt_local)
+      goto end;
+
    while (!decode_thread_dead)
    {
+      av_packet_unref(pkt_local);
+
       /* If we are paused *and* there is no pending seek we can idle,
       * otherwise we must handle the seek so the main thread unblocks. */
       slock_lock(fifo_lock);
@@ -2560,12 +2593,6 @@ static void decode_thread(void *data)
       double next_video_end   = 0.0;
       double next_audio_start = 0.0;
 
-      AVPacket *pkt_local = av_packet_alloc();  // <--- local AVPacket pointer
-      if (!pkt_local)
-      {
-         // handle error or break
-         break;
-      }
       AVCodecContext *actx_active = NULL;
       ASS_Track *ass_track_active = NULL;
 
@@ -2706,20 +2733,17 @@ static void decode_thread(void *data)
                   slock_unlock(fifo_lock);
                   log_cb(RETRO_LOG_INFO, "[APLAYER] Advancing to playlist item #%u/%u: %s\n",
                          playlist_index + 1, playlist_count, playlist[playlist_index]);
-                  av_packet_free(&pkt_local);
                   break_out_loop = true; // break out to allow media reload
                }
                else
                {
                   // Last track in playlist: end playback.
-                  av_packet_free(&pkt_local);
                   break_out_loop = true;
                }
             }
             else
             {
                // Single file: do not loop, finish playback.
-               av_packet_free(&pkt_local);
                break_out_loop = true;
             }
             break;
@@ -2731,7 +2755,6 @@ static void decode_thread(void *data)
             seek_time = 0.0;
             eof = false; // Reset the EOF flag.
             slock_unlock(fifo_lock);
-            av_packet_free(&pkt_local);
             // Continue decoding on the same track.
             continue;
 
@@ -2750,7 +2773,6 @@ static void decode_thread(void *data)
                slock_unlock(fifo_lock);
                log_cb(RETRO_LOG_INFO, "[APLAYER] Looping playlist, new track #%u/%u: %s\n",
                       playlist_index + 1, playlist_count, playlist[playlist_index]);
-               av_packet_free(&pkt_local);
                // Exit the loop so that retro_run() can unload and reload the new media.
                break_out_loop = true;
             }
@@ -2762,7 +2784,6 @@ static void decode_thread(void *data)
                seek_time = 0.0;
                eof = false;
                slock_unlock(fifo_lock);
-               av_packet_free(&pkt_local);
                continue;
             }
             break;
@@ -2783,7 +2804,6 @@ static void decode_thread(void *data)
                slock_unlock(fifo_lock);
                log_cb(RETRO_LOG_INFO, "[APLAYER] Shuffling playlist, new track #%u/%u: %s\n",
                       playlist_index + 1, playlist_count, playlist[playlist_index]);
-               av_packet_free(&pkt_local);
                // Exit the loop so that the main thread can reload the newly chosen track.
                break_out_loop = true;
             }
@@ -2795,14 +2815,12 @@ static void decode_thread(void *data)
                seek_time = 0.0;
                eof = false;
                slock_unlock(fifo_lock);
-               av_packet_free(&pkt_local);
                continue;
             }
             break;
 
          default:
             // Fallback: treat as PLAY_TRACK (i.e. finish).
-            av_packet_free(&pkt_local);
             break_out_loop = true;
             break;
          }
@@ -2870,7 +2888,6 @@ static void decode_thread(void *data)
             if (subtitle_slot < 0)
             {
                av_packet_unref(pkt_local);
-               av_packet_free(&pkt_local);
                continue;
             }
 
@@ -2879,7 +2896,6 @@ static void decode_thread(void *data)
             if (!sctx_sub)
             {
                av_packet_unref(pkt_local);
-               av_packet_free(&pkt_local);
                continue;
             }
 
@@ -2989,8 +3005,10 @@ static void decode_thread(void *data)
             av_packet_unref(pkt_local);
          }
       }
-      av_packet_free(&pkt_local);
    }
+
+end:
+   av_packet_free(&pkt_local);
 
    for (i = 0; (int)i < audio_streams_num; i++)
       swr_free(&swr[i]);
@@ -3036,6 +3054,9 @@ static void context_reset(void)
    };
    GLuint vert, frag;
    unsigned i;
+
+   frames_tex_width  = 0;
+   frames_tex_height = 0;
 
    if (audio_streams_num > 0 && video_stream_index < 0)
    {
@@ -3200,8 +3221,6 @@ void retro_unload_game(void)
 
    ass_render = NULL;
    ass = NULL;
-
-   av_freep(&video_frame_temp_buffer);
 
    media_reset_defaults();
 }
@@ -3368,9 +3387,6 @@ bool retro_load_game(const struct retro_game_info *info)
    slock_unlock(fifo_lock);
 
    decode_thread_handle = sthread_create(decode_thread, NULL);
-
-   video_frame_temp_buffer = (uint32_t*)
-      av_malloc(media.width * media.height * sizeof(uint32_t));
 
    pts_bias = 0.0;
 

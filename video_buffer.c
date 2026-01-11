@@ -152,8 +152,9 @@ void video_buffer_return_open_slot(
    if (video_buffer->status[context->index] == KB_IN_PROGRESS)
    {
       video_buffer->status[context->index] = KB_OPEN;
-      video_buffer->head--;
-      video_buffer->head %= video_buffer->capacity;
+      /* Ensure wraparound without negative modulus. */
+      video_buffer->head = (video_buffer->head + (int64_t)video_buffer->capacity - 1) %
+            (int64_t)video_buffer->capacity;
    }
 
    slock_unlock(video_buffer->lock);
