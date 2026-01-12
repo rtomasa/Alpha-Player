@@ -44,9 +44,14 @@ This core has been modified focusing on Raspberry Pi devices using a development
 * JOYPAD_L2 - seek -300s (5 min)
 * JOYPAD_R2 - seek +300s (5 min)
 
+# Subtitles
+
+If a video has an external subtitle file with the same name and a `.srt` extension, it will be loaded automatically.
+
 # Changelog
 
 # v2.2.0
+- [X] Added support for external .srt files
 - [X] Optimize software video path by eliminating an extra full-frame CPU copy (use video_buffer RGB output directly).
 - [X] Improve GL upload performance by allocating textures once per size and updating via glTexSubImage2D instead of glTexImage2D each frame.
 - [X] Reduce decode-thread allocation churn by reusing AVPacket and reusing a drain AVFrame on EAGAIN.

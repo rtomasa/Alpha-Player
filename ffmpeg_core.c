@@ -113,6 +113,7 @@ static int subtitle_streams[MAX_STREAMS];
 static int subtitle_streams_num;
 static int subtitle_streams_ptr;
 static bool subtitle_is_ass[MAX_STREAMS];
+static bool subtitle_is_external[MAX_STREAMS];
 
 /* ASS/SSA and text-based subtitles via libass. */
 static ASS_Library *ass;
@@ -1792,6 +1793,7 @@ static bool open_codecs(void)
    memset(audio_streams,    0, sizeof(audio_streams));
    memset(subtitle_streams, 0, sizeof(subtitle_streams));
    memset(subtitle_is_ass,  0, sizeof(subtitle_is_ass));
+   memset(subtitle_is_external, 0, sizeof(subtitle_is_external));
    first_subtitle_event_logged = false;
    first_ass_render_logged = false;
    memset(first_ass_image_logged, 0, sizeof(first_ass_image_logged));
@@ -2272,6 +2274,509 @@ static void ass_add_text_event(ASS_Track *track, int64_t start_ms, int64_t end_m
    free(escaped);
 }
 
+static bool path_replace_extension(const char *path, const char *new_ext, char *out, size_t out_size)
+{
+   const char *last_slash = NULL;
+   const char *last_dot = NULL;
+   size_t base_len = 0;
+   size_t ext_len = 0;
+
+   if (!path || !new_ext || !out || out_size == 0)
+      return false;
+
+   last_slash = strrchr(path, '/');
+   last_dot = strrchr(path, '.');
+
+   if (last_dot && (!last_slash || last_dot > last_slash))
+      base_len = (size_t)(last_dot - path);
+   else
+      base_len = strlen(path);
+
+   ext_len = strlen(new_ext);
+   if (base_len + ext_len + 1 > out_size)
+      return false;
+
+   memcpy(out, path, base_len);
+   memcpy(out + base_len, new_ext, ext_len);
+   out[base_len + ext_len] = '\0';
+   return true;
+}
+
+static char *read_entire_file(const char *path, size_t *out_size)
+{
+   static const size_t max_size = 8u * 1024u * 1024u;
+   FILE *f = NULL;
+   long file_size = 0;
+   size_t to_read = 0;
+   size_t read_total = 0;
+   char *buf = NULL;
+
+   if (out_size)
+      *out_size = 0;
+
+   if (!path)
+      return NULL;
+
+   f = fopen(path, "rb");
+   if (!f)
+      return NULL;
+
+   if (fseek(f, 0, SEEK_END) != 0)
+      goto error;
+
+   file_size = ftell(f);
+   if (file_size < 0)
+      goto error;
+
+   if ((size_t)file_size > max_size)
+      goto error;
+
+   if (fseek(f, 0, SEEK_SET) != 0)
+      goto error;
+
+   to_read = (size_t)file_size;
+   buf = (char*)malloc(to_read + 2);
+   if (!buf)
+      goto error;
+
+   read_total = fread(buf, 1, to_read, f);
+   if (read_total != to_read)
+      goto error;
+
+   if (to_read > 0 && buf[to_read - 1] != '\n')
+      buf[to_read++] = '\n';
+   buf[to_read] = '\0';
+
+   fclose(f);
+   if (out_size)
+      *out_size = to_read;
+   return buf;
+
+error:
+   if (f)
+      fclose(f);
+   free(buf);
+   return NULL;
+}
+
+static bool buffer_looks_like_ass(const char *buf, size_t buf_size)
+{
+   const unsigned char *u = (const unsigned char*)buf;
+   size_t i = 0;
+
+   if (!buf || buf_size == 0)
+      return false;
+
+   if (buf_size >= 3 && u[0] == 0xEF && u[1] == 0xBB && u[2] == 0xBF)
+      i = 3;
+
+   while (i < buf_size && isspace((unsigned char)buf[i]))
+      i++;
+
+   if (i + 13 <= buf_size && strncmp(buf + i, "[Script Info]", 13) == 0)
+      return true;
+
+   if (strstr(buf + i, "[V4+ Styles]") || strstr(buf + i, "[V4 Styles]") ||
+         strstr(buf + i, "[Events]"))
+      return true;
+
+   return false;
+}
+
+static char *trim_srt_line(char *line)
+{
+   unsigned char *u = (unsigned char*)line;
+   char *start = line;
+   char *end = NULL;
+
+   if (!line)
+      return NULL;
+
+   if (u[0] == 0xEF && u[1] == 0xBB && u[2] == 0xBF)
+      start += 3;
+
+   while (*start && isspace((unsigned char)*start))
+      start++;
+
+   end = start + strlen(start);
+   while (end > start && isspace((unsigned char)end[-1]))
+      end--;
+   *end = '\0';
+
+   return start;
+}
+
+static char *next_line_inplace(char **cursor, char *end)
+{
+   char *line = NULL;
+   char *p = NULL;
+
+   if (!cursor || !*cursor || *cursor >= end)
+      return NULL;
+
+   line = *cursor;
+   p = line;
+
+   while (p < end && *p != '\n' && *p != '\r')
+      p++;
+
+   if (p < end)
+   {
+      if (*p == '\r')
+      {
+         *p++ = '\0';
+         if (p < end && *p == '\n')
+            *p++ = '\0';
+      }
+      else
+      {
+         *p++ = '\0';
+      }
+   }
+
+   *cursor = p;
+   return line;
+}
+
+static bool parse_uint_component(const char *s, int *out_val, const char **out_end)
+{
+   char *endptr = NULL;
+   long v;
+
+   if (!s || !*s || !out_val)
+      return false;
+
+   v = strtol(s, &endptr, 10);
+   if (endptr == s || v < 0 || v > INT_MAX)
+      return false;
+
+   *out_val = (int)v;
+   if (out_end)
+      *out_end = endptr;
+   return true;
+}
+
+static bool parse_srt_timestamp_ms(const char *s, int64_t *out_ms)
+{
+   const char *p = s;
+   const char *ms_start = NULL;
+   int hours = 0;
+   int minutes = 0;
+   int seconds = 0;
+   int ms = 0;
+
+   if (!s || !out_ms)
+      return false;
+
+   while (*p && isspace((unsigned char)*p))
+      p++;
+
+   if (!parse_uint_component(p, &hours, &p) || *p != ':')
+      return false;
+   p++;
+   if (!parse_uint_component(p, &minutes, &p) || *p != ':')
+      return false;
+   p++;
+   if (!parse_uint_component(p, &seconds, &p))
+      return false;
+
+   if (*p == ',' || *p == '.')
+   {
+      int ms_val = 0;
+      int digits = 0;
+
+      p++;
+      ms_start = p;
+      if (!parse_uint_component(p, &ms_val, &p))
+         ms_val = 0;
+
+      digits = (int)(p - ms_start);
+      if (digits == 1)
+         ms_val *= 100;
+      else if (digits == 2)
+         ms_val *= 10;
+      else if (digits > 3)
+      {
+         while (digits > 3)
+         {
+            ms_val /= 10;
+            digits--;
+         }
+      }
+      ms = ms_val;
+   }
+
+   *out_ms = ((int64_t)hours * 3600 + (int64_t)minutes * 60 + (int64_t)seconds) * 1000 + ms;
+   return true;
+}
+
+static bool parse_srt_time_range_ms(const char *line, int64_t *start_ms, int64_t *end_ms)
+{
+   const char *arrow = NULL;
+   const char *p = NULL;
+
+   if (!line || !start_ms || !end_ms)
+      return false;
+
+   arrow = strstr(line, "-->");
+   if (!arrow)
+      return false;
+
+   p = line;
+   if (!parse_srt_timestamp_ms(p, start_ms))
+      return false;
+
+   p = arrow + 3;
+   if (!parse_srt_timestamp_ms(p, end_ms))
+      return false;
+
+   return true;
+}
+
+static bool srt_add_events_from_buffer(ASS_Track *track, char *buf, size_t buf_size, int64_t *first_start_ms_out)
+{
+   char *cursor = buf;
+   char *end = buf + buf_size;
+   int64_t first_start_ms = -1;
+   bool any = false;
+
+   if (first_start_ms_out)
+      *first_start_ms_out = -1;
+
+   if (!track || !buf || buf_size == 0)
+      return false;
+
+   while (true)
+   {
+      char *line = next_line_inplace(&cursor, end);
+      char *trimmed = NULL;
+      bool is_index = true;
+      int64_t start_ms = 0;
+      int64_t end_ms = 0;
+
+      if (!line)
+         break;
+
+      trimmed = trim_srt_line(line);
+      if (!trimmed || *trimmed == '\0')
+         continue;
+
+      /* Optional numeric index line. */
+      for (char *p = trimmed; *p; p++)
+      {
+         if (!isdigit((unsigned char)*p))
+         {
+            is_index = false;
+            break;
+         }
+      }
+
+      if (is_index)
+      {
+         line = next_line_inplace(&cursor, end);
+         if (!line)
+            break;
+         trimmed = trim_srt_line(line);
+         if (!trimmed || *trimmed == '\0')
+            continue;
+      }
+
+      if (!parse_srt_time_range_ms(trimmed, &start_ms, &end_ms))
+         continue;
+
+      /* Collect text lines until an empty separator line. */
+      {
+         char *text = NULL;
+         size_t text_len = 0;
+         size_t text_cap = 0;
+
+         while (true)
+         {
+            char *tline = next_line_inplace(&cursor, end);
+            char *ws = NULL;
+            size_t add_len = 0;
+            size_t need = 0;
+
+            if (!tline)
+               break;
+
+            ws = tline;
+            while (*ws && isspace((unsigned char)*ws))
+               ws++;
+
+            if (*ws == '\0')
+               break;
+
+            add_len = strlen(tline);
+            need = text_len + add_len + (text_len ? 1 : 0) + 1;
+
+            if (need > text_cap)
+            {
+               size_t new_cap = text_cap ? text_cap * 2 : 256;
+               char *new_text = NULL;
+               while (new_cap < need)
+                  new_cap *= 2;
+               new_text = (char*)realloc(text, new_cap);
+               if (!new_text)
+               {
+                  free(text);
+                  text = NULL;
+                  text_cap = 0;
+                  text_len = 0;
+                  break;
+               }
+               text = new_text;
+               text_cap = new_cap;
+            }
+
+            if (text_len)
+               text[text_len++] = '\n';
+            memcpy(text + text_len, tline, add_len);
+            text_len += add_len;
+            text[text_len] = '\0';
+         }
+
+         if (text && text_len > 0)
+         {
+            ass_add_text_event(track, start_ms, end_ms, text);
+            any = true;
+            if (first_start_ms < 0)
+               first_start_ms = start_ms;
+         }
+
+         free(text);
+      }
+   }
+
+   if (first_start_ms_out)
+      *first_start_ms_out = first_start_ms;
+
+   return any;
+}
+
+static bool ensure_ass_context(void)
+{
+   if (ass && ass_render)
+      return true;
+
+   ass = ass_library_init();
+   if (!ass)
+      return false;
+
+   ass_set_message_cb(ass, ass_msg_cb, NULL);
+
+   for (unsigned i = 0; i < attachments_size; i++)
+      ass_add_font(ass, (char*)"", (char*)attachments[i].data, attachments[i].size);
+
+   ass_render = ass_renderer_init(ass);
+   if (!ass_render)
+   {
+      ass_library_done(ass);
+      ass = NULL;
+      return false;
+   }
+
+   ass_set_frame_size(ass_render, media.width, media.height);
+   ass_set_extract_fonts(ass, true);
+   ass_set_fonts(ass_render, NULL, NULL, 1, NULL, 1);
+   ass_set_hinting(ass_render, ASS_HINTING_LIGHT);
+
+   update_subtitle_style_overrides();
+   update_subtitle_font_scale();
+
+   return true;
+}
+
+static void maybe_load_external_subtitles(const char *media_path)
+{
+   static const char *exts[] = { ".srt" };
+   char sub_path[PATH_MAX];
+
+   if (!media_path)
+      return;
+
+   if (get_media_type() != MEDIA_TYPE_VIDEO)
+      return;
+
+   if (subtitle_streams_num >= MAX_STREAMS)
+      return;
+
+   for (unsigned i = 0; i < (unsigned)(sizeof(exts) / sizeof(exts[0])); i++)
+   {
+      size_t buf_size = 0;
+      char *buf = NULL;
+      ASS_Track *track = NULL;
+      bool is_ass = false;
+      bool any_events = false;
+      int64_t first_start_ms = -1;
+      int slot = subtitle_streams_num;
+
+      if (!path_replace_extension(media_path, exts[i], sub_path, sizeof(sub_path)))
+         continue;
+
+      if (strcmp(sub_path, media_path) == 0)
+         continue;
+
+      if (access(sub_path, R_OK) != 0)
+         continue;
+
+      buf = read_entire_file(sub_path, &buf_size);
+      if (!buf || buf_size == 0)
+      {
+         free(buf);
+         continue;
+      }
+
+      if (!ensure_ass_context())
+      {
+         free(buf);
+         return;
+      }
+
+      is_ass = buffer_looks_like_ass(buf, buf_size);
+      track = ass_new_track(ass);
+      if (!track)
+      {
+         free(buf);
+         return;
+      }
+
+      if (is_ass)
+      {
+         ass_process_data(track, buf, (int)buf_size);
+      }
+      else
+      {
+         ass_init_default_track(track);
+         any_events = srt_add_events_from_buffer(track, buf, buf_size, &first_start_ms);
+         if (!any_events)
+         {
+            ass_free_track(track);
+            free(buf);
+            continue;
+         }
+      }
+
+      ass_scale_track_styles(track, subtitle_font_scale);
+
+      sctx[slot] = NULL;
+      ass_track[slot] = track;
+      subtitle_streams[slot] = -1;
+      subtitle_is_ass[slot] = is_ass;
+      subtitle_is_external[slot] = true;
+      first_subtitle_start_ms[slot] = first_start_ms;
+      subtitle_streams_num++;
+
+      update_subtitle_style_overrides();
+
+      log_cb(RETRO_LOG_INFO, "[APLAYER] Loaded external subtitles: %s (%s)\n",
+            sub_path, is_ass ? "ass" : "text");
+
+      free(buf);
+      break;
+   }
+}
+
 static void sws_worker_thread(void *arg)
 {
    int ret = 0;
@@ -2488,7 +2993,7 @@ static void decode_thread_seek(double time)
    {
       if (sctx[i])
          avcodec_flush_buffers(sctx[i]);
-      if (ass_track[i])
+      if (ass_track[i] && !subtitle_is_external[i])
          ass_flush_events(ass_track[i]);
    }
 }
@@ -3343,6 +3848,8 @@ bool retro_load_game(const struct retro_game_info *info)
       log_cb(RETRO_LOG_ERROR, "[APLAYER] Failed to init media info.");
       goto error;
    }
+
+   maybe_load_external_subtitles(local_info.path);
 
    is_fft = video_stream_index < 0 && audio_streams_num > 0;
 
