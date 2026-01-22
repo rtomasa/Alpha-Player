@@ -9,7 +9,6 @@
 #include <libavcodec/avcodec.h>
 #include <libswscale/swscale.h>
 #include <libavutil/error.h>
-#include <libavutil/hwcontext.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/time.h>
 #include <libavutil/opt.h>
@@ -98,11 +97,6 @@ static unsigned sw_decoder_threads;
 static unsigned sw_sws_threads;
 static video_buffer_t *video_buffer;
 static tpool_t *tpool;
-
-static enum AVHWDeviceType hw_decoder;
-static bool hw_decoding_enabled;
-static enum AVPixelFormat pix_fmt;
-static bool force_sw_decoder;
 
 #define MAX_STREAMS 8
 static AVCodecContext *actx[MAX_STREAMS];
@@ -414,22 +408,13 @@ void retro_set_environment(retro_environment_t cb)
 
    struct retro_core_option_v2_category option_categories[] =
    {
-      {"music", "Music", "Music Settings"},
       {"video", "Video", "Video settings"},
+      {"music", "Music", "Music Settings"},
       {NULL, NULL, NULL}
    };
 
    struct retro_core_option_v2_definition option_definitions[] =
    {
-      {
-         "aplayer_hw_decoder", "Hardware Decoder (restart)", NULL, INFO_RESTART, NULL, "video",
-         {
-            {"auto", "Automatic"},
-            {"off", "Disabled"},
-            {"drm", "DRM"},
-            {NULL, NULL}
-         }, "auto"
-      },
       {
          "aplayer_sw_decoder_threads", "Software Decoder Threads (restart)", NULL, INFO_RESTART, NULL, "video",
          {
@@ -664,7 +649,6 @@ static void update_subtitle_style_overrides(void)
 
 static void check_variables(bool firststart)
 {
-   struct retro_variable hw_var  = {0};
    struct retro_variable sw_threads_var = {0};
    struct retro_variable loop_content  = {0};
    struct retro_variable replay_is_crt  = {0};
@@ -775,22 +759,6 @@ static void check_variables(bool firststart)
          is_crt = true;
       else
          is_crt = false;
-   }
-
-   if (firststart)
-   {
-      hw_var.key = "aplayer_hw_decoder";
-
-      force_sw_decoder = false;
-      hw_decoder = AV_HWDEVICE_TYPE_NONE;
-
-      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &hw_var) && hw_var.value)
-      {
-         if (string_is_equal(hw_var.value, "off"))
-            force_sw_decoder = true;
-         else if (string_is_equal(hw_var.value, "drm"))
-            hw_decoder = AV_HWDEVICE_TYPE_DRM;
-      }
    }
 
    if (firststart)
@@ -1503,137 +1471,6 @@ void retro_run(void)
       audio_batch_cb(audio_buffer, to_read_frames);
 }
 
-/*
- * Try to initialize a specific HW decoder defined by type.
- * Optionaly tests the pixel format list for a compatible pixel format.
- */
-static enum AVPixelFormat init_hw_decoder(struct AVCodecContext *ctx,
-                                    const enum AVHWDeviceType type,
-                                    const enum AVPixelFormat *pix_fmts)
-{
-   int ret = 0;
-   enum AVPixelFormat decoder_pix_fmt = AV_PIX_FMT_NONE;
-   const AVCodec *codec = avcodec_find_decoder(fctx->streams[video_stream_index]->codecpar->codec_id);
-
-   for (int i = 0;; i++)
-   {
-      const AVCodecHWConfig *config = avcodec_get_hw_config(codec, i);
-      if (!config)
-      {
-         log_cb(RETRO_LOG_ERROR, "[APLAYER] Codec %s is not supported by HW video decoder %s.\n",
-                  codec->name, av_hwdevice_get_type_name(type));
-         break;
-      }
-      if (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX &&
-         config->device_type == type)
-      {
-         enum AVPixelFormat device_pix_fmt = config->pix_fmt;
-
-         log_cb(RETRO_LOG_INFO, "[APLAYER] Selected HW decoder %s.\n",
-                  av_hwdevice_get_type_name(type));
-         log_cb(RETRO_LOG_INFO, "[APLAYER] Selected HW pixel format %s.\n",
-                  av_get_pix_fmt_name(device_pix_fmt));
-
-         if (pix_fmts != NULL)
-         {
-            /* Look if codec can supports the pix format of the device */
-            for (size_t i = 0; pix_fmts[i] != AV_PIX_FMT_NONE; i++)
-               if (pix_fmts[i] == device_pix_fmt)
-               {
-                  decoder_pix_fmt = pix_fmts[i];
-                  goto exit;
-               }
-            log_cb(RETRO_LOG_ERROR, "[APLAYER] Codec %s does not support device pixel format %s.\n",
-                  codec->name, av_get_pix_fmt_name(device_pix_fmt));
-         }
-         else
-         {
-            decoder_pix_fmt = device_pix_fmt;
-            goto exit;
-         }
-      }
-   }
-
-exit:
-   if (decoder_pix_fmt != AV_PIX_FMT_NONE)
-   {
-      AVBufferRef *hw_device_ctx;
-      if ((ret = av_hwdevice_ctx_create(&hw_device_ctx,
-                                       type, NULL, NULL, 0)) < 0)
-      {
-         log_cb(RETRO_LOG_ERROR, "[APLAYER] Failed to create specified HW device: %s\n", av_err2str(ret));
-         decoder_pix_fmt = AV_PIX_FMT_NONE;
-      }
-      else
-         ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
-   }
-
-   return decoder_pix_fmt;
-}
-
-/* Automatically try to find a suitable HW decoder */
-static enum AVPixelFormat auto_hw_decoder(AVCodecContext *ctx,
-                                    const enum AVPixelFormat *pix_fmts)
-{
-   enum AVPixelFormat decoder_pix_fmt = AV_PIX_FMT_NONE;
-   enum AVHWDeviceType type = AV_HWDEVICE_TYPE_NONE;
-
-   while((type = av_hwdevice_iterate_types(type)) != AV_HWDEVICE_TYPE_NONE)
-   {
-      decoder_pix_fmt = init_hw_decoder(ctx, type, pix_fmts);
-      if (decoder_pix_fmt != AV_PIX_FMT_NONE)
-         break;
-   }
-
-   return decoder_pix_fmt;
-}
-
-static enum AVPixelFormat select_decoder(AVCodecContext *ctx,
-                                    const enum AVPixelFormat *pix_fmts)
-{
-   enum AVPixelFormat format = AV_PIX_FMT_NONE;
-
-   if (!force_sw_decoder)
-   {
-      if (hw_decoder == AV_HWDEVICE_TYPE_NONE)
-         format              = auto_hw_decoder(ctx, pix_fmts);
-      else
-         format              = init_hw_decoder(ctx, hw_decoder, pix_fmts);
-   }
-
-   /* Fallback to SW rendering */
-   if (format == AV_PIX_FMT_NONE)
-   {
-      log_cb(RETRO_LOG_INFO, "[APLAYER] Using SW decoding.\n");
-
-      ctx->thread_type       = FF_THREAD_FRAME;
-      ctx->thread_count      = sw_decoder_threads;
-      log_cb(RETRO_LOG_INFO, "[APLAYER] Configured software decoding threads: %d\n", sw_decoder_threads);
-      format                 = (enum AVPixelFormat)fctx->streams[video_stream_index]->codecpar->format;
-      hw_decoding_enabled    = false;
-   }
-   else
-      hw_decoding_enabled    = true;
-
-   return format;
-}
-
-/* Callback used by ffmpeg to configure the pixelformat to use. */
-static enum AVPixelFormat get_format(AVCodecContext *ctx,
-                                     const enum AVPixelFormat *pix_fmts)
-{
-   /* Look if we can reuse the current decoder */
-   for (size_t i = 0; pix_fmts[i] != AV_PIX_FMT_NONE; i++)
-   {
-      if (pix_fmts[i] == pix_fmt)
-         return pix_fmt;
-   }
-
-   pix_fmt = select_decoder(ctx, pix_fmts);
-
-   return pix_fmt;
-}
-
 static bool open_codec(AVCodecContext **ctx, enum AVMediaType type, unsigned index)
 {
    int ret              = 0;
@@ -1650,8 +1487,10 @@ static bool open_codec(AVCodecContext **ctx, enum AVMediaType type, unsigned ind
    if (type == AVMEDIA_TYPE_VIDEO)
    {
       video_stream_index = index;
-      vctx->get_format  = get_format;
-      pix_fmt = select_decoder((*ctx), NULL);
+      (*ctx)->thread_type  = FF_THREAD_FRAME;
+      (*ctx)->thread_count = sw_decoder_threads;
+      log_cb(RETRO_LOG_INFO, "[APLAYER] Using SW decoding.\n");
+      log_cb(RETRO_LOG_INFO, "[APLAYER] Configured software decoding threads: %d\n", sw_decoder_threads);
    }
 
    if ((ret = avcodec_open2(*ctx, codec, NULL)) < 0)
@@ -2805,10 +2644,7 @@ static void sws_worker_thread(void *arg)
    AVFrame *tmp_frame = NULL;
    video_decoder_context_t *ctx = (video_decoder_context_t*) arg;
 
-   if (hw_decoding_enabled)
-      tmp_frame = ctx->hw_source;
-   else
-      tmp_frame = ctx->source;
+   tmp_frame = ctx->source;
 
    ctx->sws = sws_getCachedContext(ctx->sws,
          media.width, media.height, (enum AVPixelFormat)tmp_frame->format,
@@ -2829,7 +2665,6 @@ static void sws_worker_thread(void *arg)
    ctx->pts = ctx->source->best_effort_timestamp;
 
    av_frame_unref(ctx->source);
-   av_frame_unref(ctx->hw_source);
    video_buffer_finish_slot(video_buffer, ctx);
 }
 
@@ -3539,9 +3374,6 @@ end:
 
    for (i = 0; (int)i < audio_streams_num; i++)
       swr_free(&swr[i]);
-
-   if (vctx && vctx->hw_device_ctx)
-      av_buffer_unref(&vctx->hw_device_ctx);
 
    packet_buffer_destroy(audio_packet_buffer);
    packet_buffer_destroy(video_packet_buffer);

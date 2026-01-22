@@ -53,6 +53,7 @@ If a video has an external subtitle file with the same name and a `.srt` extensi
 # v2.2.0
 - [X] Added support for external .srt files
 - [X] Added option to disable subtitles
+- [X] Removed unused hardware decoder path
 - [X] Optimized software video path by eliminating an extra full-frame CPU copy (use video_buffer RGB output directly).
 - [X] Improved GL upload performance by allocating textures once per size and updating via glTexSubImage2D instead of glTexImage2D each frame.
 - [X] Reduced decode-thread allocation churn by reusing AVPacket and reusing a drain AVFrame on EAGAIN.
