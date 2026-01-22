@@ -82,6 +82,7 @@ static bool subtitle_font_auto = false;
 static double subtitle_font_scale = 1.0;
 static const char *subtitle_font_name = "DejaVu Sans";
 static int subtitle_font_bold = 0;
+static bool subtitles_enabled = true;
 static char subtitle_style_override_font[128];
 static char subtitle_style_override_bold[64];
 static char *subtitle_style_overrides[] = {
@@ -441,6 +442,14 @@ void retro_set_environment(retro_environment_t cb)
          }, "auto"
       },
       {
+         "aplayer_subtitles", "Subtitles", NULL, NULL, NULL, "video",
+         {
+            {"enabled", "Enabled"},
+            {"disabled", "Disabled"},
+            {NULL, NULL}
+         }, "enabled"
+      },
+      {
          "aplayer_subtitle_font_size", "Subtitle Font Size", NULL, NULL, NULL, "video",
          {
             {"auto", "Auto"},
@@ -660,6 +669,7 @@ static void check_variables(bool firststart)
    struct retro_variable loop_content  = {0};
    struct retro_variable replay_is_crt  = {0};
    struct retro_variable fft_var    = {0};
+   struct retro_variable subtitle_toggle_var = {0};
    struct retro_variable subtitle_font_var = {0};
    struct retro_variable subtitle_font_name_var = {0};
 
@@ -675,6 +685,15 @@ static void check_variables(bool firststart)
          fft_width = w;
          fft_height = h;
       }
+   }
+
+   subtitles_enabled = true;
+   subtitle_toggle_var.key = "aplayer_subtitles";
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &subtitle_toggle_var) &&
+         subtitle_toggle_var.value)
+   {
+      if (string_is_equal(subtitle_toggle_var.value, "disabled"))
+         subtitles_enabled = false;
    }
 
    subtitle_font_size = 64;
@@ -2070,6 +2089,9 @@ static void render_subtitles_on_buffer(uint32_t *buffer, unsigned width,
    int64_t track_start_ms = -1;
 
    if (!buffer || width == 0 || height == 0)
+      return;
+
+   if (!subtitles_enabled)
       return;
 
    if (!ass_render || subtitle_streams_num <= 0)

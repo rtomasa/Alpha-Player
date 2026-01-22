@@ -52,10 +52,11 @@ If a video has an external subtitle file with the same name and a `.srt` extensi
 
 # v2.2.0
 - [X] Added support for external .srt files
-- [X] Optimize software video path by eliminating an extra full-frame CPU copy (use video_buffer RGB output directly).
-- [X] Improve GL upload performance by allocating textures once per size and updating via glTexSubImage2D instead of glTexImage2D each frame.
-- [X] Reduce decode-thread allocation churn by reusing AVPacket and reusing a drain AVFrame on EAGAIN.
-- [X] Fix video_buffer ring-buffer head wraparound when returning an open slot (avoids negative modulus / potential stalls).
+- [X] Added option to disable subtitles
+- [X] Optimized software video path by eliminating an extra full-frame CPU copy (use video_buffer RGB output directly).
+- [X] Improved GL upload performance by allocating textures once per size and updating via glTexSubImage2D instead of glTexImage2D each frame.
+- [X] Reduced decode-thread allocation churn by reusing AVPacket and reusing a drain AVFrame on EAGAIN.
+- [X] Fixed video_buffer ring-buffer head wraparound when returning an open slot (avoids negative modulus / potential stalls).
 
 # v2.1.0
 - [X] Changed POINT to BILINEAR scaling for better image quality
