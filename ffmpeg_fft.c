@@ -10,7 +10,6 @@
 #include <retro_inline.h>
 #include <filters.h>
 #include <math/complex.h>
-#include <gfx/math/matrix_4x4.h>
 #include <gfx/math/vector_2.h>
 
 #include "include/ffmpeg_fft.h"
@@ -85,15 +84,15 @@ struct GLFFT
    unsigned size;
    unsigned block_size;
    unsigned depth;
+   unsigned frame;
 };
 
-#include "gl_shaders/fft_heightmap.glsl.vert.h"
-#include "gl_shaders/fft_heightmap.glsl.frag.h"
 #include "gl_shaders/fft_vertex_program.glsl.vert.h"
 #include "gl_shaders/fft_fragment_program_resolve.glsl.frag.h"
 #include "gl_shaders/fft_fragment_program_real.glsl.frag.h"
 #include "gl_shaders/fft_fragment_program_complex.glsl.frag.h"
 #include "gl_shaders/fft_fragment_program_blur.glsl.frag.h"
+#include "gl_shaders/fft_visualizer.glsl.frag.h"
 
 static GLuint fft_compile_shader(fft_t *fft, GLenum type, const char *source)
 {
@@ -147,8 +146,6 @@ static GLuint fft_compile_program(fft_t *fft,
    glDeleteShader(frag);
    return prog;
 }
-
-typedef float stub_matrix4x4[4][4];
 
 static INLINE unsigned log2i(unsigned x)
 {
@@ -373,76 +370,18 @@ static void fft_init(fft_t *fft)
 
 static void fft_init_block(fft_t *fft)
 {
-   unsigned x, y;
-   unsigned block_vertices_size = 0;
-   unsigned block_indices_size  = 0;
-   int pos                      = 0;
-   GLuint *bp                   = NULL;
-   GLushort *block_vertices     = NULL;
-   GLuint   *block_indices      = NULL;
+   static const GLfloat unity[] = { 0.0f, 0.0f, 1.0f, 1.0f };
 
    fft->block.prog              = fft_compile_program(fft,
-         fft_vertex_program_heightmap, fft_fragment_program_heightmap);
+         fft_vertex_program, fft_fragment_program_visualizer);
 
    glUseProgram(fft->block.prog);
    glUniform1i(glGetUniformLocation(fft->block.prog, "sHeight"), 0);
-
-   block_vertices_size = 2 * fft->block_size * fft->depth;
-   block_vertices      = (GLushort*)calloc(block_vertices_size, sizeof(GLushort));
-
-   for (y = 0; y < fft->depth; y++)
-   {
-      for (x = 0; x < fft->block_size; x++)
-      {
-         block_vertices[2 * (y * fft->block_size + x) + 0] = x;
-         block_vertices[2 * (y * fft->block_size + x) + 1] = y;
-      }
-   }
-   glGenBuffers(1, &fft->block.vbo);
-   glBindBuffer(GL_ARRAY_BUFFER, fft->block.vbo);
-   glBufferData(GL_ARRAY_BUFFER,
-         block_vertices_size * sizeof(GLushort),
-         &block_vertices[0], GL_STATIC_DRAW);
-
-   fft->block.elems = (2 * fft->block_size - 1) * (fft->depth - 1) + 1;
-
-   block_indices_size = fft->block.elems;
-   block_indices = (GLuint*)calloc(block_indices_size, sizeof(GLuint));
-
-   bp = &block_indices[0];
-
-   for (y = 0; y < fft->depth - 1; y++)
-   {
-      int x;
-      int step_odd  = (-(int)(fft->block_size)) + ((y & 1) ? -1 : 1);
-      int step_even = fft->block_size;
-
-      for (x = 0; x < 2 * (int)(fft->block_size) - 1; x++)
-      {
-         *bp++ = pos;
-         pos += (x & 1) ? step_odd : step_even;
-      }
-   }
-   *bp++ = pos;
-
-   glGenVertexArrays(1, &fft->block.vao);
-   glBindVertexArray(fft->block.vao);
-
-   glGenBuffers(1, &fft->block.ibo);
-   glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, fft->block.ibo);
-   glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-         block_indices_size * sizeof(GLuint),
-         &block_indices[0], GL_STATIC_DRAW);
-
-   glEnableVertexAttribArray(0);
-   glVertexAttribPointer(0, 2, GL_UNSIGNED_SHORT, GL_FALSE, 0, 0);
-   glBindVertexArray(0);
-
-   glBindBuffer(GL_ARRAY_BUFFER, 0);
-   glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-
-   free(block_vertices);
-   free(block_indices);
+   glUniform4fv(glGetUniformLocation(fft->block.prog, "uOffsetScale"), 1, unity);
+   fft->block.vao  = fft->vao;
+   fft->block.vbo  = 0;
+   fft->block.ibo  = 0;
+   fft->block.elems = 4;
 }
 
 static bool fft_context_reset(fft_t *fft, unsigned fft_steps,
@@ -454,6 +393,7 @@ static bool fft_context_reset(fft_t *fft, unsigned fft_steps,
    fft->depth       = fft_depth;
    fft->size        = 1 << fft_steps;
    fft->block_size  = fft->size / 4 + 1;
+   fft->frame       = 0;
 
    fft->passes_size = fft_steps;
    fft->passes      = (struct Pass*)calloc(fft->passes_size, sizeof(struct Pass));
@@ -664,67 +604,32 @@ void fft_step_fft(fft_t *fft, const GLshort *audio_buffer, unsigned frames)
 
 void fft_render(fft_t *fft, GLuint backbuffer, unsigned width, unsigned height)
 {
-   vec3_t eye, center, up;
-   stub_matrix4x4 mvp_real;
-   math_matrix_4x4 mvp_lookat, mvp, mvp_persp;
-
-   eye[0]               = 0.0f;
-   eye[1]               = 80.0f;
-   eye[2]               = -60.0f;
-
-   up[0]                = 0.0f;
-   up[1]                = 1.0f;
-   up[2]                = 0.0f;
-
-   center[0]            = 0.0f;
-   center[1]            = 0.0f;
-   center[2]            = 1.0f;
-
-   vec3_add(center, eye);
-
-   matrix_4x4_projection(mvp_persp, (float)M_HALF_PI, (float)width / height, 1.0f, 500.0f);
-   matrix_4x4_lookat(mvp_lookat, eye, center, up);
-   matrix_4x4_multiply(mvp, mvp_lookat, mvp_persp);
+   unsigned row = (fft->output_ptr + fft->depth - 1) & (fft->depth - 1);
+   float time = (float)fft->frame++;
 
    /* Render scene. */
    glBindFramebuffer(GL_FRAMEBUFFER, fft->ms_fbo ? fft->ms_fbo : backbuffer);
    glViewport(0, 0, width, height);
-   glClearColor(0.1f, 0.15f, 0.1f, 1.0f);
+   glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+   glDisable(GL_CULL_FACE);
+   glDisable(GL_DEPTH_TEST);
 
    glUseProgram(fft->block.prog);
 
-   mvp_real[0][0] = MAT_ELEM_4X4(mvp, 0, 0);
-   mvp_real[0][1] = MAT_ELEM_4X4(mvp, 0, 1);
-   mvp_real[0][2] = MAT_ELEM_4X4(mvp, 0, 2);
-   mvp_real[0][3] = MAT_ELEM_4X4(mvp, 0, 3);
-   mvp_real[1][0] = MAT_ELEM_4X4(mvp, 1, 0);
-   mvp_real[1][1] = MAT_ELEM_4X4(mvp, 1, 1);
-   mvp_real[1][2] = MAT_ELEM_4X4(mvp, 1, 2);
-   mvp_real[1][3] = MAT_ELEM_4X4(mvp, 1, 3);
-   mvp_real[2][0] = MAT_ELEM_4X4(mvp, 2, 0);
-   mvp_real[2][1] = MAT_ELEM_4X4(mvp, 2, 1);
-   mvp_real[2][2] = MAT_ELEM_4X4(mvp, 2, 2);
-   mvp_real[2][3] = MAT_ELEM_4X4(mvp, 2, 3);
-   mvp_real[3][0] = MAT_ELEM_4X4(mvp, 3, 0);
-   mvp_real[3][1] = MAT_ELEM_4X4(mvp, 3, 1);
-   mvp_real[3][2] = MAT_ELEM_4X4(mvp, 3, 2);
-   mvp_real[3][3] = MAT_ELEM_4X4(mvp, 3, 3);
+   glUniform2f(glGetUniformLocation(fft->block.prog, "uResolution"),
+         (float)width, (float)height);
+   glUniform2f(glGetUniformLocation(fft->block.prog, "uHeightmapSize"),
+         (float)fft->size, (float)fft->depth);
+   glUniform1f(glGetUniformLocation(fft->block.prog, "uRow"), (float)row);
+   glUniform1f(glGetUniformLocation(fft->block.prog, "uTime"), time);
 
-   glUniformMatrix4fv(glGetUniformLocation(fft->block.prog, "uMVP"),
-         1, GL_FALSE, (&mvp_real[0][0]));
-
-   glUniform2i(glGetUniformLocation(fft->block.prog, "uOffset"),
-         ((-(int)(fft->block_size)) + 1) / 2, fft->output_ptr);
-   glUniform4f(glGetUniformLocation(fft->block.prog, "uHeightmapParams"),
-         -(fft->block_size - 1.0f) / 2.0f, 0.0f, 3.0f, 2.0f);
-   glUniform1f(glGetUniformLocation(fft->block.prog, "uAngleScale"),
-         M_PI / ((fft->block_size - 1) / 2));
-
-   glBindVertexArray(fft->block.vao);
+   glActiveTexture(GL_TEXTURE0);
    glBindTexture(GL_TEXTURE_2D, fft->blur.tex);
-   glDrawElements(GL_TRIANGLE_STRIP, fft->block.elems, GL_UNSIGNED_INT, NULL);
+   glBindVertexArray(fft->vao);
+   glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
    glBindVertexArray(0);
+   glBindTexture(GL_TEXTURE_2D, 0);
    glUseProgram(0);
 
    if (fft->ms_fbo)

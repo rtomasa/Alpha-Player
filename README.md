@@ -53,6 +53,8 @@ If a video has an external subtitle file with the same name and a `.srt` extensi
 # v2.2.0
 - [X] Added support for external .srt files
 - [X] Added option to disable subtitles
+- [X] Added option to disable visualizer
+- [X] Replaced FFT visualizer
 - [X] Removed unused hardware decoder path
 - [X] Optimized software video path by eliminating an extra full-frame CPU copy (use video_buffer RGB output directly).
 - [X] Improved GL upload performance by allocating textures once per size and updating via glTexSubImage2D instead of glTexImage2D each frame.

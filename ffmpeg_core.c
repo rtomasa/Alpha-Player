@@ -129,6 +129,7 @@ static size_t attachments_size;
 static fft_t *fft;
 unsigned fft_width;
 unsigned fft_height;
+static bool fft_enabled;
 
 /* A/V timing. */
 static uint64_t frame_cnt;
@@ -468,12 +469,12 @@ void retro_set_environment(retro_environment_t cb)
          }, "dejavu_sans_mono_bold"
       },
       {
-         "aplayer_fft_resolution", "Visualizer Resolution", NULL, NULL, NULL, "music",
+         "aplayer_visualizer", "Visualizer", NULL, NULL, NULL, "music",
          {
-            {"320x240", NULL},
-            {"320x180", NULL},
+            {"enabled", "Enabled"},
+            {"disabled", "Disabled"},
             {NULL, NULL}
-         }, "320x240"
+         }, "enabled"
       },
       {
          "aplayer_loop_content", "Loop Mode", NULL, NULL, NULL, NULL,
@@ -652,23 +653,20 @@ static void check_variables(bool firststart)
    struct retro_variable sw_threads_var = {0};
    struct retro_variable loop_content  = {0};
    struct retro_variable replay_is_crt  = {0};
-   struct retro_variable fft_var    = {0};
+   struct retro_variable fft_toggle_var    = {0};
    struct retro_variable subtitle_toggle_var = {0};
    struct retro_variable subtitle_font_var = {0};
    struct retro_variable subtitle_font_name_var = {0};
 
-   fft_var.key = "aplayer_fft_resolution";
-
-   fft_width       = 320;
-   fft_height      = 240;
-   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &fft_var) && fft_var.value)
+   fft_width  = 640;
+   fft_height = 480;
+   fft_enabled = true;
+   fft_toggle_var.key = "aplayer_visualizer";
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &fft_toggle_var) &&
+         fft_toggle_var.value)
    {
-      unsigned w, h;
-      if (sscanf(fft_var.value, "%ux%u", &w, &h) == 2)
-      {
-         fft_width = w;
-         fft_height = h;
-      }
+      if (string_is_equal(fft_toggle_var.value, "disabled"))
+         fft_enabled = false;
    }
 
    subtitles_enabled = true;
@@ -1440,23 +1438,33 @@ void retro_run(void)
    }
    else if (fft)
    {
-      unsigned       frames = to_read_frames;
-      const int16_t *buffer = audio_buffer;
-
-      while (frames)
+      if (fft_enabled)
       {
-         unsigned to_read = frames;
+         unsigned       frames = to_read_frames;
+         const int16_t *buffer = audio_buffer;
 
-         /* FFT size we use (1 << 11). Really shouldn't happen,
-          * unless we use a crazy high sample rate. */
-         if (to_read > (1 << 11))
-            to_read = 1 << 11;
+         while (frames)
+         {
+            unsigned to_read = frames;
 
-         fft_step_fft(fft, buffer, to_read);
-         buffer += to_read * 2;
-         frames -= to_read;
+            /* FFT size we use (1 << 11). Really shouldn't happen,
+             * unless we use a crazy high sample rate. */
+            if (to_read > (1 << 11))
+               to_read = 1 << 11;
+
+            fft_step_fft(fft, buffer, to_read);
+            buffer += to_read * 2;
+            frames -= to_read;
+         }
+         fft_render(fft, hw_render.get_current_framebuffer(), fft_width, fft_height);
       }
-      fft_render(fft, hw_render.get_current_framebuffer(), fft_width, fft_height);
+      else
+      {
+         glBindFramebuffer(GL_FRAMEBUFFER, hw_render.get_current_framebuffer());
+         glViewport(0, 0, fft_width, fft_height);
+         glClearColor(0, 0, 0, 1);
+         glClear(GL_COLOR_BUFFER_BIT);
+      }
 
       /* Draw music FFT using OGL*/
       video_cb(RETRO_HW_FRAME_BUFFER_VALID,
