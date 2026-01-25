@@ -371,7 +371,7 @@ static void show_not_supported_message(void)
    msg_obj.msg      = "Not supported";
    msg_obj.duration = 2000;
    msg_obj.priority = 1;
-   msg_obj.level    = RETRO_LOG_INFO;
+   msg_obj.level    = RETRO_LOG_WARN;
    msg_obj.target   = RETRO_MESSAGE_TARGET_ALL;
    msg_obj.type     = RETRO_MESSAGE_TYPE_NOTIFICATION;
    msg_obj.progress = -1;
