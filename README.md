@@ -51,6 +51,7 @@ If a video has an external subtitle file with the same name and a `.srt` extensi
 # Changelog
 
 # v2.2.0
+- [X] Added support for tracker music (s3m|it|xm|mod)
 - [X] Added support for external .srt files
 - [X] Added option to disable subtitles
 - [X] Added option to disable visualizer

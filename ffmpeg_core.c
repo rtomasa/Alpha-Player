@@ -152,6 +152,9 @@ static bool do_seek;
 static double seek_time;
 static bool paused = false;
 static volatile bool audio_switch_requested = false;
+static bool seek_supported = true;
+static bool time_supported = true;
+static bool gme_seek_disabled = false;
 
 /* GL stuff */
 static struct frame frames[2];
@@ -171,6 +174,9 @@ static void media_reset_defaults(void)
    media.interpolate_fps = 60.0;   // your current default
    media.sample_rate     = 32000.0; // safe default until audio stream is opened
    media.aspect          = 0.0f;    // force recompute
+   seek_supported        = true;
+   time_supported        = true;
+   gme_seek_disabled     = false;
 }
 
 static void init_aspect_ratio(void)
@@ -298,6 +304,81 @@ static int get_media_type()
    return type;
 }
 
+static bool duration_is_valid(double seconds)
+{
+   const double max_duration = 365.0 * 24.0 * 60.0 * 60.0;
+   return seconds > 0.0 && seconds < max_duration;
+}
+
+static bool is_gme_extension(const char *ext)
+{
+   static const char *const exts[] = {
+      ".ay", ".gbs", ".gym", ".hes", ".kss",
+      ".nsf", ".nsfe", ".sap", ".spc", ".vgm", ".vgz",
+      NULL
+   };
+
+   if (!ext || !*ext)
+      return false;
+
+   for (int i = 0; exts[i]; i++)
+   {
+      if (strcasecmp(ext, exts[i]) == 0)
+         return true;
+   }
+
+   return false;
+}
+
+static bool is_gme_path(const char *path)
+{
+   const char *ext = path ? strrchr(path, '.') : NULL;
+   return is_gme_extension(ext);
+}
+
+static double stream_duration_seconds(int stream_index)
+{
+   if (!fctx || stream_index < 0 || stream_index >= (int)fctx->nb_streams)
+      return 0.0;
+
+   AVStream *st = fctx->streams[stream_index];
+   if (!st || st->duration == AV_NOPTS_VALUE || st->duration <= 0)
+      return 0.0;
+
+   return st->duration * av_q2d(st->time_base);
+}
+
+static void format_time_hhmmss(double seconds, char *out, size_t out_size)
+{
+   if (!out || out_size == 0)
+      return;
+
+   if (seconds < 0.0)
+      seconds = 0.0;
+
+   unsigned total = (unsigned)seconds;
+   unsigned hours = total / 3600;
+   unsigned minutes = (total % 3600) / 60;
+   unsigned secs = total % 60;
+
+   snprintf(out, out_size, "%02u:%02u:%02u", hours, minutes, secs);
+}
+
+static void show_not_supported_message(void)
+{
+   struct retro_message_ext msg_obj = {0};
+
+   msg_obj.msg      = "Not supported";
+   msg_obj.duration = 2000;
+   msg_obj.priority = 1;
+   msg_obj.level    = RETRO_LOG_INFO;
+   msg_obj.target   = RETRO_MESSAGE_TARGET_ALL;
+   msg_obj.type     = RETRO_MESSAGE_TYPE_NOTIFICATION;
+   msg_obj.progress = -1;
+
+   environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
+}
+
 static void display_media_title()
 {
    if (!fctx || decode_thread_dead)
@@ -394,7 +475,10 @@ void retro_get_system_av_info(struct retro_system_av_info *info)
       aspect = (float)fft_width / (float)fft_height;
    }
    info->timing.fps = media.interpolate_fps;
-   info->timing.sample_rate = actx[0] ? media.sample_rate : 32000.0;
+   if (actx[0] && media.sample_rate > 0)
+      info->timing.sample_rate = media.sample_rate;
+   else
+      info->timing.sample_rate = 32000.0;
 
    info->geometry.base_width   = width;
    info->geometry.base_height  = height;
@@ -781,14 +865,20 @@ static void check_variables(bool firststart)
 static void seek_frame(int seek_frames)
 {
    char msg[256];
+   char seek_time_str[16];
+   char total_time_str[16];
    struct retro_message_ext msg_obj = {0};
    int seek_frames_capped           = seek_frames;
-   unsigned seek_hours              = 0;
-   unsigned seek_minutes            = 0;
-   unsigned seek_seconds            = 0;
    int8_t seek_progress             = -1;
+   bool duration_valid              = duration_is_valid(media.duration.time);
 
    msg[0] = '\0';
+
+   if (!seek_supported && !reset_triggered)
+   {
+      show_not_supported_message();
+      return;
+   }
 
    /* Handle resets + attempts to seek to a location
     * before the start of the video */
@@ -801,33 +891,39 @@ static void seek_frame(int seek_frames)
    else
    {
       double current_time     = (double)frame_cnt / media.interpolate_fps;
-      double seek_step_time   = (double)seek_frames / media.interpolate_fps;
-      double seek_target_time = current_time + seek_step_time;
-      double seek_time_max    = media.duration.time - 1.0;
 
-      seek_time_max = (seek_time_max > 0.0) ?
-            seek_time_max : 0.0;
-
-      /* Ensure that we don't attempt to seek past
-       * the end of the file */
-      if (seek_target_time > seek_time_max)
+      if (duration_valid)
       {
-         seek_step_time = seek_time_max - current_time;
+         double seek_step_time   = (double)seek_frames / media.interpolate_fps;
+         double seek_target_time = current_time + seek_step_time;
+         double seek_time_max    = media.duration.time - 1.0;
 
-         /* If seek would have taken us to the
-          * end of the file, restart it instead
-          * (less jarring for the user in case of
-          * accidental seeking...) */
-         if (seek_step_time < 0.0)
-            seek_frames_capped = -1;
+         seek_time_max = (seek_time_max > 0.0) ?
+               seek_time_max : 0.0;
+
+         /* Ensure that we don't attempt to seek past
+          * the end of the file */
+         if (seek_target_time > seek_time_max)
+         {
+            seek_step_time = seek_time_max - current_time;
+
+            /* If seek would have taken us to the
+             * end of the file, restart it instead
+             * (less jarring for the user in case of
+             * accidental seeking...) */
+            if (seek_step_time < 0.0)
+               seek_frames_capped = -1;
+            else
+               seek_frames_capped = (int)(seek_step_time * media.interpolate_fps);
+         }
+
+         if (seek_frames_capped < 0)
+            frame_cnt  = 0;
          else
-            seek_frames_capped = (int)(seek_step_time * media.interpolate_fps);
+            frame_cnt += seek_frames_capped;
       }
-
-      if (seek_frames_capped < 0)
-         frame_cnt  = 0;
       else
-         frame_cnt += seek_frames_capped;
+         frame_cnt += seek_frames;
    }
 
    do_seek = true;
@@ -835,24 +931,26 @@ static void seek_frame(int seek_frames)
    seek_time      = frame_cnt / media.interpolate_fps;
 
    /* Convert seek time to a printable format */
-   seek_seconds  = (unsigned)seek_time;
-   seek_minutes  = seek_seconds / 60;
-   seek_seconds %= 60;
-   seek_hours    = seek_minutes / 60;
-   seek_minutes %= 60;
+   format_time_hhmmss(seek_time, seek_time_str, sizeof(seek_time_str));
+   if (duration_valid)
+      format_time_hhmmss(media.duration.time, total_time_str, sizeof(total_time_str));
+   else
+      snprintf(total_time_str, sizeof(total_time_str), "--:--:--");
 
    /* Get current progress */
-   if (media.duration.time > 0.0)
+   if (duration_valid)
    {
       seek_progress = (int8_t)((100.0 * seek_time / media.duration.time) + 0.5);
       seek_progress = (seek_progress < -1)  ? -1  : seek_progress;
       seek_progress = (seek_progress > 100) ? 100 : seek_progress;
    }
 
-   snprintf(msg, sizeof(msg), "%02d:%02d:%02d / %02d:%02d:%02d (%d%%)",
-         seek_hours, seek_minutes, seek_seconds,
-         media.duration.hours, media.duration.minutes, media.duration.seconds,
-         seek_progress);
+   if (duration_valid)
+      snprintf(msg, sizeof(msg), "%s / %s (%d%%)",
+            seek_time_str, total_time_str, seek_progress);
+   else
+      snprintf(msg, sizeof(msg), "%s / %s",
+            seek_time_str, total_time_str);
 
    /* Send message to frontend */
    msg_obj.msg      = msg;
@@ -861,7 +959,7 @@ static void seek_frame(int seek_frames)
    msg_obj.level    = RETRO_LOG_INFO;
    msg_obj.target   = RETRO_MESSAGE_TARGET_OSD;
    msg_obj.type     = RETRO_MESSAGE_TYPE_PROGRESS;
-   msg_obj.progress = seek_progress;
+   msg_obj.progress = duration_valid ? seek_progress : -1;
    environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
 
    if (seek_frames_capped < 0)
@@ -879,7 +977,16 @@ static void seek_frame(int seek_frames)
    while (!decode_thread_dead && do_seek)
    {
       main_sleeping = true;
-      scond_wait(fifo_cond, fifo_lock);
+      if (video_stream_index < 0)
+      {
+         if (!scond_wait_timeout(fifo_cond, fifo_lock, 2000))
+         {
+            log_cb(RETRO_LOG_WARN, "[APLAYER] Seek timed out, continuing.\n");
+            break;
+         }
+      }
+      else
+         scond_wait(fifo_cond, fifo_lock);
       main_sleeping = false;
    }
 
@@ -894,48 +1001,56 @@ static void dispaly_time(void)
 
    // Local buffer for the message, plus the RetroArch message object
    char msg[256];
+   char current_str[16];
+   char total_str[16];
    struct retro_message_ext msg_obj = {0};
    msg[0] = '\0';
 
-   // 1. Read the shared "current time" in seconds from a protected variable
-   double current_time = 0.0;
-   slock_lock(time_lock);
-   current_time = g_current_time;   // The decode thread sets this
-   slock_unlock(time_lock);
+   double total_duration = media.duration.time;
+   bool total_valid = duration_is_valid(total_duration);
 
-   // 2. Get total duration of the file (already in fctx->duration)
-   double total_duration = (double)fctx->duration / AV_TIME_BASE;
+   double pts_time = 0.0;
+   if (time_lock)
+   {
+      slock_lock(time_lock);
+      pts_time = g_current_time;   // The decode thread sets this
+      slock_unlock(time_lock);
+   }
 
-   // (Optional) If current_time <= 0 or uninitialized, you could decide to return
-   // or skip the rest. That is up to your design.
+   double fallback_time = (double)frame_cnt / media.interpolate_fps;
+   if (audio_streams_num > 0 && video_stream_index < 0 && media.sample_rate > 0)
+      fallback_time = (double)audio_frames / media.sample_rate;
+
+   double current_time = pts_time;
+   if (video_stream_index < 0 ||
+         current_time < 0.0 ||
+         (total_valid && current_time > total_duration + 5.0))
+      current_time = fallback_time;
+
    if (current_time < 0.0)
       current_time = 0.0;
 
-   // 3. Convert current_time to HH:MM:SS
-   int current_hours   = (int)(current_time / 3600);
-   int current_minutes = ((int)current_time % 3600) / 60;
-   int current_seconds = (int)current_time % 60;
+   format_time_hhmmss(current_time, current_str, sizeof(current_str));
+   if (total_valid)
+      format_time_hhmmss(total_duration, total_str, sizeof(total_str));
+   else
+      snprintf(total_str, sizeof(total_str), "--:--:--");
 
-   // 4. Convert total_duration to HH:MM:SS
-   int total_hours     = (int)(total_duration / 3600);
-   int total_minutes   = ((int)total_duration % 3600) / 60;
-   int total_seconds   = (int)total_duration % 60;
-
-   // 5. Compute progress percentage (0..100)
    double progress = 0.0;
-   if (total_duration > 0.0)
+   int progress_int = -1;
+   if (total_valid)
    {
       progress = (current_time / total_duration) * 100.0;
       if (progress < 0.0)   progress = 0.0;
       if (progress > 100.0) progress = 100.0;
+      progress_int = (int)(progress + 0.5);
    }
 
-   // 6. Build the message string
-   snprintf(msg, sizeof(msg),
-         "%02d:%02d:%02d / %02d:%02d:%02d (%d%%)",
-         current_hours, current_minutes, current_seconds,
-         total_hours,   total_minutes,   total_seconds,
-         (int)progress);
+   if (total_valid)
+      snprintf(msg, sizeof(msg), "%s / %s (%d%%)",
+            current_str, total_str, progress_int);
+   else
+      snprintf(msg, sizeof(msg), "%s / %s", current_str, total_str);
 
    // 7. Fill in the retro_message_ext object and send to frontend
    msg_obj.msg      = msg;
@@ -944,7 +1059,7 @@ static void dispaly_time(void)
    msg_obj.level    = RETRO_LOG_INFO;
    msg_obj.target   = RETRO_MESSAGE_TARGET_ALL;
    msg_obj.type     = RETRO_MESSAGE_TYPE_PROGRESS;
-   msg_obj.progress = progress;
+   msg_obj.progress = progress_int;
 
    environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
 }
@@ -1316,21 +1431,35 @@ void retro_run(void)
       double expected_pts;
       double old_pts_bias;
       size_t to_read_bytes;
+      size_t bytes_per_frame = sizeof(int16_t) * 2;
       uint64_t expected_audio_frames = frame_cnt * media.sample_rate / media.interpolate_fps;
 
       to_read_frames = expected_audio_frames - audio_frames;
-      to_read_bytes = to_read_frames * sizeof(int16_t) * 2;
+      to_read_bytes = to_read_frames * bytes_per_frame;
 
       slock_lock(fifo_lock);
-      while (!decode_thread_dead && FIFO_READ_AVAIL(audio_decode_fifo) < to_read_bytes)
+      if (video_stream_index < 0)
       {
-         main_sleeping = true;
-         scond_signal(fifo_decode_cond);
-         scond_wait(fifo_cond, fifo_lock);
-         main_sleeping = false;
+         if (!decode_thread_dead && FIFO_READ_AVAIL(audio_decode_fifo) < to_read_bytes)
+         {
+            main_sleeping = true;
+            scond_signal(fifo_decode_cond);
+            scond_wait_timeout(fifo_cond, fifo_lock, 2000);
+            main_sleeping = false;
+         }
+      }
+      else
+      {
+         while (!decode_thread_dead && FIFO_READ_AVAIL(audio_decode_fifo) < to_read_bytes)
+         {
+            main_sleeping = true;
+            scond_signal(fifo_decode_cond);
+            scond_wait(fifo_cond, fifo_lock);
+            main_sleeping = false;
+         }
       }
       reading_pts  = decode_last_audio_time -
-         (double)FIFO_READ_AVAIL(audio_decode_fifo) / (media.sample_rate * sizeof(int16_t) * 2);
+         (double)FIFO_READ_AVAIL(audio_decode_fifo) / (media.sample_rate * bytes_per_frame);
       expected_pts = (double)audio_frames / media.sample_rate;
       old_pts_bias = pts_bias;
       pts_bias     = reading_pts - expected_pts;
@@ -1343,7 +1472,22 @@ void retro_run(void)
       }
 
       if (!decode_thread_dead)
-         fifo_read(audio_decode_fifo, audio_buffer, to_read_bytes);
+      {
+         if (video_stream_index < 0)
+         {
+            size_t avail_bytes = FIFO_READ_AVAIL(audio_decode_fifo);
+            size_t read_bytes = avail_bytes < to_read_bytes ? avail_bytes : to_read_bytes;
+            size_t read_frames = read_bytes / bytes_per_frame;
+
+            if (read_bytes)
+               fifo_read(audio_decode_fifo, audio_buffer, read_bytes);
+            if (read_frames < to_read_frames)
+               memset(audio_buffer + (read_frames * 2), 0,
+                     (to_read_frames - read_frames) * bytes_per_frame);
+         }
+         else
+            fifo_read(audio_decode_fifo, audio_buffer, to_read_bytes);
+      }
       scond_signal(fifo_decode_cond);
 
       slock_unlock(fifo_lock);
@@ -1751,8 +1895,12 @@ static bool open_codecs(void)
 
 static bool init_media_info(void)
 {
-   if (actx[0])
+   if (actx[0] && actx[0]->sample_rate > 0)
       media.sample_rate = actx[0]->sample_rate;
+   else if (actx[0])
+      log_cb(RETRO_LOG_WARN,
+            "[APLAYER] Invalid audio sample rate (%d), using default %u.\n",
+            actx[0]->sample_rate, media.sample_rate);
 
    media.interpolate_fps = 60.0;
 
@@ -1765,10 +1913,23 @@ static bool init_media_info(void)
 
    if (fctx)
    {
-      if (fctx->duration != AV_NOPTS_VALUE)
+      double duration_sec = 0.0;
+
+      if (fctx->duration != AV_NOPTS_VALUE && fctx->duration > 0)
       {
-         int64_t duration        = fctx->duration + (fctx->duration <= INT64_MAX - 5000 ? 5000 : 0);
-         media.duration.time     = (double)(duration / AV_TIME_BASE);
+         int64_t duration = fctx->duration + (fctx->duration <= INT64_MAX - 5000 ? 5000 : 0);
+         duration_sec = (double)(duration / AV_TIME_BASE);
+      }
+
+      if (!duration_is_valid(duration_sec) && audio_streams_num > 0)
+         duration_sec = stream_duration_seconds(audio_streams[0]);
+
+      if (!duration_is_valid(duration_sec) && video_stream_index >= 0)
+         duration_sec = stream_duration_seconds(video_stream_index);
+
+      if (duration_is_valid(duration_sec))
+      {
+         media.duration.time     = duration_sec;
          media.duration.seconds  = (unsigned)media.duration.time;
          media.duration.minutes  = media.duration.seconds / 60;
          media.duration.seconds %= 60;
@@ -1781,7 +1942,7 @@ static bool init_media_info(void)
          media.duration.hours   = 0;
          media.duration.minutes = 0;
          media.duration.seconds = 0;
-         log_cb(RETRO_LOG_ERROR, "[APLAYER] Could not determine media duration\n");
+         log_cb(RETRO_LOG_WARN, "[APLAYER] Could not determine media duration\n");
       }
    }
 
@@ -2770,6 +2931,10 @@ static int16_t *decode_audio(AVCodecContext *ctx, AVPacket *pkt,
    int ret = 0;
    int64_t pts = 0;
    size_t required_buffer = 0;
+   int out_samples = 0;
+   int max_out_samples = 0;
+   size_t bytes_per_frame = sizeof(int16_t) * 2;
+   static bool warned_fifo_small = false;
 
    if ((ret = avcodec_send_packet(ctx, pkt)) < 0)
    {
@@ -2788,27 +2953,76 @@ static int16_t *decode_audio(AVCodecContext *ctx, AVPacket *pkt,
          break;
       }
 
-      required_buffer = frame->nb_samples * sizeof(int16_t) * 2;
+      max_out_samples = swr_get_out_samples(swr, frame->nb_samples);
+      if (max_out_samples < frame->nb_samples)
+         max_out_samples = frame->nb_samples;
+
+      required_buffer = (size_t)max_out_samples * bytes_per_frame;
       if (required_buffer > *buffer_cap)
       {
          buffer      = (int16_t*)av_realloc(buffer, required_buffer);
          *buffer_cap = required_buffer;
       }
 
-      swr_convert(swr,
+      out_samples = swr_convert(swr,
             (uint8_t**)&buffer,
-            frame->nb_samples,
+            max_out_samples,
             (const uint8_t**)frame->data,
             frame->nb_samples);
+      if (out_samples < 0)
+      {
+         log_cb(RETRO_LOG_ERROR, "[APLAYER] Error while resampling audio: %s\n",
+               av_err2str(out_samples));
+         break;
+      }
+      if (out_samples == 0)
+         continue;
+
+      required_buffer = (size_t)out_samples * bytes_per_frame;
 
       pts = frame->best_effort_timestamp;
       slock_lock(fifo_lock);
 
+      if (!audio_decode_fifo)
+      {
+         slock_unlock(fifo_lock);
+         continue;
+      }
+
+      size_t fifo_capacity = audio_decode_fifo->size ? audio_decode_fifo->size - 1 : 0;
+      if (fifo_capacity == 0)
+      {
+         slock_unlock(fifo_lock);
+         continue;
+      }
+      if (required_buffer > fifo_capacity)
+      {
+         if (!warned_fifo_small)
+         {
+            log_cb(RETRO_LOG_WARN,
+                  "[APLAYER] Audio frame larger than FIFO (%zu > %zu), truncating.\n",
+                  required_buffer, fifo_capacity);
+            warned_fifo_small = true;
+         }
+         required_buffer = fifo_capacity;
+      }
+
       while (!decode_thread_dead &&
             FIFO_WRITE_AVAIL(audio_decode_fifo) < required_buffer)
       {
+         if (do_seek)
+         {
+            scond_signal(fifo_cond);
+            slock_unlock(fifo_lock);
+            return buffer;
+         }
          if (!main_sleeping)
             scond_wait(fifo_decode_cond, fifo_lock);
+         else if (video_stream_index < 0)
+         {
+            if (!scond_wait_timeout(fifo_decode_cond, fifo_lock, 2000))
+               break;
+         }
          else
          {
             log_cb(RETRO_LOG_ERROR, "[APLAYER] Thread: Audio deadlock detected.\n");
@@ -2820,7 +3034,8 @@ static int16_t *decode_audio(AVCodecContext *ctx, AVPacket *pkt,
       decode_last_audio_time = pts * av_q2d(
             fctx->streams[audio_streams[audio_streams_ptr]]->time_base);
 
-      if (!decode_thread_dead)
+      if (!decode_thread_dead &&
+            FIFO_WRITE_AVAIL(audio_decode_fifo) >= required_buffer)
          fifo_write(audio_decode_fifo, buffer, required_buffer);
 
       scond_signal(fifo_cond);
@@ -3013,8 +3228,7 @@ static void decode_thread(void *data)
       /* Decide whether to pull one audio packet from audio_packet_buffer.
        *
        * We do it when:
-       *   1. There is no video yet (audio-only file or we’re still before the first
-       *      decoded video frame),                               next_video_end == 0
+       *   1. There is no video stream (audio-only file)
        *   2. Audio PTS is not “too far” ahead of the next video PTS
        *      (<= 500 ms tolerance),                              ahead < 0.5
        *   3. The decoder already hit EOF,                        eof == true
@@ -3034,7 +3248,8 @@ static void decode_thread(void *data)
       slock_unlock(fifo_lock);
 
       double ahead = next_audio_start - next_video_end;   /* may be < 0 */
-      bool   okay  = (ahead < 0.5 /*s*/) || need_audio_now || eof;
+      bool   okay  = (video_stream_index < 0) ||
+                     (ahead < 0.5 /*s*/) || need_audio_now || eof;
 
       if (okay && !packet_buffer_empty(audio_packet_buffer))
       {
@@ -3634,6 +3849,8 @@ bool retro_load_game(const struct retro_game_info *info)
       }
    }
 
+   gme_seek_disabled = is_gme_path(local_info.path);
+
    log_cb(RETRO_LOG_INFO, "[APLAYER] Loading %s", local_info.path);
 
    /*
@@ -3710,6 +3927,9 @@ bool retro_load_game(const struct retro_game_info *info)
       log_cb(RETRO_LOG_ERROR, "[APLAYER] Failed to init media info.");
       goto error;
    }
+
+   time_supported = duration_is_valid(media.duration.time);
+   seek_supported = time_supported && !gme_seek_disabled;
 
    maybe_load_external_subtitles(local_info.path);
 
