@@ -459,7 +459,7 @@ void retro_get_system_info(struct retro_system_info *info)
    info->library_name     = "Alpha Player";
    info->library_version  = "v2.2.0";
    info->need_fullpath    = true;
-   info->valid_extensions = "mkv|avi|f4v|f4f|3gp|ogm|flv|mp4|mp3|flac|ogg|m4a|webm|3g2|mov|wmv|mpg|mpeg|vob|asf|divx|m2p|m2ts|ps|ts|mxf|wma|wav|m3u";
+   info->valid_extensions = "mkv|avi|f4v|f4f|3gp|ogm|flv|mp4|mp3|flac|ogg|m4a|webm|3g2|mov|wmv|mpg|mpeg|vob|asf|divx|m2p|m2ts|ps|ts|mxf|wma|wav|m3u|s3m|it|xm|mod|ay|gbs|gym|hes|kss|nsf|nsfe|sap|spc|vgm|vgz";
 }
 
 void retro_get_system_av_info(struct retro_system_av_info *info)
