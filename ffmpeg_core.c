@@ -13,6 +13,7 @@
 #include <libavutil/time.h>
 #include <libavutil/opt.h>
 #include <libavutil/log.h>
+#include <libavutil/channel_layout.h>
 #include <libswresample/swresample.h>
 #include <ass/ass.h>
 #include "include/ffmpeg_core.h"
@@ -457,7 +458,7 @@ void retro_get_system_info(struct retro_system_info *info)
 {
    memset(info, 0, sizeof(*info));
    info->library_name     = "Alpha Player";
-   info->library_version  = "v2.2.0";
+   info->library_version  = "v2.3.0";
    info->need_fullpath    = true;
    info->valid_extensions = "mkv|avi|f4v|f4f|3gp|ogm|flv|mp4|mp3|flac|ogg|m4a|webm|3g2|mov|wmv|mpg|mpeg|vob|asf|divx|m2p|m2ts|ps|ts|mxf|wma|wav|m3u|s3m|it|xm|mod|ay|gbs|gym|hes|kss|nsf|nsfe|sap|spc|vgm|vgz";
 }
@@ -3109,20 +3110,32 @@ static void decode_thread(void *data)
    {
       swr[i] = swr_alloc();
 
-      uint64_t in_layout  = actx[i]->channel_layout ?
-                      actx[i]->channel_layout :
-                      av_get_default_channel_layout(actx[i]->channels);
-      uint64_t out_layout = AV_CH_LAYOUT_STEREO;
+      AVChannelLayout in_default_layout = {0};
+      const AVChannelLayout *in_layout = &actx[i]->ch_layout;
+      AVChannelLayout out_layout = {0};
+      int in_channels = in_layout->nb_channels;
 
-      av_opt_set_int(swr[i], "in_channel_layout",  in_layout,  0);
-      av_opt_set_int(swr[i], "out_channel_layout", out_layout, 0);
+      if (in_channels <= 0)
+         in_channels = 2;
+
+      /* Swr expects a concrete channel map; normalize unknown/custom layouts. */
+      if (in_layout->order != AV_CHANNEL_ORDER_NATIVE || in_layout->u.mask == 0)
+      {
+         av_channel_layout_default(&in_default_layout, in_channels);
+         in_layout = &in_default_layout;
+      }
+
+      av_channel_layout_default(&out_layout, 2);
+
+      av_opt_set_chlayout(swr[i], "in_chlayout", in_layout, 0);
+      av_opt_set_chlayout(swr[i], "out_chlayout", &out_layout, 0);
       av_opt_set_int(swr[i], "in_sample_rate",     actx[i]->sample_rate, 0);
       av_opt_set_int(swr[i], "out_sample_rate",    media.sample_rate,    0);
       av_opt_set_sample_fmt(swr[i], "in_sample_fmt",  actx[i]->sample_fmt, 0);
       av_opt_set_sample_fmt(swr[i], "out_sample_fmt", AV_SAMPLE_FMT_S16,  0);
 
       /* matriz solo si hay 6 canales */
-      if (av_get_channel_layout_nb_channels(in_layout) == 6) {
+      if (in_layout->nb_channels == 6) {
          double m[12] = {
             1.0, 0.0, 1.2, 0.0, 0.5, 0.5, 
             0.0, 1.0, 1.2, 0.0, 0.5, 0.5
@@ -3134,8 +3147,13 @@ static void decode_thread(void *data)
       int ret;
       if ((ret = swr_init(swr[i])) < 0) {
          log_cb(RETRO_LOG_ERROR, "swr_init fallo: %s\n", av_err2str(ret));
+         av_channel_layout_uninit(&out_layout);
+         av_channel_layout_uninit(&in_default_layout);
          continue;
      }
+
+      av_channel_layout_uninit(&out_layout);
+      av_channel_layout_uninit(&in_default_layout);
    }
 
    aud_frame = av_frame_alloc();
