@@ -44,6 +44,13 @@ This core has been modified focusing on Raspberry Pi devices using a development
 * JOYPAD_L2 - seek -300s (5 min)
 * JOYPAD_R2 - seek +300s (5 min)
 
+# Video Options
+
+* View Mode - Auto, Zoom, Stretch 4:3, Stretch 16:9 or Custom
+* Zoom Amount - Custom mode only, supports zoom-out below `1.00x`
+* Aspect Correction - Custom mode only
+* Zoom fills 16:9 by default, or 4:3 when `replay_is_crt=true`
+
 # Subtitles
 
 If a video has an external subtitle file with the same name and a `.srt` extension, it will be loaded automatically.
@@ -51,6 +58,11 @@ If a video has an external subtitle file with the same name and a `.srt` extensi
 # Changelog
 
 # v2.4.0
+- [X] Added new Video options allowing different video-formats:
+    - View Mode - Auto, Zoom, Stretch 4:3, Stretch 16:9 or Custom
+    - Zoom Amount - Custom mode only
+    - Aspect Correction - Custom mode only
+    - Zoom fills 16:9 by default, or 4:3 in CRT screen
 - [X] Fixed controller port initialization so input works correctly on direct boot
 
 # v2.3.0

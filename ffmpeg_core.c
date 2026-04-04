@@ -97,6 +97,15 @@ static const struct retro_controller_description aplayer_controller_types[] =
 
 static struct retro_controller_info aplayer_controller_info[APLAYER_MAX_PORTS + 1];
 
+enum video_view_mode
+{
+   VIDEO_VIEW_MODE_AUTO = 0,
+   VIDEO_VIEW_MODE_ZOOM,
+   VIDEO_VIEW_MODE_STRETCH_4_3,
+   VIDEO_VIEW_MODE_STRETCH_16_9,
+   VIDEO_VIEW_MODE_CUSTOM
+};
+
 static void fallback_log(enum retro_log_level level, const char *fmt, ...)
 {
     (void)level;
@@ -289,6 +298,9 @@ static volatile bool audio_switch_requested = false;
 static bool seek_supported = true;
 static bool time_supported = true;
 static bool gme_seek_disabled = false;
+static enum video_view_mode video_view_mode = VIDEO_VIEW_MODE_AUTO;
+static float video_custom_zoom = 1.0f;
+static float video_pixel_ratio = 1.0f;
 
 /* GL stuff */
 static struct frame frames[2];
@@ -352,6 +364,129 @@ static void init_aspect_ratio(void)
    
    log_cb(RETRO_LOG_INFO, "[APLAYER] Video aspect ratio: %.3f (SAR: %d:%d)\n", 
           media.aspect, sar.num, sar.den);
+}
+
+static float get_video_native_aspect(void)
+{
+   if (media.aspect > 0.0f)
+      return media.aspect;
+
+   if (media.width > 0 && media.height > 0)
+      return (float)media.width / (float)media.height;
+
+   return 4.0f / 3.0f;
+}
+
+static float get_video_zoom_target_aspect(void)
+{
+   return is_crt ? (4.0f / 3.0f) : (16.0f / 9.0f);
+}
+
+static float get_video_output_aspect(void)
+{
+   float native_aspect = get_video_native_aspect();
+
+   switch (video_view_mode)
+   {
+      case VIDEO_VIEW_MODE_ZOOM:
+         return get_video_zoom_target_aspect();
+      case VIDEO_VIEW_MODE_STRETCH_4_3:
+         return 4.0f / 3.0f;
+      case VIDEO_VIEW_MODE_STRETCH_16_9:
+         return 16.0f / 9.0f;
+      case VIDEO_VIEW_MODE_CUSTOM:
+         return native_aspect * video_pixel_ratio;
+      case VIDEO_VIEW_MODE_AUTO:
+      default:
+         return native_aspect;
+   }
+}
+
+static void get_video_texture_window(float *u_min, float *u_max,
+      float *v_min, float *v_max)
+{
+   float visible_width  = 1.0f;
+   float visible_height = 1.0f;
+   float source_aspect  = get_video_native_aspect();
+   float zoom           = 1.0f;
+
+   if (video_view_mode == VIDEO_VIEW_MODE_ZOOM)
+   {
+      float target_aspect = get_video_output_aspect();
+
+      if (source_aspect > 0.0f && target_aspect > 0.0f)
+      {
+         if (source_aspect > target_aspect)
+            visible_width = target_aspect / source_aspect;
+         else if (source_aspect < target_aspect)
+            visible_height = source_aspect / target_aspect;
+      }
+   }
+   else if (video_view_mode == VIDEO_VIEW_MODE_CUSTOM)
+   {
+      zoom = video_custom_zoom;
+   }
+
+   if (zoom > 1.0f)
+   {
+      visible_width  /= zoom;
+      visible_height /= zoom;
+   }
+
+   if (visible_width < 0.0f)
+      visible_width = 0.0f;
+   else if (visible_width > 1.0f)
+      visible_width = 1.0f;
+
+   if (visible_height < 0.0f)
+      visible_height = 0.0f;
+   else if (visible_height > 1.0f)
+      visible_height = 1.0f;
+
+   *u_min = (1.0f - visible_width) * 0.5f;
+   *u_max = *u_min + visible_width;
+   *v_min = (1.0f - visible_height) * 0.5f;
+   *v_max = *v_min + visible_height;
+}
+
+static void update_video_quad(void)
+{
+   GLfloat vertex_data[16];
+   float u_min;
+   float u_max;
+   float v_min;
+   float v_max;
+   float vertex_scale = 1.0f;
+
+   get_video_texture_window(&u_min, &u_max, &v_min, &v_max);
+
+   if (video_view_mode == VIDEO_VIEW_MODE_CUSTOM &&
+       video_custom_zoom > 0.0f &&
+       video_custom_zoom < 1.0f)
+   {
+      vertex_scale = video_custom_zoom;
+   }
+
+   vertex_data[0]  = -vertex_scale;
+   vertex_data[1]  = -vertex_scale;
+   vertex_data[2]  = u_min;
+   vertex_data[3]  = v_min;
+   vertex_data[4]  = vertex_scale;
+   vertex_data[5]  = -vertex_scale;
+   vertex_data[6]  = u_max;
+   vertex_data[7]  = v_min;
+   vertex_data[8]  = -vertex_scale;
+   vertex_data[9]  = vertex_scale;
+   vertex_data[10] = u_min;
+   vertex_data[11] = v_max;
+   vertex_data[12] = vertex_scale;
+   vertex_data[13] = vertex_scale;
+   vertex_data[14] = u_max;
+   vertex_data[15] = v_max;
+
+   glBindBuffer(GL_ARRAY_BUFFER, vbo);
+   glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(vertex_data), vertex_data);
+   glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 
 static bool parse_m3u_playlist(const char* path)
@@ -605,7 +740,7 @@ void retro_get_system_av_info(struct retro_system_av_info *info)
 {
    unsigned width  = vctx ? media.width : 320;
    unsigned height = vctx ? media.height : 240;
-   float aspect    = vctx ? media.aspect : (float)width / (float)height;
+   float aspect    = vctx ? get_video_output_aspect() : (float)width / (float)height;
 
    if (audio_streams_num > 0 && video_stream_index < 0)
    {
@@ -649,6 +784,54 @@ void retro_set_environment(retro_environment_t cb)
             {"4", NULL},
             {NULL, NULL}
          }, "auto"
+      },
+      {
+         "aplayer_video_view_mode", "View Mode", "Controls how the video is fitted or stretched.",
+         NULL, NULL, "video",
+         {
+            {"auto", "Auto"},
+            {"zoom", "Zoom"},
+            {"stretch_4_3", "Stretch 4:3"},
+            {"stretch_16_9", "Stretch 16:9"},
+            {"custom", "Custom"},
+            {NULL, NULL}
+         }, "auto"
+      },
+      {
+         "aplayer_video_custom_zoom", "Zoom Amount", "Custom mode only. Shrinks below 1.00x and crops above 1.00x.",
+         NULL, NULL, "video",
+         {
+            {"0.50", "0.50x"},
+            {"0.67", "0.67x"},
+            {"0.75", "0.75x"},
+            {"0.80", "0.80x"},
+            {"0.90", "0.90x"},
+            {"0.95", "0.95x"},
+            {"1.00", "1.00x"},
+            {"1.05", "1.05x"},
+            {"1.10", "1.10x"},
+            {"1.15", "1.15x"},
+            {"1.20", "1.20x"},
+            {"1.25", "1.25x"},
+            {"1.33", "1.33x"},
+            {"1.50", "1.50x"},
+            {NULL, NULL}
+         }, "1.00"
+      },
+      {
+         "aplayer_video_pixel_ratio", "Aspect Correction", "Custom mode only. Widens or narrows the displayed image.",
+         NULL, NULL, "video",
+         {
+            {"0.75", "0.75x"},
+            {"0.90", "0.90x"},
+            {"1.00", "1.00x"},
+            {"1.10", "1.10x"},
+            {"1.25", "1.25x"},
+            {"1.33", "1.33x"},
+            {"1.50", "1.50x"},
+            {"1.78", "1.78x"},
+            {NULL, NULL}
+         }, "1.00"
       },
       {
          "aplayer_subtitles", "Subtitles", NULL, NULL, NULL, "video",
@@ -874,12 +1057,15 @@ static void update_subtitle_style_overrides(void)
 static void check_variables(bool firststart)
 {
    struct retro_variable sw_threads_var = {0};
-   struct retro_variable loop_content  = {0};
-   struct retro_variable replay_is_crt  = {0};
-   struct retro_variable fft_toggle_var    = {0};
+   struct retro_variable loop_content = {0};
+   struct retro_variable replay_is_crt = {0};
+   struct retro_variable fft_toggle_var = {0};
    struct retro_variable subtitle_toggle_var = {0};
    struct retro_variable subtitle_font_var = {0};
    struct retro_variable subtitle_font_name_var = {0};
+   struct retro_variable video_view_mode_var = {0};
+   struct retro_variable video_custom_zoom_var = {0};
+   struct retro_variable video_pixel_ratio_var = {0};
 
    fft_width  = 640;
    fft_height = 480;
@@ -955,6 +1141,41 @@ static void check_variables(bool firststart)
          subtitle_font_name = "DejaVu Serif";
          subtitle_font_bold = 1;
       }
+   }
+
+   video_view_mode = VIDEO_VIEW_MODE_AUTO;
+   video_view_mode_var.key = "aplayer_video_view_mode";
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &video_view_mode_var) &&
+         video_view_mode_var.value)
+   {
+      if (string_is_equal(video_view_mode_var.value, "zoom"))
+         video_view_mode = VIDEO_VIEW_MODE_ZOOM;
+      else if (string_is_equal(video_view_mode_var.value, "stretch_4_3"))
+         video_view_mode = VIDEO_VIEW_MODE_STRETCH_4_3;
+      else if (string_is_equal(video_view_mode_var.value, "stretch_16_9"))
+         video_view_mode = VIDEO_VIEW_MODE_STRETCH_16_9;
+      else if (string_is_equal(video_view_mode_var.value, "custom"))
+         video_view_mode = VIDEO_VIEW_MODE_CUSTOM;
+   }
+
+   video_custom_zoom = 1.0f;
+   video_custom_zoom_var.key = "aplayer_video_custom_zoom";
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &video_custom_zoom_var) &&
+         video_custom_zoom_var.value)
+   {
+      video_custom_zoom = strtof(video_custom_zoom_var.value, NULL);
+      if (video_custom_zoom <= 0.0f)
+         video_custom_zoom = 1.0f;
+   }
+
+   video_pixel_ratio = 1.0f;
+   video_pixel_ratio_var.key = "aplayer_video_pixel_ratio";
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &video_pixel_ratio_var) &&
+         video_pixel_ratio_var.value)
+   {
+      video_pixel_ratio = strtof(video_pixel_ratio_var.value, NULL);
+      if (video_pixel_ratio <= 0.0f)
+         video_pixel_ratio = 1.0f;
    }
 
    update_subtitle_font_scale();
@@ -1260,11 +1481,13 @@ void retro_run(void)
    bool updated                 = false;
    unsigned old_fft_width       = fft_width;
    unsigned old_fft_height      = fft_height;
+   float old_video_aspect       = video_stream_index >= 0 ? get_video_output_aspect() : 0.0f;
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
       check_variables(false);
 
-   if (fft_width != old_fft_width || fft_height != old_fft_height)
+   if (fft_width != old_fft_width || fft_height != old_fft_height ||
+       (video_stream_index >= 0 && old_video_aspect != get_video_output_aspect()))
    {
       struct retro_system_av_info info;
       retro_get_system_av_info(&info);
@@ -1700,6 +1923,7 @@ void retro_run(void)
       glActiveTexture(GL_TEXTURE0);
       glBindTexture(GL_TEXTURE_2D, frames[0].tex);
 
+      update_video_quad();
       glBindBuffer(GL_ARRAY_BUFFER, vbo);
       glVertexAttribPointer(vertex_loc, 2, GL_FLOAT, GL_FALSE,
             4 * sizeof(GLfloat), (const GLvoid*)(0 * sizeof(GLfloat)));
@@ -3847,7 +4071,7 @@ static void context_reset(void)
    glGenBuffers(1, &vbo);
    glBindBuffer(GL_ARRAY_BUFFER, vbo);
    glBufferData(GL_ARRAY_BUFFER,
-         sizeof(vertex_data), vertex_data, GL_STATIC_DRAW);
+         sizeof(vertex_data), vertex_data, GL_DYNAMIC_DRAW);
 
    glBindBuffer(GL_ARRAY_BUFFER, 0);
    glBindTexture(GL_TEXTURE_2D, 0);
