@@ -7,3 +7,5 @@ NOTES.md
 .vscode/settings.json
 .vscode/pro-deployer.json
 .vscode/pro-deployer.json
+.codex
+*.o

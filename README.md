@@ -50,6 +50,9 @@ If a video has an external subtitle file with the same name and a `.srt` extensi
 
 # Changelog
 
+# v2.4.0
+- [X] Fixed controller port initialization so input works correctly on direct boot
+
 # v2.3.0
 - [X] Refactored code to support libavutil >= 57
 

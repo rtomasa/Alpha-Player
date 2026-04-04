@@ -54,12 +54,48 @@ retro_log_printf_t log_cb;
    s ##_version() & 0xFF);
 
 #define MAX_PLAYLIST_ENTRIES 256
+#define APLAYER_MAX_PORTS 4
 static char playlist[MAX_PLAYLIST_ENTRIES][PATH_MAX];
 static unsigned playlist_count = 0;
 static unsigned playlist_index = 0;  
 
 static bool reset_triggered;
 static bool libretro_supports_bitmasks = false;
+static unsigned input_ports = 1;
+static unsigned controller_port_devices[APLAYER_MAX_PORTS];
+
+struct aplayer_input_binding
+{
+   unsigned id;
+   const char *description;
+};
+
+static const struct aplayer_input_binding aplayer_input_bindings[] =
+{
+   { RETRO_DEVICE_ID_JOYPAD_START, "Play/Pause" },
+   { RETRO_DEVICE_ID_JOYPAD_A,     "Display Time" },
+   { RETRO_DEVICE_ID_JOYPAD_B,     "Display Title" },
+   { RETRO_DEVICE_ID_JOYPAD_X,     "Toggle Subtitles" },
+   { RETRO_DEVICE_ID_JOYPAD_Y,     "Cycle Audio Track" },
+   { RETRO_DEVICE_ID_JOYPAD_L,     "Previous (M3U)" },
+   { RETRO_DEVICE_ID_JOYPAD_R,     "Next (M3U)" },
+   { RETRO_DEVICE_ID_JOYPAD_LEFT,  "Seek -15 sec" },
+   { RETRO_DEVICE_ID_JOYPAD_RIGHT, "Seek +15 sec" },
+   { RETRO_DEVICE_ID_JOYPAD_DOWN,  "Seek -3 min" },
+   { RETRO_DEVICE_ID_JOYPAD_UP,    "Seek +3 min" },
+   { RETRO_DEVICE_ID_JOYPAD_L2,    "Seek -5 min" },
+   { RETRO_DEVICE_ID_JOYPAD_R2,    "Seek +5 min" },
+};
+
+static struct retro_input_descriptor
+   aplayer_input_descriptors[(APLAYER_MAX_PORTS * ARRAY_SIZE(aplayer_input_bindings)) + 1];
+
+static const struct retro_controller_description aplayer_controller_types[] =
+{
+   { "RetroPad", RETRO_DEVICE_JOYPAD },
+};
+
+static struct retro_controller_info aplayer_controller_info[APLAYER_MAX_PORTS + 1];
 
 static void fallback_log(enum retro_log_level level, const char *fmt, ...)
 {
@@ -68,6 +104,103 @@ static void fallback_log(enum retro_log_level level, const char *fmt, ...)
     va_start(va, fmt);
     vfprintf(stderr, fmt, va);
     va_end(va);
+}
+
+static bool aplayer_device_is_joypad(unsigned device)
+{
+   return (device & RETRO_DEVICE_MASK) == RETRO_DEVICE_JOYPAD;
+}
+
+static void aplayer_reset_controller_ports(void)
+{
+   unsigned i;
+
+   input_ports = 1;
+
+   for (i = 0; i < APLAYER_MAX_PORTS; i++)
+      controller_port_devices[i] = RETRO_DEVICE_JOYPAD;
+}
+
+static unsigned aplayer_get_input_ports(void)
+{
+   unsigned max_users = 0;
+
+   if (environ_cb &&
+       environ_cb(RETRO_ENVIRONMENT_GET_INPUT_MAX_USERS, &max_users) &&
+       max_users > 0)
+   {
+      if (max_users > APLAYER_MAX_PORTS)
+         max_users = APLAYER_MAX_PORTS;
+      return max_users;
+   }
+
+   return 1;
+}
+
+static void aplayer_set_controller_info(unsigned ports)
+{
+   unsigned i;
+
+   for (i = 0; i < ports; i++)
+   {
+      aplayer_controller_info[i].types     = aplayer_controller_types;
+      aplayer_controller_info[i].num_types = ARRAY_SIZE(aplayer_controller_types);
+   }
+
+   aplayer_controller_info[ports].types     = NULL;
+   aplayer_controller_info[ports].num_types = 0;
+
+   environ_cb(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, aplayer_controller_info);
+}
+
+static void aplayer_set_input_descriptors(unsigned ports)
+{
+   unsigned port;
+   size_t desc = 0;
+
+   for (port = 0; port < ports; port++)
+   {
+      size_t i;
+
+      for (i = 0; i < ARRAY_SIZE(aplayer_input_bindings); i++)
+      {
+         aplayer_input_descriptors[desc].port        = port;
+         aplayer_input_descriptors[desc].device      = RETRO_DEVICE_JOYPAD;
+         aplayer_input_descriptors[desc].index       = 0;
+         aplayer_input_descriptors[desc].id          = aplayer_input_bindings[i].id;
+         aplayer_input_descriptors[desc].description = aplayer_input_bindings[i].description;
+         desc++;
+      }
+   }
+
+   memset(&aplayer_input_descriptors[desc], 0,
+         sizeof(aplayer_input_descriptors[desc]));
+   environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, aplayer_input_descriptors);
+}
+
+static void aplayer_register_input_layout(void)
+{
+   input_ports = aplayer_get_input_ports();
+   aplayer_set_controller_info(input_ports);
+   aplayer_set_input_descriptors(input_ports);
+}
+
+static uint16_t aplayer_poll_input_mask(unsigned port)
+{
+   uint16_t ret = 0;
+
+   if (libretro_supports_bitmasks)
+      return (uint16_t)input_state_cb(port, RETRO_DEVICE_JOYPAD,
+            0, RETRO_DEVICE_ID_JOYPAD_MASK);
+
+   {
+      unsigned i;
+      for (i = RETRO_DEVICE_ID_JOYPAD_B; i <= RETRO_DEVICE_ID_JOYPAD_R2; i++)
+         if (input_state_cb(port, RETRO_DEVICE_JOYPAD, 0, i))
+            ret |= (1U << i);
+   }
+
+   return ret;
 }
 
 /* FFmpeg context data. */
@@ -420,6 +553,7 @@ static void append_attachment(const uint8_t *data, size_t size)
 void retro_init(void)
 {
    reset_triggered = false;
+   aplayer_reset_controller_ports();
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_INPUT_BITMASKS, NULL))
       libretro_supports_bitmasks = true;
@@ -450,15 +584,19 @@ unsigned retro_api_version(void)
 
 void retro_set_controller_port_device(unsigned port, unsigned device)
 {
-   (void)port;
-   (void)device;
+   if (port < APLAYER_MAX_PORTS)
+   {
+      controller_port_devices[port] = device;
+      if (port + 1 > input_ports)
+         input_ports = port + 1;
+   }
 }
 
 void retro_get_system_info(struct retro_system_info *info)
 {
    memset(info, 0, sizeof(*info));
    info->library_name     = "Alpha Player";
-   info->library_version  = "v2.3.0";
+   info->library_version  = "v2.4.0";
    info->need_fullpath    = true;
    info->valid_extensions = "mkv|avi|f4v|f4f|3gp|ogm|flv|mp4|mp3|flac|ogg|m4a|webm|3g2|mov|wmv|mpg|mpeg|vob|asf|divx|m2p|m2ts|ps|ts|mxf|wma|wav|m3u|s3m|it|xm|mod|ay|gbs|gym|hes|kss|nsf|nsfe|sap|spc|vgm|vgz";
 }
@@ -1138,16 +1276,20 @@ void retro_run(void)
    }
 
    input_poll_cb();
-
-   if (libretro_supports_bitmasks)
-      ret = input_state_cb(0, RETRO_DEVICE_JOYPAD,
-            0, RETRO_DEVICE_ID_JOYPAD_MASK);
-   else
    {
-      unsigned i;
-      for (i = RETRO_DEVICE_ID_JOYPAD_B; i <= RETRO_DEVICE_ID_JOYPAD_R2; i++)
-         if (input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, i))
-            ret |= (1 << i);
+      unsigned port;
+      unsigned ports = input_ports;
+
+      if (ports > APLAYER_MAX_PORTS)
+         ports = APLAYER_MAX_PORTS;
+
+      for (port = 0; port < ports; port++)
+      {
+         if (!aplayer_device_is_joypad(controller_port_devices[port]))
+            continue;
+
+         ret |= aplayer_poll_input_mask(port);
+      }
    }
 
    left  = ret & (1 << RETRO_DEVICE_ID_JOYPAD_LEFT);
@@ -3831,6 +3973,8 @@ bool retro_load_game(const struct retro_game_info *info)
       return false;
 
    media_reset_defaults();
+   aplayer_reset_controller_ports();
+   aplayer_register_input_layout();
 
    const char* ext = strrchr(info->path, '.');
    // Local mutable retro_game_info
@@ -3890,26 +4034,7 @@ bool retro_load_game(const struct retro_game_info *info)
    bool is_fft = false;
    enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
 
-   struct retro_input_descriptor desc[] = {
-      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START, "Play/Pause" },
-      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A,     "Display Time" },
-      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B,     "Display Title" },
-      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_X,     "Toggle Subtitles"},
-      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_Y,     "Cycle Audio Track"},
-      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L,     "Previous (M3U)" },
-      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R,     "Next (M3U)" },
-      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT,  "Seek -15 sec" },
-      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT, "Seek +15 sec" },
-      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN,  "Seek -3 min" },
-      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP,    "Seek +3 min" },
-      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L2,    "Seek -5 min" },
-      { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R2,    "Seek +5 min" },
-      { 0 },
-   };
-
    check_variables(true);
-
-   environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, desc);
 
    if (!environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt))
    {
