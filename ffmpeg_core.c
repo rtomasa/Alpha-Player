@@ -58,6 +58,7 @@ retro_log_printf_t log_cb;
 static char playlist[MAX_PLAYLIST_ENTRIES][PATH_MAX];
 static unsigned playlist_count = 0;
 static unsigned playlist_index = 0;  
+static char current_media_path[PATH_MAX];
 
 static bool reset_triggered;
 static bool libretro_supports_bitmasks = false;
@@ -648,17 +649,43 @@ static void show_not_supported_message(void)
    environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
 }
 
+static const char *aplayer_filename_from_path(const char *path)
+{
+   const char *filename_unix = NULL;
+   const char *filename_windows = NULL;
+
+   if (!path || !path[0])
+      return NULL;
+
+   filename_unix = strrchr(path, '/');
+   filename_windows = strrchr(path, '\\');
+
+   if (filename_unix && filename_windows)
+      return (filename_unix > filename_windows ? filename_unix : filename_windows) + 1;
+   if (filename_unix)
+      return filename_unix + 1;
+   if (filename_windows)
+      return filename_windows + 1;
+
+   return path;
+}
+
 static void display_media_title()
 {
+   const char *filename = NULL;
+
    if (!fctx || decode_thread_dead)
       return;
 
    char msg[256];
    struct retro_message_ext msg_obj = {0};
    msg[0] = '\0';
+   filename = aplayer_filename_from_path(current_media_path);
 
    if (media.title) {
       snprintf(msg, sizeof(msg), "%s", media.title->value);
+   } else if (filename) {
+      snprintf(msg, sizeof(msg), "%s", filename);
    } else {
       snprintf(msg, sizeof(msg), "%s", "Title not available");
    }
@@ -4245,6 +4272,8 @@ bool retro_load_game(const struct retro_game_info *info)
    }
 
    gme_seek_disabled = is_gme_path(local_info.path);
+   strncpy(current_media_path, local_info.path, sizeof(current_media_path) - 1);
+   current_media_path[sizeof(current_media_path) - 1] = '\0';
 
    log_cb(RETRO_LOG_INFO, "[APLAYER] Loading %s", local_info.path);
 
