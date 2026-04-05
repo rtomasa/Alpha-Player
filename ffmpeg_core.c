@@ -246,7 +246,6 @@ static bool subtitle_font_auto = false;
 static double subtitle_font_scale = 1.0;
 static const char *subtitle_font_name = "DejaVu Sans";
 static int subtitle_font_bold = 0;
-static bool subtitles_enabled = true;
 static char subtitle_style_override_font[128];
 static char subtitle_style_override_bold[64];
 static char *subtitle_style_overrides[] = {
@@ -264,6 +263,7 @@ static video_buffer_t *video_buffer;
 static tpool_t *tpool;
 
 #define MAX_STREAMS 8
+#define SUBTITLE_STREAM_DISABLED (-1)
 static AVCodecContext *actx[MAX_STREAMS];
 static AVCodecContext *sctx[MAX_STREAMS];
 static int audio_streams[MAX_STREAMS];
@@ -974,7 +974,9 @@ static void aplayer_bookmark_apply_stream_selection(
        bookmark->audio_stream_ptr < audio_streams_num)
       audio_streams_ptr = bookmark->audio_stream_ptr;
 
-   if (bookmark->subtitle_stream_ptr >= 0 &&
+   if (bookmark->subtitle_stream_ptr == SUBTITLE_STREAM_DISABLED)
+      subtitle_streams_ptr = SUBTITLE_STREAM_DISABLED;
+   else if (bookmark->subtitle_stream_ptr >= 0 &&
        bookmark->subtitle_stream_ptr < subtitle_streams_num)
       subtitle_streams_ptr = bookmark->subtitle_stream_ptr;
    slock_unlock(decode_thread_lock);
@@ -1213,14 +1215,6 @@ void retro_set_environment(retro_environment_t cb)
          }, "full"
       },
       {
-         "aplayer_subtitles", "Subtitles", NULL, NULL, NULL, "video",
-         {
-            {"enabled", "Enabled"},
-            {"disabled", "Disabled"},
-            {NULL, NULL}
-         }, "enabled"
-      },
-      {
          "aplayer_subtitle_font_size", "Subtitle Font Size", NULL, NULL, NULL, "video",
          {
             {"auto", "Auto"},
@@ -1449,7 +1443,6 @@ static void check_variables(bool firststart)
    struct retro_variable auto_resume_var = {0};
    struct retro_variable replay_is_crt = {0};
    struct retro_variable fft_toggle_var = {0};
-   struct retro_variable subtitle_toggle_var = {0};
    struct retro_variable subtitle_font_var = {0};
    struct retro_variable subtitle_font_name_var = {0};
    struct retro_variable video_view_mode_var = {0};
@@ -1466,15 +1459,6 @@ static void check_variables(bool firststart)
    {
       if (string_is_equal(fft_toggle_var.value, "disabled"))
          fft_enabled = false;
-   }
-
-   subtitles_enabled = true;
-   subtitle_toggle_var.key = "aplayer_subtitles";
-   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &subtitle_toggle_var) &&
-         subtitle_toggle_var.value)
-   {
-      if (string_is_equal(subtitle_toggle_var.value, "disabled"))
-         subtitles_enabled = false;
    }
 
    subtitle_font_size = 64;
@@ -1820,6 +1804,57 @@ static void dispaly_time(void)
    environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
 }
 
+static bool subtitle_selection_is_valid(int subtitle_ptr)
+{
+   return subtitle_ptr >= 0 && subtitle_ptr < subtitle_streams_num;
+}
+
+static int subtitle_next_selection(int subtitle_ptr)
+{
+   if (subtitle_streams_num <= 0)
+      return SUBTITLE_STREAM_DISABLED;
+
+   if (!subtitle_selection_is_valid(subtitle_ptr))
+      return 0;
+
+   subtitle_ptr++;
+   if (subtitle_ptr >= subtitle_streams_num)
+      return SUBTITLE_STREAM_DISABLED;
+
+   return subtitle_ptr;
+}
+
+static void subtitle_selection_label(int subtitle_ptr, char *label, size_t label_size)
+{
+   AVDictionaryEntry *tag = NULL;
+   const char *title = NULL;
+   int stream_index = -1;
+
+   if (!label || label_size == 0)
+      return;
+
+   if (!subtitle_selection_is_valid(subtitle_ptr))
+   {
+      snprintf(label, label_size, "Disabled subtitles");
+      return;
+   }
+
+   stream_index = subtitle_streams[subtitle_ptr];
+   if (fctx && stream_index >= 0 && stream_index < (int)fctx->nb_streams)
+   {
+      tag = av_dict_get(fctx->streams[stream_index]->metadata, "title", NULL, 0);
+      if (tag && !string_is_empty(tag->value))
+         title = tag->value;
+   }
+
+   if (title)
+      snprintf(label, label_size, "%s #%d", title, subtitle_ptr);
+   else if (subtitle_is_external[subtitle_ptr])
+      snprintf(label, label_size, "External Subtitle #%d", subtitle_ptr);
+   else
+      snprintf(label, label_size, "Subtitle Track #%d", subtitle_ptr);
+}
+
 static void render_subtitles_on_buffer(uint32_t *buffer, unsigned width,
       unsigned height, double time_sec);
 
@@ -2141,10 +2176,13 @@ void retro_run(void)
 
          if (subtitle_streams_num > 0)
          {
+            int next_subtitle_stream_ptr;
+
             slock_lock(decode_thread_lock);
-            subtitle_streams_ptr = (subtitle_streams_ptr + 1) % subtitle_streams_num;
+            subtitle_streams_ptr = subtitle_next_selection(subtitle_streams_ptr);
+            next_subtitle_stream_ptr = subtitle_streams_ptr;
             slock_unlock(decode_thread_lock);
-            snprintf(msg, sizeof(msg), "Subtitle Track #%d", subtitle_streams_ptr);
+            subtitle_selection_label(next_subtitle_stream_ptr, msg, sizeof(msg));
          }
          else
          {
@@ -2629,7 +2667,7 @@ static bool open_codecs(void)
 
    slock_lock(decode_thread_lock);
    audio_streams_ptr    = 0;
-   subtitle_streams_ptr = 0;
+   subtitle_streams_ptr = SUBTITLE_STREAM_DISABLED;
    slock_unlock(decode_thread_lock);
 
    memset(audio_streams,    0, sizeof(audio_streams));
@@ -2943,19 +2981,16 @@ static void render_subtitles_on_buffer(uint32_t *buffer, unsigned width,
    if (!buffer || width == 0 || height == 0)
       return;
 
-   if (!subtitles_enabled)
-      return;
-
    if (!ass_render || subtitle_streams_num <= 0)
       return;
 
    if (decode_thread_lock)
    {
       slock_lock(decode_thread_lock);
-      if (subtitle_streams_num > 0)
+      if (subtitle_selection_is_valid(subtitle_streams_ptr))
       {
          subtitle_ptr = subtitle_streams_ptr;
-         render_track = ass_track[subtitle_streams_ptr];
+         render_track = ass_track[subtitle_ptr];
       }
       slock_unlock(decode_thread_lock);
    }
@@ -4074,7 +4109,8 @@ static void decode_thread(void *data)
       audio_stream_index          = audio_streams[audio_streams_ptr];
       audio_stream_ptr            = audio_streams_ptr;
       actx_active                 = actx[audio_streams_ptr];
-      ass_track_active            = ass_track[subtitle_streams_ptr];
+      if (subtitle_selection_is_valid(subtitle_streams_ptr))
+         ass_track_active         = ass_track[subtitle_streams_ptr];
       audio_timebase = av_q2d(fctx->streams[audio_stream_index]->time_base);
       if (video_stream_index >= 0)
          video_timebase = av_q2d(fctx->streams[video_stream_index]->time_base);
