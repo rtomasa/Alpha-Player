@@ -63,6 +63,7 @@ If a video has an external subtitle file with the same name and a `.srt` extensi
     - Zoom Amount - Custom mode only
     - Aspect Correction - Custom mode only
     - Zoom fills 16:9 by default, or 4:3 in CRT screen
+- [X] Added check for videos with no alternate audio tracks
 - [X] Fixed controller port initialization so input works correctly on direct boot
 
 # v2.3.0

@@ -1647,44 +1647,53 @@ void retro_run(void)
 
       int media_type = get_media_type();
 
-      if (media_type == MEDIA_TYPE_VIDEO && y && !last_y && audio_streams_num > 0)
+      if (media_type == MEDIA_TYPE_VIDEO && y && !last_y)
       {
-         // Safely update the new audio track index.
-         slock_lock(decode_thread_lock);
-         audio_streams_ptr = (audio_streams_ptr + 1) % audio_streams_num;
-         slock_unlock(decode_thread_lock);
+         char msg[256];
+         struct retro_message_ext msg_obj = {0};
 
-         // In addition to updating the index, trigger a full flush of the pipelines.
-         slock_lock(fifo_lock);
-         do_seek = true;
+         msg[0] = '\0';
 
-         // Set the new seek time to the current playback time.
-         // (You can choose to keep the playback time unchanged or compute a new one.)
-         slock_lock(time_lock);
-         seek_time = g_current_time;  // Alternatively, use 0 if you wish to restart the stream.
-         slock_unlock(time_lock);
-         scond_signal(fifo_cond);
-         slock_unlock(fifo_lock);
-
-         // Display a message for the new audio track.
+         if (audio_streams_num > 1)
          {
-            char msg[256];
-            struct retro_message_ext msg_obj = {0};
-            int audio_stream_index = audio_streams[audio_streams_ptr];
-            AVDictionaryEntry *tag = av_dict_get(fctx->streams[audio_stream_index]->metadata, "title", NULL, 0);
+            int audio_stream_index;
+            int next_audio_stream_ptr;
+            AVDictionaryEntry *tag;
+
+            // Safely update the new audio track index.
+            slock_lock(decode_thread_lock);
+            audio_streams_ptr = (audio_streams_ptr + 1) % audio_streams_num;
+            next_audio_stream_ptr = audio_streams_ptr;
+            slock_unlock(decode_thread_lock);
+
+            // Flush the decode pipelines so the new track starts in sync.
+            slock_lock(fifo_lock);
+            do_seek = true;
+
+            slock_lock(time_lock);
+            seek_time = g_current_time;
+            slock_unlock(time_lock);
+            scond_signal(fifo_cond);
+            slock_unlock(fifo_lock);
+
+            audio_stream_index = audio_streams[next_audio_stream_ptr];
+            tag = av_dict_get(fctx->streams[audio_stream_index]->metadata, "title", NULL, 0);
             if (tag)
-               snprintf(msg, sizeof(msg), "%s #%d", tag->value, audio_streams_ptr);
+               snprintf(msg, sizeof(msg), "%s #%d", tag->value, next_audio_stream_ptr);
             else
-               snprintf(msg, sizeof(msg), "Audio Track #%d", audio_streams_ptr);
-            msg_obj.msg      = msg;
-            msg_obj.duration = 3000;
-            msg_obj.priority = 1;
-            msg_obj.level    = RETRO_LOG_INFO;
-            msg_obj.target   = RETRO_MESSAGE_TARGET_ALL;
-            msg_obj.type     = RETRO_MESSAGE_TYPE_NOTIFICATION;
-            msg_obj.progress = -1;
-            environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
+               snprintf(msg, sizeof(msg), "Audio Track #%d", next_audio_stream_ptr);
          }
+         else
+            snprintf(msg, sizeof(msg), "No alternate audio tracks");
+
+         msg_obj.msg      = msg;
+         msg_obj.duration = 3000;
+         msg_obj.priority = 1;
+         msg_obj.level    = RETRO_LOG_INFO;
+         msg_obj.target   = RETRO_MESSAGE_TARGET_ALL;
+         msg_obj.type     = RETRO_MESSAGE_TYPE_NOTIFICATION;
+         msg_obj.progress = -1;
+         environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
       }
       else if (media_type == MEDIA_TYPE_VIDEO && x && !last_x)
       {
