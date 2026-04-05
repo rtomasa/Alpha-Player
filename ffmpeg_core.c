@@ -55,15 +55,35 @@ retro_log_printf_t log_cb;
 
 #define MAX_PLAYLIST_ENTRIES 256
 #define APLAYER_MAX_PORTS 4
+#define APLAYER_BOOKMARK_MAGIC 0x4150424dU
+#define APLAYER_BOOKMARK_VERSION 1U
+#define APLAYER_BOOKMARK_MIN_TIME 1.0
 static char playlist[MAX_PLAYLIST_ENTRIES][PATH_MAX];
 static unsigned playlist_count = 0;
-static unsigned playlist_index = 0;  
+static unsigned playlist_index = 0;
+static char current_content_path[PATH_MAX];
 static char current_media_path[PATH_MAX];
+static char playlist_source_path[PATH_MAX];
 
 static bool reset_triggered;
 static bool libretro_supports_bitmasks = false;
 static unsigned input_ports = 1;
 static unsigned controller_port_devices[APLAYER_MAX_PORTS];
+static bool auto_resume_enabled = false;
+static bool content_loaded = false;
+static bool playlist_source_active = false;
+static bool internal_playlist_reload_pending = false;
+
+struct aplayer_bookmark
+{
+   uint32_t magic;
+   uint32_t version;
+   double playback_time;
+   uint32_t playlist_index;
+   int32_t audio_stream_ptr;
+   int32_t subtitle_stream_ptr;
+   char media_path[PATH_MAX];
+};
 
 struct aplayer_input_binding
 {
@@ -324,6 +344,11 @@ static void media_reset_defaults(void)
    seek_supported        = true;
    time_supported        = true;
    gme_seek_disabled     = false;
+   paused                = false;
+   do_seek               = false;
+   seek_time             = 0.0;
+   audio_switch_requested = false;
+   g_current_time        = 0.0;
 }
 
 static void init_aspect_ratio(void)
@@ -670,6 +695,278 @@ static const char *aplayer_filename_from_path(const char *path)
    return path;
 }
 
+static void aplayer_copy_path(char *dst, size_t size, const char *src)
+{
+   if (!dst || size == 0)
+      return;
+
+   if (src)
+      snprintf(dst, size, "%s", src);
+   else
+      dst[0] = '\0';
+}
+
+static bool aplayer_path_is_m3u(const char *path)
+{
+   const char *ext = path ? strrchr(path, '.') : NULL;
+   return ext && strcasecmp(ext, ".m3u") == 0;
+}
+
+static unsigned long long aplayer_bookmark_hash_path(const char *path)
+{
+   const unsigned char *ptr = (const unsigned char*)path;
+   unsigned long long hash = 1469598103934665603ULL;
+
+   while (ptr && *ptr)
+   {
+      hash ^= (unsigned long long)(*ptr++);
+      hash *= 1099511628211ULL;
+   }
+
+   return hash;
+}
+
+static bool aplayer_bookmark_get_dir(char *out_dir, size_t out_dir_size)
+{
+   const char *dir = NULL;
+
+   if (!out_dir || out_dir_size == 0)
+      return false;
+
+   out_dir[0] = '\0';
+
+   if (environ_cb &&
+       environ_cb(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &dir) &&
+       !string_is_empty(dir))
+   {
+      aplayer_copy_path(out_dir, out_dir_size, dir);
+      return true;
+   }
+
+   if (environ_cb &&
+       environ_cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &dir) &&
+       !string_is_empty(dir))
+   {
+      aplayer_copy_path(out_dir, out_dir_size, dir);
+      return true;
+   }
+
+   return false;
+}
+
+static bool aplayer_bookmark_build_path(const char *content_path,
+      char *out_path, size_t out_path_size)
+{
+   char base_dir[PATH_MAX];
+   char filename[64];
+   size_t dir_len;
+
+   if (!out_path || out_path_size == 0 || string_is_empty(content_path))
+      return false;
+
+   out_path[0] = '\0';
+
+   if (!aplayer_bookmark_get_dir(base_dir, sizeof(base_dir)))
+      return false;
+
+   snprintf(filename, sizeof(filename), "alpha_player_resume_%016llx.dat",
+         aplayer_bookmark_hash_path(content_path));
+
+   dir_len = strlen(base_dir);
+   snprintf(out_path, out_path_size, "%s%s%s",
+         base_dir,
+         (dir_len > 0 && base_dir[dir_len - 1] != '/' &&
+               base_dir[dir_len - 1] != '\\') ? "/" : "",
+         filename);
+
+   return out_path[0] != '\0';
+}
+
+static double aplayer_get_current_playback_time(void)
+{
+   double total_duration = media.duration.time;
+   bool total_valid = duration_is_valid(total_duration);
+   double pts_time = 0.0;
+   double fallback_time = (double)frame_cnt / media.interpolate_fps;
+   double current_time;
+
+   if (time_lock)
+   {
+      slock_lock(time_lock);
+      pts_time = g_current_time;
+      slock_unlock(time_lock);
+   }
+
+   if (audio_streams_num > 0 && video_stream_index < 0 && media.sample_rate > 0)
+      fallback_time = (double)audio_frames / media.sample_rate;
+
+   current_time = pts_time;
+   if (video_stream_index < 0 ||
+         current_time < 0.0 ||
+         (total_valid && current_time > total_duration + 5.0))
+      current_time = fallback_time;
+
+   if (current_time < 0.0)
+      current_time = 0.0;
+
+   return current_time;
+}
+
+static void aplayer_show_resume_message(double playback_time)
+{
+   char msg[64];
+   char time_str[16];
+   struct retro_message_ext msg_obj = {0};
+
+   format_time_hhmmss(playback_time, time_str, sizeof(time_str));
+   snprintf(msg, sizeof(msg), "Resumed from %s", time_str);
+
+   msg_obj.msg      = msg;
+   msg_obj.duration = 3000;
+   msg_obj.priority = 2;
+   msg_obj.level    = RETRO_LOG_INFO;
+   msg_obj.target   = RETRO_MESSAGE_TARGET_ALL;
+   msg_obj.type     = RETRO_MESSAGE_TYPE_NOTIFICATION;
+   msg_obj.progress = -1;
+   environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
+}
+
+static void aplayer_bookmark_clear_path(const char *content_path)
+{
+   char bookmark_path[PATH_MAX];
+
+   if (!aplayer_bookmark_build_path(content_path, bookmark_path, sizeof(bookmark_path)))
+      return;
+
+   remove(bookmark_path);
+}
+
+static void aplayer_bookmark_clear_current(void)
+{
+   aplayer_bookmark_clear_path(current_content_path);
+}
+
+static bool aplayer_bookmark_load(const char *content_path,
+      struct aplayer_bookmark *bookmark)
+{
+   FILE *fp = NULL;
+   char bookmark_path[PATH_MAX];
+   size_t read_elems = 0;
+
+   if (!bookmark)
+      return false;
+
+   memset(bookmark, 0, sizeof(*bookmark));
+
+   if (!aplayer_bookmark_build_path(content_path, bookmark_path, sizeof(bookmark_path)))
+      return false;
+
+   fp = fopen(bookmark_path, "rb");
+   if (!fp)
+      return false;
+
+   read_elems = fread(bookmark, sizeof(*bookmark), 1, fp);
+   fclose(fp);
+
+   if (read_elems != 1 ||
+       bookmark->magic != APLAYER_BOOKMARK_MAGIC ||
+       bookmark->version != APLAYER_BOOKMARK_VERSION ||
+       (bookmark->playback_time != 0.0 &&
+        !duration_is_valid(bookmark->playback_time)))
+   {
+      aplayer_bookmark_clear_path(content_path);
+      memset(bookmark, 0, sizeof(*bookmark));
+      return false;
+   }
+
+   return true;
+}
+
+static bool aplayer_bookmark_save_current(void)
+{
+   struct aplayer_bookmark bookmark;
+   FILE *fp = NULL;
+   char bookmark_path[PATH_MAX];
+   double playback_time = 0.0;
+
+   if (!content_loaded || !seek_supported || string_is_empty(current_content_path))
+      return false;
+
+   playback_time = aplayer_get_current_playback_time();
+   if (!duration_is_valid(playback_time) ||
+       playback_time < APLAYER_BOOKMARK_MIN_TIME)
+   {
+      aplayer_bookmark_clear_current();
+      return false;
+   }
+
+   if (!aplayer_bookmark_build_path(current_content_path, bookmark_path, sizeof(bookmark_path)))
+      return false;
+
+   memset(&bookmark, 0, sizeof(bookmark));
+   bookmark.magic              = APLAYER_BOOKMARK_MAGIC;
+   bookmark.version            = APLAYER_BOOKMARK_VERSION;
+   bookmark.playback_time      = playback_time;
+   bookmark.playlist_index     = playlist_index;
+   bookmark.audio_stream_ptr   = audio_streams_ptr;
+   bookmark.subtitle_stream_ptr = subtitle_streams_ptr;
+   aplayer_copy_path(bookmark.media_path, sizeof(bookmark.media_path), current_media_path);
+
+   fp = fopen(bookmark_path, "wb");
+   if (!fp)
+      return false;
+
+   if (fwrite(&bookmark, sizeof(bookmark), 1, fp) != 1)
+   {
+      fclose(fp);
+      return false;
+   }
+
+   fclose(fp);
+   return true;
+}
+
+static void aplayer_bookmark_apply_stream_selection(
+      const struct aplayer_bookmark *bookmark)
+{
+   if (!bookmark || !decode_thread_lock)
+      return;
+
+   slock_lock(decode_thread_lock);
+   if (bookmark->audio_stream_ptr >= 0 &&
+       bookmark->audio_stream_ptr < audio_streams_num)
+      audio_streams_ptr = bookmark->audio_stream_ptr;
+
+   if (bookmark->subtitle_stream_ptr >= 0 &&
+       bookmark->subtitle_stream_ptr < subtitle_streams_num)
+      subtitle_streams_ptr = bookmark->subtitle_stream_ptr;
+   slock_unlock(decode_thread_lock);
+}
+
+static void aplayer_bookmark_restore_playlist_index(
+      const struct aplayer_bookmark *bookmark)
+{
+   unsigned i;
+
+   if (!bookmark || playlist_count == 0)
+      return;
+
+   if (!string_is_empty(bookmark->media_path))
+   {
+      for (i = 0; i < playlist_count; i++)
+      {
+         if (string_is_equal(playlist[i], bookmark->media_path))
+         {
+            playlist_index = i;
+            return;
+         }
+      }
+   }
+
+   if (bookmark->playlist_index < playlist_count)
+      playlist_index = bookmark->playlist_index;
+}
+
 static void display_media_title()
 {
    const char *filename = NULL;
@@ -715,6 +1012,12 @@ static void append_attachment(const uint8_t *data, size_t size)
 void retro_init(void)
 {
    reset_triggered = false;
+   content_loaded = false;
+   playlist_source_active = false;
+   internal_playlist_reload_pending = false;
+   current_content_path[0] = '\0';
+   current_media_path[0] = '\0';
+   playlist_source_path[0] = '\0';
    aplayer_reset_controller_ports();
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_INPUT_BITMASKS, NULL))
@@ -910,6 +1213,14 @@ void retro_set_environment(retro_environment_t cb)
          }, "enabled"
       },
       {
+         "aplayer_auto_resume", "Auto Resume", NULL, NULL, NULL, NULL,
+         {
+            {"disabled", "OFF"},
+            {"enabled", "ON"},
+            {NULL, NULL}
+         }, "disabled"
+      },
+      {
          "aplayer_loop_content", "Loop Mode", NULL, NULL, NULL, NULL,
          {
             {"0", "Play Track"},
@@ -965,6 +1276,7 @@ void retro_set_video_refresh(retro_video_refresh_t cb)
 
 void retro_reset(void)
 {
+   aplayer_bookmark_clear_current();
    reset_triggered = true;
 }
 
@@ -1085,6 +1397,7 @@ static void check_variables(bool firststart)
 {
    struct retro_variable sw_threads_var = {0};
    struct retro_variable loop_content = {0};
+   struct retro_variable auto_resume_var = {0};
    struct retro_variable replay_is_crt = {0};
    struct retro_variable fft_toggle_var = {0};
    struct retro_variable subtitle_toggle_var = {0};
@@ -1207,6 +1520,14 @@ static void check_variables(bool firststart)
 
    update_subtitle_font_scale();
    update_subtitle_style_overrides();
+   auto_resume_enabled = false;
+   auto_resume_var.key = "aplayer_auto_resume";
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &auto_resume_var) &&
+         auto_resume_var.value)
+   {
+      if (string_is_equal(auto_resume_var.value, "enabled"))
+         auto_resume_enabled = true;
+   }
    /* M3U */
    loop_content.key = "aplayer_loop_content";
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &loop_content) && loop_content.value)
@@ -1395,27 +1716,7 @@ static void dispaly_time(void)
 
    double total_duration = media.duration.time;
    bool total_valid = duration_is_valid(total_duration);
-
-   double pts_time = 0.0;
-   if (time_lock)
-   {
-      slock_lock(time_lock);
-      pts_time = g_current_time;   // The decode thread sets this
-      slock_unlock(time_lock);
-   }
-
-   double fallback_time = (double)frame_cnt / media.interpolate_fps;
-   if (audio_streams_num > 0 && video_stream_index < 0 && media.sample_rate > 0)
-      fallback_time = (double)audio_frames / media.sample_rate;
-
-   double current_time = pts_time;
-   if (video_stream_index < 0 ||
-         current_time < 0.0 ||
-         (total_valid && current_time > total_duration + 5.0))
-      current_time = fallback_time;
-
-   if (current_time < 0.0)
-      current_time = 0.0;
+   double current_time = aplayer_get_current_playback_time();
 
    format_time_hhmmss(current_time, current_str, sizeof(current_str));
    if (total_valid)
@@ -1774,6 +2075,7 @@ void retro_run(void)
    /* M3U */
    if (do_seek && seek_time == 0.0 && playlist_count > 0)
    {
+      internal_playlist_reload_pending = true;
       retro_unload_game();
       struct retro_game_info next_info = {0};
       next_info.path = playlist[playlist_index];
@@ -1789,6 +2091,7 @@ void retro_run(void)
 
       if (tries == playlist_count)
       {
+         internal_playlist_reload_pending = false;
          struct retro_message_ext m = {
             .msg = "Playlist finished - no playable entries.",
             .duration = 5000, .level = RETRO_LOG_ERROR
@@ -1797,6 +2100,7 @@ void retro_run(void)
          return;   /* stop running gracefully */
       }
       do_seek = false;
+      internal_playlist_reload_pending = false;
 
       struct retro_system_av_info info;
       retro_get_system_av_info(&info);
@@ -4118,6 +4422,11 @@ void retro_unload_game(void)
 {
    unsigned i;
 
+   if (auto_resume_enabled)
+      aplayer_bookmark_save_current();
+
+   content_loaded = false;
+
    if (decode_thread_handle)
    {
       /* Stop the decode thread first */
@@ -4224,56 +4533,85 @@ void retro_unload_game(void)
    ass_render = NULL;
    ass = NULL;
 
+   current_media_path[0] = '\0';
+
    media_reset_defaults();
 }
 
 bool retro_load_game(const struct retro_game_info *info)
 {
-   if (!info)
+   struct retro_game_info local_info;
+   struct aplayer_bookmark bookmark;
+   bool have_bookmark = false;
+   bool internal_playlist_reload = internal_playlist_reload_pending;
+   bool requested_playlist = false;
+   int resume_frames = 0;
+
+   internal_playlist_reload_pending = false;
+
+   if (!info || string_is_empty(info->path))
       return false;
+
+   memset(&local_info, 0, sizeof(local_info));
+   memset(&bookmark, 0, sizeof(bookmark));
 
    media_reset_defaults();
    aplayer_reset_controller_ports();
    aplayer_register_input_layout();
+   current_media_path[0] = '\0';
+   content_loaded = false;
+   check_variables(true);
 
-   const char* ext = strrchr(info->path, '.');
-   // Local mutable retro_game_info
-   struct retro_game_info local_info;
+   requested_playlist = aplayer_path_is_m3u(info->path);
 
-   if (ext && strcasecmp(ext, ".m3u") == 0)
+   if (requested_playlist)
    {
       if (!parse_m3u_playlist(info->path))
          return false;
 
-      // Load first media file in playlist
+      playlist_source_active = true;
+      aplayer_copy_path(playlist_source_path, sizeof(playlist_source_path), info->path);
+      aplayer_copy_path(current_content_path, sizeof(current_content_path), playlist_source_path);
+
+      if (auto_resume_enabled &&
+          aplayer_bookmark_load(current_content_path, &bookmark))
+      {
+         have_bookmark = true;
+         aplayer_bookmark_restore_playlist_index(&bookmark);
+      }
+
+      local_info.path = playlist[playlist_index];
+      local_info.size = info->size;
+      local_info.data = info->data;
+   }
+   else if (internal_playlist_reload && playlist_source_active && playlist_count > 0)
+   {
+      aplayer_copy_path(current_content_path, sizeof(current_content_path), playlist_source_path);
       local_info.path = playlist[playlist_index];
       local_info.size = info->size;
       local_info.data = info->data;
    }
    else
    {
-      // If not an M3U, check if we're in the middle of a playlist
-      if (playlist_count == 0)
+      playlist_source_active = false;
+      playlist_source_path[0] = '\0';
+      playlist_count = 0;
+      playlist_index = 0;
+      aplayer_copy_path(current_content_path, sizeof(current_content_path), info->path);
+
+      if (auto_resume_enabled &&
+          aplayer_bookmark_load(current_content_path, &bookmark))
       {
-         // Not part of a playlist; load as single file
-         playlist_count = 0;
-         playlist_index = 0;
-         local_info.path = info->path;
-         local_info.size = info->size;
-         local_info.data = info->data;
+         have_bookmark = true;
       }
-      else
-      {
-         // Part of an existing playlist; use the current playlist entry
-         local_info.path = playlist[playlist_index];
-         local_info.size = info->size;
-         local_info.data = info->data;
-      }
+
+      local_info.path = info->path;
+      local_info.size = info->size;
+      local_info.data = info->data;
    }
 
    gme_seek_disabled = is_gme_path(local_info.path);
-   strncpy(current_media_path, local_info.path, sizeof(current_media_path) - 1);
-   current_media_path[sizeof(current_media_path) - 1] = '\0';
+   aplayer_copy_path(current_media_path, sizeof(current_media_path), local_info.path);
 
    log_cb(RETRO_LOG_INFO, "[APLAYER] Loading %s", local_info.path);
 
@@ -4295,8 +4633,6 @@ bool retro_load_game(const struct retro_game_info *info)
    int ret = 0;
    bool is_fft = false;
    enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
-
-   check_variables(true);
 
    if (!environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt))
    {
@@ -4337,6 +4673,8 @@ bool retro_load_game(const struct retro_game_info *info)
    seek_supported = time_supported && !gme_seek_disabled;
 
    maybe_load_external_subtitles(local_info.path);
+   if (have_bookmark)
+      aplayer_bookmark_apply_stream_selection(&bookmark);
 
    is_fft = video_stream_index < 0 && audio_streams_num > 0;
 
@@ -4383,6 +4721,22 @@ bool retro_load_game(const struct retro_game_info *info)
    decode_thread_handle = sthread_create(decode_thread, NULL);
 
    pts_bias = 0.0;
+   content_loaded = true;
+
+   if (!internal_playlist_reload &&
+       have_bookmark &&
+       seek_supported &&
+       duration_is_valid(bookmark.playback_time) &&
+       bookmark.playback_time >= APLAYER_BOOKMARK_MIN_TIME &&
+       bookmark.playback_time <= ((double)INT_MAX / media.interpolate_fps))
+   {
+      resume_frames = (int)(bookmark.playback_time * media.interpolate_fps + 0.5);
+      if (resume_frames > 0)
+      {
+         seek_frame(resume_frames);
+         aplayer_show_resume_message(bookmark.playback_time);
+      }
+   }
 
    return true;
 
