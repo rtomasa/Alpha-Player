@@ -1,6 +1,7 @@
 #ifndef FFMPEG_CORE_H_
 #define FFMPEG_CORE_H_
 
+#include <stdbool.h>
 #include <glsym/glsym.h>
 
 struct attachment
@@ -13,6 +14,7 @@ struct frame
 {
    GLuint tex;
    double pts;
+   bool valid;
 };
 
 enum media_type {

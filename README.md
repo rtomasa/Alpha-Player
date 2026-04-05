@@ -53,6 +53,7 @@ This core has been modified focusing on Raspberry Pi devices using a development
 * View Mode - Auto, Zoom, Stretch 4:3, Stretch 16:9 or Custom
 * Zoom Amount - Custom mode only, supports zoom-out below `1.00x`
 * Aspect Correction - Custom mode only
+* Frame Blending - Off, Low, Medium, High or Full
 * Zoom fills 16:9 by default, or 4:3 when `replay_is_crt=true`
 
 # Subtitles
@@ -70,7 +71,10 @@ If a video has an external subtitle file with the same name and a `.srt` extensi
 - [X] Added new `AUTO RESUME` option (when supported)
 - [X] Added check for videos with no alternate audio tracks
 - [X] Added fallback to display the file name when no metadata exists
+- [X] Added real frame blending with configurable strength: Off, Low, Medium, High, Full
+- [X] Changed Alpha Player’s timing base from hardcoded 60.0 to the frontend target refresh when available
 - [X] Fixed controller port initialization so input works correctly on direct boot
+- [ ] Fix subtitles always on if no "no subtitle" track exists
 
 # v2.3.0
 - [X] Refactored code to support libavutil >= 57

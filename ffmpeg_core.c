@@ -55,6 +55,7 @@ retro_log_printf_t log_cb;
 
 #define MAX_PLAYLIST_ENTRIES 256
 #define APLAYER_MAX_PORTS 4
+#define APLAYER_TARGET_REFRESH_RETRY_FRAMES 300
 #define APLAYER_BOOKMARK_MAGIC 0x4150424dU
 #define APLAYER_BOOKMARK_VERSION 1U
 #define APLAYER_BOOKMARK_MIN_TIME 1.0
@@ -322,6 +323,9 @@ static bool gme_seek_disabled = false;
 static enum video_view_mode video_view_mode = VIDEO_VIEW_MODE_AUTO;
 static float video_custom_zoom = 1.0f;
 static float video_pixel_ratio = 1.0f;
+static float video_blend_strength = 1.0f;
+static bool target_refresh_retry_active = false;
+static unsigned target_refresh_retry_frames = 0;
 
 /* GL stuff */
 static struct frame frames[2];
@@ -349,6 +353,12 @@ static void media_reset_defaults(void)
    seek_time             = 0.0;
    audio_switch_requested = false;
    g_current_time        = 0.0;
+   frames[0].pts         = 0.0;
+   frames[1].pts         = 0.0;
+   frames[0].valid       = false;
+   frames[1].valid       = false;
+   target_refresh_retry_active = false;
+   target_refresh_retry_frames = 0;
 }
 
 static void init_aspect_ratio(void)
@@ -641,6 +651,33 @@ static double stream_duration_seconds(int stream_index)
       return 0.0;
 
    return st->duration * av_q2d(st->time_base);
+}
+
+static bool aplayer_query_target_refresh_rate(double *refresh_rate_out)
+{
+   float refresh_rate = 0.0f;
+
+   if (environ_cb &&
+       environ_cb(RETRO_ENVIRONMENT_GET_TARGET_REFRESH_RATE, &refresh_rate) &&
+       refresh_rate > 10.0f && refresh_rate < 1000.0f)
+   {
+      if (refresh_rate_out)
+         *refresh_rate_out = refresh_rate;
+      return true;
+   }
+
+   return false;
+}
+
+static double aplayer_get_target_refresh_rate(bool *used_fallback)
+{
+   double refresh_rate = 60.0;
+   bool valid = aplayer_query_target_refresh_rate(&refresh_rate);
+
+   if (used_fallback)
+      *used_fallback = !valid;
+
+   return valid ? refresh_rate : 60.0;
 }
 
 static void format_time_hhmmss(double seconds, char *out, size_t out_size)
@@ -1164,6 +1201,18 @@ void retro_set_environment(retro_environment_t cb)
          }, "1.00"
       },
       {
+         "aplayer_video_blending", "Frame Blending", "Crossfades adjacent frames to smooth motion when content and display refresh do not match.",
+         NULL, NULL, "video",
+         {
+            {"off", "Off"},
+            {"low", "Low"},
+            {"medium", "Medium"},
+            {"high", "High"},
+            {"full", "Full"},
+            {NULL, NULL}
+         }, "full"
+      },
+      {
          "aplayer_subtitles", "Subtitles", NULL, NULL, NULL, "video",
          {
             {"enabled", "Enabled"},
@@ -1406,6 +1455,7 @@ static void check_variables(bool firststart)
    struct retro_variable video_view_mode_var = {0};
    struct retro_variable video_custom_zoom_var = {0};
    struct retro_variable video_pixel_ratio_var = {0};
+   struct retro_variable video_blending_var = {0};
 
    fft_width  = 640;
    fft_height = 480;
@@ -1516,6 +1566,23 @@ static void check_variables(bool firststart)
       video_pixel_ratio = strtof(video_pixel_ratio_var.value, NULL);
       if (video_pixel_ratio <= 0.0f)
          video_pixel_ratio = 1.0f;
+   }
+
+   video_blend_strength = 1.0f;
+   video_blending_var.key = "aplayer_video_blending";
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &video_blending_var) &&
+         video_blending_var.value)
+   {
+      if (string_is_equal(video_blending_var.value, "off"))
+         video_blend_strength = 0.0f;
+      else if (string_is_equal(video_blending_var.value, "low"))
+         video_blend_strength = 0.35f;
+      else if (string_is_equal(video_blending_var.value, "medium"))
+         video_blend_strength = 0.60f;
+      else if (string_is_equal(video_blending_var.value, "high"))
+         video_blend_strength = 0.80f;
+      else
+         video_blend_strength = 1.0f;
    }
 
    update_subtitle_font_scale();
@@ -1671,11 +1738,12 @@ static void seek_frame(int seek_frames)
    environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
 
    if (seek_frames_capped < 0)
-   {
       log_cb(RETRO_LOG_INFO, "[APLAYER] Resetting PTS.\n");
-      frames[0].pts = 0.0;
-      frames[1].pts = 0.0;
-   }
+
+   frames[0].pts = 0.0;
+   frames[1].pts = 0.0;
+   frames[0].valid = false;
+   frames[1].valid = false;
    audio_frames = frame_cnt * media.sample_rate / media.interpolate_fps;
 
    if (audio_decode_fifo)
@@ -1810,12 +1878,43 @@ void retro_run(void)
    unsigned old_fft_width       = fft_width;
    unsigned old_fft_height      = fft_height;
    float old_video_aspect       = video_stream_index >= 0 ? get_video_output_aspect() : 0.0f;
+   double old_interpolate_fps   = media.interpolate_fps;
+   uint64_t old_frame_cnt       = frame_cnt;
+   bool refresh_updated         = false;
+   double target_refresh_rate   = 0.0;
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
       check_variables(false);
 
+   if (target_refresh_retry_active && target_refresh_retry_frames > 0)
+   {
+      if (aplayer_query_target_refresh_rate(&target_refresh_rate) &&
+          (target_refresh_rate < old_interpolate_fps - 0.001 ||
+           target_refresh_rate > old_interpolate_fps + 0.001))
+      {
+         double current_time = old_interpolate_fps > 0.0 ?
+               (double)frame_cnt / old_interpolate_fps : 0.0;
+         media.interpolate_fps = target_refresh_rate;
+         frame_cnt = (uint64_t)(current_time * media.interpolate_fps + 0.5);
+         refresh_updated = true;
+         log_cb(RETRO_LOG_INFO,
+               "[APLAYER] Target refresh update detected during playback: %.3f -> %.3f Hz\n",
+               old_interpolate_fps, media.interpolate_fps);
+      }
+
+      target_refresh_retry_frames--;
+      if (!refresh_updated && target_refresh_retry_frames == 0)
+      {
+         target_refresh_retry_active = false;
+         log_cb(RETRO_LOG_INFO,
+               "[APLAYER] Target refresh monitoring finished at %.3f Hz\n",
+               media.interpolate_fps);
+      }
+   }
+
    if (fft_width != old_fft_width || fft_height != old_fft_height ||
-       (video_stream_index >= 0 && old_video_aspect != get_video_output_aspect()))
+       (video_stream_index >= 0 && old_video_aspect != get_video_output_aspect()) ||
+       refresh_updated)
    {
       struct retro_system_av_info info;
       retro_get_system_av_info(&info);
@@ -1823,6 +1922,17 @@ void retro_run(void)
       {
          fft_width = old_fft_width;
          fft_height = old_fft_height;
+         media.interpolate_fps = old_interpolate_fps;
+         frame_cnt = old_frame_cnt;
+         refresh_updated = false;
+      }
+      else if (refresh_updated)
+      {
+         target_refresh_retry_active = false;
+         target_refresh_retry_frames = 0;
+         log_cb(RETRO_LOG_INFO,
+               "[APLAYER] Applied updated target refresh rate during playback: %.3f -> %.3f Hz\n",
+               old_interpolate_fps, media.interpolate_fps);
       }
    }
 
@@ -2205,18 +2315,18 @@ void retro_run(void)
    if (video_stream_index >= 0)
    {
       /* Video */
-      if (min_pts > frames[1].pts)
-      {
-         struct frame tmp = frames[1];
-         frames[1] = frames[0];
-         frames[0] = tmp;
-      }
-
       float mix_factor;
 
-      while (!decode_thread_dead && min_pts > frames[1].pts)
+      while (!decode_thread_dead && (!frames[1].valid || min_pts > frames[1].pts))
       {
          int64_t pts = 0;
+
+         if (frames[1].valid)
+         {
+            struct frame tmp = frames[1];
+            frames[1] = frames[0];
+            frames[0] = tmp;
+         }
 
          if (!decode_thread_dead)
          {
@@ -2244,10 +2354,25 @@ void retro_run(void)
             video_buffer_open_slot(video_buffer, ctx);
          }
 
-         frames[1].pts = av_q2d(fctx->streams[video_stream_index]->time_base) * pts;
+         if (pts != AV_NOPTS_VALUE)
+            frames[1].pts = av_q2d(fctx->streams[video_stream_index]->time_base) * pts;
+         else if (frames[0].valid)
+            frames[1].pts = frames[0].pts + (1.0 / media.interpolate_fps);
+         else
+            frames[1].pts = min_pts;
+         frames[1].valid = true;
       }
 
       mix_factor = 1.0f;
+      if (frames[0].valid && frames[1].valid && frames[1].pts > frames[0].pts)
+      {
+         double mix = (min_pts - frames[0].pts) / (frames[1].pts - frames[0].pts);
+         if (mix < 0.0)
+            mix = 0.0;
+         else if (mix > 1.0)
+            mix = 1.0;
+         mix_factor = 1.0f - (video_blend_strength * (1.0f - (float)mix));
+      }
 
       glBindFramebuffer(GL_FRAMEBUFFER, hw_render.get_current_framebuffer());
 
@@ -2602,6 +2727,8 @@ static bool open_codecs(void)
 
 static bool init_media_info(void)
 {
+   bool used_fallback = false;
+
    if (actx[0] && actx[0]->sample_rate > 0)
       media.sample_rate = actx[0]->sample_rate;
    else if (actx[0])
@@ -2609,7 +2736,17 @@ static bool init_media_info(void)
             "[APLAYER] Invalid audio sample rate (%d), using default %u.\n",
             actx[0]->sample_rate, media.sample_rate);
 
-   media.interpolate_fps = 60.0;
+   media.interpolate_fps = aplayer_get_target_refresh_rate(&used_fallback);
+   target_refresh_retry_active = true;
+   target_refresh_retry_frames = APLAYER_TARGET_REFRESH_RETRY_FRAMES;
+   if (used_fallback)
+      log_cb(RETRO_LOG_INFO,
+            "[APLAYER] Target refresh rate unavailable, using fallback %.3f Hz and retrying during early playback.\n",
+            media.interpolate_fps);
+   else
+      log_cb(RETRO_LOG_INFO,
+            "[APLAYER] Using target refresh rate: %.3f Hz and monitoring for early updates.\n",
+            media.interpolate_fps);
 
    if (vctx)
    {
@@ -4363,6 +4500,10 @@ static void context_reset(void)
 
    frames_tex_width  = 0;
    frames_tex_height = 0;
+   frames[0].pts     = 0.0;
+   frames[1].pts     = 0.0;
+   frames[0].valid   = false;
+   frames[1].valid   = false;
 
    if (audio_streams_num > 0 && video_stream_index < 0)
    {
@@ -4481,6 +4622,7 @@ void retro_unload_game(void)
    decode_last_audio_time = 0.0;
 
    frames[0].pts = frames[1].pts = 0.0;
+   frames[0].valid = frames[1].valid = false;
    pts_bias = 0.0;
    frame_cnt = 0;
    audio_frames = 0;
@@ -4721,6 +4863,8 @@ bool retro_load_game(const struct retro_game_info *info)
    decode_thread_handle = sthread_create(decode_thread, NULL);
 
    pts_bias = 0.0;
+   frames[0].valid = false;
+   frames[1].valid = false;
    content_loaded = true;
 
    if (!internal_playlist_reload &&
