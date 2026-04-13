@@ -1337,9 +1337,10 @@ static unsigned subtitle_font_size_auto(unsigned height)
    if (height == 0)
       return subtitle_font_base_size;
 
-   unsigned size = (height * 7 + 99) / 100; /* ~15% of height */
-   if (size < 24)
-      size = 24;
+   /* Match common player behavior more closely: about 38 px at 720p. */
+   unsigned size = (height * 38 + 360) / 720;
+   if (size < 8)
+      size = 8;
    if (size > 128)
       size = 128;
    return size;
@@ -1360,7 +1361,12 @@ static void ass_scale_all_tracks(double scale)
       return;
 
    for (int i = 0; i < subtitle_streams_num; i++)
+   {
+      /* Respect authored ASS/SSA script sizing; only scale generated text tracks. */
+      if (subtitle_is_ass[i])
+         continue;
       ass_scale_track_styles(ass_track[i], scale);
+   }
 }
 
 static void update_subtitle_font_scale(void)
@@ -2882,7 +2888,8 @@ static bool init_media_info(void)
             else
                ass_init_default_track(ass_track[i]);
 
-            ass_scale_track_styles(ass_track[i], subtitle_font_scale);
+            if (!subtitle_is_ass[i])
+               ass_scale_track_styles(ass_track[i], subtitle_font_scale);
          }
       }
    }
@@ -3181,6 +3188,42 @@ static void ass_add_text_event(ASS_Track *track, int64_t start_ms, int64_t end_m
    ass_add_text_event_raw(track, start_ms, end_ms, escaped);
 
    free(escaped);
+}
+
+static void ass_add_embedded_event(ASS_Track *track, int64_t start_ms,
+      int64_t end_ms, const char *ass_line)
+{
+   const char *chunk = ass_line;
+   int64_t duration_ms = 0;
+
+   if (!track || !ass_line || !*ass_line)
+      return;
+
+   while (*chunk && isspace((unsigned char)*chunk))
+      chunk++;
+
+   if (strncmp(chunk, "Dialogue:", 9) == 0)
+   {
+      chunk += 9;
+      while (*chunk && isspace((unsigned char)*chunk))
+         chunk++;
+   }
+   else if (strncmp(chunk, "Comment:", 8) == 0)
+   {
+      return;
+   }
+
+   if (!*chunk)
+      return;
+
+   if (start_ms < 0)
+      start_ms = 0;
+
+   duration_ms = end_ms - start_ms;
+   if (duration_ms <= 0)
+      duration_ms = 2000;
+
+   ass_process_chunk(track, (char*)chunk, (int)strlen(chunk), start_ms, duration_ms);
 }
 
 static bool path_replace_extension(const char *path, const char *new_ext, char *out, size_t out_size)
@@ -3666,7 +3709,8 @@ static void maybe_load_external_subtitles(const char *media_path)
          }
       }
 
-      ass_scale_track_styles(track, subtitle_font_scale);
+      if (!is_ass)
+         ass_scale_track_styles(track, subtitle_font_scale);
 
       sctx[slot] = NULL;
       ass_track[slot] = track;
@@ -4434,7 +4478,8 @@ static void decode_thread(void *data)
                                  payload ? payload : "(null)");
                            first_subtitle_event_logged = true;
                         }
-                        ass_process_line(ass_track_sub, sub.rects[i]->ass);
+                        ass_add_embedded_event(ass_track_sub,
+                              start_ms, end_ms, sub.rects[i]->ass);
                      }
                      else if (sub.rects[i]->text)
                      {
