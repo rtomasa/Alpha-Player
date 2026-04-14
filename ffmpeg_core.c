@@ -241,8 +241,7 @@ static int video_stream_index;
 static int loopcontent;
 static bool is_crt = false;
 static const unsigned subtitle_font_base_size = 24;
-static unsigned subtitle_font_size = 64;
-static bool subtitle_font_auto = false;
+static unsigned subtitle_font_size = 24;
 static double subtitle_font_scale = 1.0;
 static const char *subtitle_font_name = "DejaVu Sans";
 static int subtitle_font_bold = 0;
@@ -1215,27 +1214,6 @@ void retro_set_environment(retro_environment_t cb)
          }, "full"
       },
       {
-         "aplayer_subtitle_font_size", "Subtitle Font Size", NULL, NULL, NULL, "video",
-         {
-            {"auto", "Auto"},
-            {"24", NULL},
-            {"32", NULL},
-            {"40", NULL},
-            {"48", NULL},
-            {"56", NULL},
-            {"64", NULL},
-            {"72", NULL},
-            {"80", NULL},
-            {"88", NULL},
-            {"96", NULL},
-            {"104", NULL},
-            {"112", NULL},
-            {"120", NULL},
-            {"128", NULL},
-            {NULL, NULL}
-         }, "auto"
-      },
-      {
          "aplayer_subtitle_font", "Subtitle Font", NULL, NULL, NULL, "video",
          {
             {"dejavu_sans", "DejaVu Sans"},
@@ -1372,11 +1350,8 @@ static void ass_scale_all_tracks(double scale)
 static void update_subtitle_font_scale(void)
 {
    double prev_scale = subtitle_font_scale;
-   unsigned target_size = subtitle_font_size;
+   unsigned target_size = subtitle_font_size_auto(media.height);
    double target_scale = 1.0;
-
-   if (subtitle_font_auto)
-      target_size = subtitle_font_size_auto(media.height);
 
    if (target_size == 0)
       target_size = subtitle_font_base_size;
@@ -1449,7 +1424,6 @@ static void check_variables(bool firststart)
    struct retro_variable auto_resume_var = {0};
    struct retro_variable replay_is_crt = {0};
    struct retro_variable fft_toggle_var = {0};
-   struct retro_variable subtitle_font_var = {0};
    struct retro_variable subtitle_font_name_var = {0};
    struct retro_variable video_view_mode_var = {0};
    struct retro_variable video_custom_zoom_var = {0};
@@ -1467,23 +1441,7 @@ static void check_variables(bool firststart)
          fft_enabled = false;
    }
 
-   subtitle_font_size = 64;
-   subtitle_font_auto = false;
-   subtitle_font_var.key = "aplayer_subtitle_font_size";
-   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &subtitle_font_var) &&
-         subtitle_font_var.value)
-   {
-      if (string_is_equal(subtitle_font_var.value, "auto"))
-      {
-         subtitle_font_auto = true;
-      }
-      else
-      {
-         subtitle_font_size = strtoul(subtitle_font_var.value, NULL, 0);
-         if (subtitle_font_size == 0)
-            subtitle_font_size = 64;
-      }
-   }
+   subtitle_font_size = subtitle_font_base_size;
 
    subtitle_font_name = "DejaVu Sans";
    subtitle_font_bold = 0;

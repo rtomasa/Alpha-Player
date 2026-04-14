@@ -73,11 +73,13 @@ If a video has an external subtitle file with the same name and a `.srt` extensi
 - [X] Added fallback to display the file name when no metadata exists
 - [X] Added real frame blending with configurable strength: Off, Low, Medium, High, Full
 - [X] Added `DISABLED SUBTITLES` virtual track cycling state
+- [ ] Added support for embedded VobSub/DVD
 - [X] Improved support for SSA subtitles
 - [X] Improved subtitle default size (Auto)
 - [X] Changed Alpha Player’s timing base from hardcoded 60.0 to the frontend target refresh when available
 - [X] Fixed controller port initialization so input works correctly on direct boot
-- [X] Removed the redundant subtitle enable/disable core option
+- [X] Removed redundant subtitle enable/disable core option
+- [X] Removed subtitle size option (breaks subs compatibility)
 
 # v2.3.0
 - [X] Refactored code to support libavutil >= 57
