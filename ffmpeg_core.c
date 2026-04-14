@@ -1211,7 +1211,7 @@ void retro_set_environment(retro_environment_t cb)
             {"high", "High"},
             {"full", "Full"},
             {NULL, NULL}
-         }, "full"
+         }, "off"
       },
       {
          "aplayer_subtitle_font", "Subtitle Font", NULL, NULL, NULL, "video",
