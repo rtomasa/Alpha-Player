@@ -239,18 +239,14 @@ static AVCodecContext *vctx;
 static int video_stream_index;
 static int loopcontent;
 static bool is_crt = false;
-static const unsigned subtitle_font_base_size = 24;
-static unsigned subtitle_font_size = 24;
-static double subtitle_font_scale = 1.0;
-static const char *subtitle_font_name = "DejaVu Sans";
-static int subtitle_font_bold = 0;
-static char subtitle_style_override_font[128];
-static char subtitle_style_override_bold[64];
-static char *subtitle_style_overrides[] = {
-   subtitle_style_override_font,
-   subtitle_style_override_bold,
-   NULL
-};
+static const double subtitle_font_size = 38.0;
+static const double subtitle_outline_size = 1.65;
+static const int subtitle_margin_x = 19;
+static const int subtitle_margin_y = 34;
+static const int subtitle_font_scale_base = 720;
+static const int subtitle_text_playres_x = 384;
+static const int subtitle_text_playres_y = 288;
+static const char *subtitle_font_name = "sans-serif";
 
 static double g_current_time = 0.0;  // PTS in seconds
 static slock_t *time_lock    = NULL; // Protects g_current_time
@@ -1261,18 +1257,6 @@ void retro_set_environment(retro_environment_t cb)
          }, "off"
       },
       {
-         "aplayer_subtitle_font", "Subtitle Font", NULL, NULL, NULL, "video",
-         {
-            {"dejavu_sans", "DejaVu Sans"},
-            {"dejavu_sans_bold", "DejaVu Sans Bold"},
-            {"dejavu_sans_mono", "DejaVu Sans Mono"},
-            {"dejavu_sans_mono_bold", "DejaVu Sans Mono Bold"},
-            {"dejavu_serif", "DejaVu Serif"},
-            {"dejavu_serif_bold", "DejaVu Serif Bold"},
-            {NULL, NULL}
-         }, "dejavu_sans_mono_bold"
-      },
-      {
          "aplayer_visualizer", "Visualizer", NULL, NULL, NULL, "music",
          {
             {"enabled", "Enabled"},
@@ -1357,109 +1341,105 @@ static void print_ffmpeg_version()
    PRINT_VERSION(swscale)
 }
 
-static unsigned subtitle_font_size_auto(unsigned height)
+static bool subtitle_track_is_text(unsigned slot)
 {
-   if (height == 0)
-      return subtitle_font_base_size;
-
-   /* Match common player behavior more closely: about 38 px at 720p. */
-   unsigned size = (height * 38 + 360) / 720;
-   if (size < 8)
-      size = 8;
-   if (size > 128)
-      size = 128;
-   return size;
+   return slot < MAX_STREAMS && !subtitle_is_ass[slot];
 }
 
-static void ass_scale_track_styles(ASS_Track *track, double scale)
+static double subtitle_scale_for_playres(double value, int play_res_y)
 {
-   if (!track || scale == 1.0)
+   if (play_res_y <= 0)
+      play_res_y = subtitle_text_playres_y;
+
+   return value * (double)play_res_y / (double)subtitle_font_scale_base;
+}
+
+static int subtitle_scale_int_for_playres(double value, int play_res_y)
+{
+   double scaled = subtitle_scale_for_playres(value, play_res_y);
+
+   if (scaled <= 0.0)
+      return 0;
+
+   return (int)(scaled + 0.5);
+}
+
+static void subtitle_set_text_track_playres(ASS_Track *track)
+{
+   int play_res_y = 0;
+   int play_res_x = 0;
+
+   if (!track)
       return;
+
+   play_res_y = track->PlayResY > 0 ? track->PlayResY : subtitle_text_playres_y;
+   play_res_x = track->PlayResX;
+
+   if (media.width > 0 && media.height > 0)
+   {
+      double scaled_x = (double)play_res_y * (double)media.width / (double)media.height;
+
+      if (scaled_x > 0.0)
+         play_res_x = (int)(scaled_x + 0.5);
+   }
+
+   if (play_res_x <= 0)
+      play_res_x = subtitle_text_playres_x;
+
+   track->PlayResX = play_res_x;
+   track->PlayResY = play_res_y;
+   track->Kerning = true;
+}
+
+static void subtitle_apply_mpv_text_style(ASS_Style *style, int play_res_y)
+{
+   const char *font_name = subtitle_font_name ? subtitle_font_name : "sans-serif";
+
+   if (!style)
+      return;
+
+   /* Match mpv's default text subtitle sizing in scaled pixels at 720p. */
+   if (style->FontName)
+      free(style->FontName);
+   style->FontName = strdup(font_name);
+   style->Bold = 0;
+   style->FontSize = subtitle_scale_for_playres(subtitle_font_size, play_res_y);
+   style->Outline = subtitle_scale_for_playres(subtitle_outline_size, play_res_y);
+   style->Shadow = 0.0;
+   style->MarginL = subtitle_scale_int_for_playres(subtitle_margin_x, play_res_y);
+   style->MarginR = subtitle_scale_int_for_playres(subtitle_margin_x, play_res_y);
+   style->MarginV = subtitle_scale_int_for_playres(subtitle_margin_y, play_res_y);
+}
+
+static void ass_update_text_track_styles(ASS_Track *track)
+{
+   if (!track)
+      return;
+
+   subtitle_set_text_track_playres(track);
 
    for (int i = 0; i < track->n_styles; i++)
-      track->styles[i].FontSize *= scale;
+      subtitle_apply_mpv_text_style(&track->styles[i], track->PlayResY);
 }
 
-static void ass_scale_all_tracks(double scale)
+static void ass_update_all_text_track_styles(void)
 {
-   if (scale == 1.0)
-      return;
-
    for (int i = 0; i < subtitle_streams_num; i++)
    {
-      /* Respect authored ASS/SSA script sizing; only scale generated text tracks. */
-      if (subtitle_is_ass[i] || subtitle_uses_native_text_header[i])
+      if (!subtitle_track_is_text(i))
          continue;
-      ass_scale_track_styles(ass_track[i], scale);
+      ass_update_text_track_styles(ass_track[i]);
    }
 }
 
-static void update_subtitle_font_scale(void)
-{
-   double prev_scale = subtitle_font_scale;
-   unsigned target_size = subtitle_font_size_auto(media.height);
-   double target_scale = 1.0;
-
-   if (target_size == 0)
-      target_size = subtitle_font_base_size;
-
-   subtitle_font_size = target_size;
-   target_scale = (double)target_size / (double)subtitle_font_base_size;
-   if (target_scale <= 0.0)
-      target_scale = 1.0;
-
-   if (ass_render && ass_lock)
-   {
-      double scale_ratio = target_scale / (prev_scale > 0.0 ? prev_scale : 1.0);
-
-      slock_lock(ass_lock);
-      ass_set_font_scale(ass_render, 1.0);
-      ass_scale_all_tracks(scale_ratio);
-      slock_unlock(ass_lock);
-   }
-
-   subtitle_font_scale = target_scale;
-}
-
-static void ass_update_track_fonts(ASS_Track *track, const char *font_name, int bold)
-{
-   if (!track || !font_name)
-      return;
-
-   for (int i = 0; i < track->n_styles; i++)
-   {
-      if (track->styles[i].FontName)
-         free(track->styles[i].FontName);
-      track->styles[i].FontName = strdup(font_name);
-      track->styles[i].Bold = bold ? -1 : 0;
-   }
-}
-
-static void ass_update_all_track_fonts(const char *font_name, int bold)
-{
-   if (!font_name)
-      return;
-
-   for (int i = 0; i < subtitle_streams_num; i++)
-      ass_update_track_fonts(ass_track[i], font_name, bold);
-}
-
-static void update_subtitle_style_overrides(void)
+static void update_subtitle_font_settings(void)
 {
    if (!ass)
       return;
 
-   snprintf(subtitle_style_override_font, sizeof(subtitle_style_override_font),
-         "FontName=%s", subtitle_font_name);
-   snprintf(subtitle_style_override_bold, sizeof(subtitle_style_override_bold),
-         "Bold=%d", subtitle_font_bold ? -1 : 0);
-
    if (ass_lock)
       slock_lock(ass_lock);
-   ass_set_style_overrides(ass, subtitle_style_overrides);
-   if (ass_render)
-      ass_set_fonts(ass_render, subtitle_font_name, NULL, 1, NULL, 1);
-   ass_update_all_track_fonts(subtitle_font_name, subtitle_font_bold);
+   ass_update_all_text_track_styles();
    if (ass_lock)
       slock_unlock(ass_lock);
 }
@@ -1471,7 +1451,6 @@ static void check_variables(bool firststart)
    struct retro_variable auto_resume_var = {0};
    struct retro_variable replay_is_crt = {0};
    struct retro_variable fft_toggle_var = {0};
-   struct retro_variable subtitle_font_name_var = {0};
    struct retro_variable video_view_mode_var = {0};
    struct retro_variable video_blending_var = {0};
 
@@ -1486,45 +1465,7 @@ static void check_variables(bool firststart)
          fft_enabled = false;
    }
 
-   subtitle_font_size = subtitle_font_base_size;
-
-   subtitle_font_name = "DejaVu Sans";
-   subtitle_font_bold = 0;
-   subtitle_font_name_var.key = "aplayer_subtitle_font";
-   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &subtitle_font_name_var) &&
-         subtitle_font_name_var.value)
-   {
-      if (string_is_equal(subtitle_font_name_var.value, "dejavu_sans"))
-      {
-         subtitle_font_name = "DejaVu Sans";
-         subtitle_font_bold = 0;
-      }
-      else if (string_is_equal(subtitle_font_name_var.value, "dejavu_sans_bold"))
-      {
-         subtitle_font_name = "DejaVu Sans";
-         subtitle_font_bold = 1;
-      }
-      else if (string_is_equal(subtitle_font_name_var.value, "dejavu_sans_mono"))
-      {
-         subtitle_font_name = "DejaVu Sans Mono";
-         subtitle_font_bold = 0;
-      }
-      else if (string_is_equal(subtitle_font_name_var.value, "dejavu_sans_mono_bold"))
-      {
-         subtitle_font_name = "DejaVu Sans Mono";
-         subtitle_font_bold = 1;
-      }
-      else if (string_is_equal(subtitle_font_name_var.value, "dejavu_serif"))
-      {
-         subtitle_font_name = "DejaVu Serif";
-         subtitle_font_bold = 0;
-      }
-      else if (string_is_equal(subtitle_font_name_var.value, "dejavu_serif_bold"))
-      {
-         subtitle_font_name = "DejaVu Serif";
-         subtitle_font_bold = 1;
-      }
-   }
+   subtitle_font_name = "sans-serif";
 
    video_view_mode = VIDEO_VIEW_MODE_AUTO;
    video_view_mode_var.key = "aplayer_video_view_mode";
@@ -1556,8 +1497,7 @@ static void check_variables(bool firststart)
          video_blend_strength = 1.0f;
    }
 
-   update_subtitle_font_scale();
-   update_subtitle_style_overrides();
+   update_subtitle_font_settings();
    auto_resume_enabled = false;
    auto_resume_var.key = "aplayer_auto_resume";
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &auto_resume_var) &&
@@ -2816,11 +2756,11 @@ static AVCodecContext *open_text_subtitle_converter(enum AVCodecID codec_id)
 
 static void ass_init_default_track(ASS_Track *track)
 {
-   unsigned play_res_x = media.width ? media.width : 640;
-   unsigned play_res_y = media.height ? media.height : 480;
-   const char *font_name = subtitle_font_name ? subtitle_font_name : "DejaVu Sans";
-   int font_bold = subtitle_font_bold ? -1 : 0;
-   unsigned font_size = subtitle_font_base_size;
+   unsigned play_res_x = subtitle_text_playres_x;
+   unsigned play_res_y = subtitle_text_playres_y;
+   const char *font_name = subtitle_font_name ? subtitle_font_name : "sans-serif";
+   int font_bold = 0;
+   unsigned font_size = 16;
    char header[1024];
    int len = snprintf(header, sizeof(header),
          "[Script Info]\n"
@@ -2851,11 +2791,12 @@ static void ass_init_subtitle_track(ASS_Track *track, unsigned slot)
 
    if (ass_extra_data_size[slot] > 0)
       ass_process_codec_private(track, (char*)ass_extra_data[slot], ass_extra_data_size[slot]);
-   else
+
+   if (track->n_styles == 0)
       ass_init_default_track(track);
 
-   if (!subtitle_is_ass[slot] && !subtitle_uses_native_text_header[slot])
-      ass_scale_track_styles(track, subtitle_font_scale);
+   if (subtitle_track_is_text(slot))
+      ass_update_text_track_styles(track);
 
 #ifdef LIBASS_VERSION
 #if LIBASS_VERSION >= 0x01302000
@@ -3081,8 +3022,7 @@ static bool init_media_info(void)
       ass_set_extract_fonts(ass, true);
       ass_set_fonts(ass_render, NULL, NULL, 1, NULL, 1);
       ass_set_hinting(ass_render, ASS_HINTING_LIGHT);
-      update_subtitle_style_overrides();
-      update_subtitle_font_scale();
+      update_subtitle_font_settings();
 
       for (i = 0; i < (unsigned)subtitle_streams_num; i++)
       {
@@ -3888,8 +3828,7 @@ static bool ensure_ass_context(void)
    ass_set_fonts(ass_render, NULL, NULL, 1, NULL, 1);
    ass_set_hinting(ass_render, ASS_HINTING_LIGHT);
 
-   update_subtitle_style_overrides();
-   update_subtitle_font_scale();
+   update_subtitle_font_settings();
 
    return true;
 }
@@ -3990,7 +3929,7 @@ static void maybe_load_external_subtitles(const char *media_path)
       first_subtitle_start_ms[slot] = first_start_ms;
       subtitle_streams_num++;
 
-      update_subtitle_style_overrides();
+      update_subtitle_font_settings();
 
       log_cb(RETRO_LOG_INFO, "[APLAYER] Loaded external subtitles: %s (%s)\n",
             sub_path, is_ass ? "ass" : "text");

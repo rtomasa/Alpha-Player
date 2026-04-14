@@ -74,6 +74,7 @@ If a video has an external subtitle file with the same name and a `.srt` extensi
 - [X] Fixed controller port initialization so input works correctly on direct boot
 - [X] Removed redundant subtitle enable/disable core option
 - [X] Removed subtitle size option (breaks subs compatibility)
+- [X] Removed subtitle font option honoring font metadata (fallback is now `sans-serif`)
 
 # v2.3.0
 - [X] Refactored code to support libavutil >= 57
