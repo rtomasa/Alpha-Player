@@ -124,8 +124,7 @@ enum video_view_mode
    VIDEO_VIEW_MODE_AUTO = 0,
    VIDEO_VIEW_MODE_ZOOM,
    VIDEO_VIEW_MODE_STRETCH_4_3,
-   VIDEO_VIEW_MODE_STRETCH_16_9,
-   VIDEO_VIEW_MODE_CUSTOM
+   VIDEO_VIEW_MODE_STRETCH_16_9
 };
 
 static void fallback_log(enum retro_log_level level, const char *fmt, ...)
@@ -323,9 +322,11 @@ static bool seek_supported = true;
 static bool time_supported = true;
 static bool gme_seek_disabled = false;
 static enum video_view_mode video_view_mode = VIDEO_VIEW_MODE_AUTO;
-static float video_custom_zoom = 1.0f;
-static float video_pixel_ratio = 1.0f;
 static float video_blend_strength = 1.0f;
+static unsigned video_crop_left = 0;
+static unsigned video_crop_top = 0;
+static unsigned video_crop_right = 0;
+static unsigned video_crop_bottom = 0;
 static bool target_refresh_retry_active = false;
 static unsigned target_refresh_retry_frames = 0;
 
@@ -347,6 +348,10 @@ static void media_reset_defaults(void)
    media.interpolate_fps = 60.0;   // your current default
    media.sample_rate     = 32000.0; // safe default until audio stream is opened
    media.aspect          = 0.0f;    // force recompute
+   video_crop_left       = 0;
+   video_crop_top        = 0;
+   video_crop_right      = 0;
+   video_crop_bottom     = 0;
    seek_supported        = true;
    time_supported        = true;
    gme_seek_disabled     = false;
@@ -367,41 +372,91 @@ static void init_aspect_ratio(void)
 {
    if (!vctx || video_stream_index < 0)
       return;
-      
-   AVStream *video_stream = fctx->streams[video_stream_index];
-   AVRational sar = {0, 1}; // Default to square pixels
-   
-   // Priority order for aspect ratio sources:
-   
-   // 1. Try codec context sample aspect ratio
-   if (vctx->sample_aspect_ratio.num > 0 && vctx->sample_aspect_ratio.den > 0)
-      sar = vctx->sample_aspect_ratio;
-   
-   // 2. Try stream sample aspect ratio
-   else if (video_stream->sample_aspect_ratio.num > 0 && 
-            video_stream->sample_aspect_ratio.den > 0)
-      sar = video_stream->sample_aspect_ratio;
-   
-   // 3. Try codec parameters sample aspect ratio  
-   else if (video_stream->codecpar->sample_aspect_ratio.num > 0 &&
-            video_stream->codecpar->sample_aspect_ratio.den > 0)
-      sar = video_stream->codecpar->sample_aspect_ratio;
-   
-   // Check for display aspect ratio in metadata
-   AVDictionaryEntry *dar_tag = av_dict_get(video_stream->metadata, "DAR", NULL, 0);
-   if (dar_tag) {
-      // Parse DAR string (e.g., "16:9", "4:3")
-      log_cb(RETRO_LOG_INFO, "[APLAYER] Container DAR: %s\n", dar_tag->value);
-   }
-   
-   // Calculate display aspect ratio
-   media.aspect = (float)media.width * av_q2d(sar) / (float)media.height;
 
-   if (media.aspect == 0.0f)
+   AVStream *video_stream = fctx->streams[video_stream_index];
+   AVRational sar = av_guess_sample_aspect_ratio(fctx, video_stream, NULL);
+   AVDictionaryEntry *dar_tag = av_dict_get(video_stream->metadata, "DAR", NULL, 0);
+
+   if (dar_tag)
+      log_cb(RETRO_LOG_INFO, "[APLAYER] Container DAR: %s\n", dar_tag->value);
+
+   media.aspect = (float)media.width * av_q2d(sar) / (float)media.height;
+   if (media.aspect <= 0.0f && media.width > 0 && media.height > 0)
       media.aspect = (float)media.width / (float)media.height;
-   
-   log_cb(RETRO_LOG_INFO, "[APLAYER] Video aspect ratio: %.3f (SAR: %d:%d)\n", 
-          media.aspect, sar.num, sar.den);
+
+   log_cb(RETRO_LOG_INFO,
+         "[APLAYER] Video aspect ratio: %.3f (SAR guess: %d:%d)\n",
+         media.aspect, sar.num, sar.den);
+}
+
+static void update_video_presentation_from_frame(const AVFrame *frame)
+{
+   unsigned frame_width;
+   unsigned frame_height;
+   unsigned crop_left;
+   unsigned crop_top;
+   unsigned crop_right;
+   unsigned crop_bottom;
+   unsigned visible_width;
+   unsigned visible_height;
+   float aspect;
+   AVRational sar = {0, 1};
+
+   if (!frame || !fctx || video_stream_index < 0)
+      return;
+
+   frame_width = frame->width > 0 ? (unsigned)frame->width : media.width;
+   frame_height = frame->height > 0 ? (unsigned)frame->height : media.height;
+   if (frame_width == 0 || frame_height == 0)
+      return;
+
+   crop_left = (unsigned)frame->crop_left;
+   crop_top = (unsigned)frame->crop_top;
+   crop_right = (unsigned)frame->crop_right;
+   crop_bottom = (unsigned)frame->crop_bottom;
+
+   if (crop_left + crop_right >= frame_width)
+      crop_left = crop_right = 0;
+   if (crop_top + crop_bottom >= frame_height)
+      crop_top = crop_bottom = 0;
+
+   visible_width = frame_width - crop_left - crop_right;
+   visible_height = frame_height - crop_top - crop_bottom;
+   if (visible_width == 0 || visible_height == 0)
+   {
+      crop_left = crop_top = crop_right = crop_bottom = 0;
+      visible_width = frame_width;
+      visible_height = frame_height;
+   }
+
+   sar = av_guess_sample_aspect_ratio(fctx, fctx->streams[video_stream_index],
+         (AVFrame*)frame);
+
+   aspect = (float)visible_width * av_q2d(sar) / (float)visible_height;
+   if (aspect <= 0.0f)
+      aspect = (float)visible_width / (float)visible_height;
+
+   if (crop_left != video_crop_left ||
+       crop_top != video_crop_top ||
+       crop_right != video_crop_right ||
+       crop_bottom != video_crop_bottom)
+   {
+      video_crop_left = crop_left;
+      video_crop_top = crop_top;
+      video_crop_right = crop_right;
+      video_crop_bottom = crop_bottom;
+      log_cb(RETRO_LOG_INFO,
+            "[APLAYER] Video presentation crop: %ux%u+%u+%u\n",
+            visible_width, visible_height, crop_left, crop_top);
+   }
+
+   if (!(media.aspect > aspect - 0.0005f && media.aspect < aspect + 0.0005f))
+   {
+      media.aspect = aspect;
+      log_cb(RETRO_LOG_INFO,
+            "[APLAYER] Video aspect ratio updated from frame: %.3f (SAR guess: %d:%d)\n",
+            media.aspect, sar.num, sar.den);
+   }
 }
 
 static float get_video_native_aspect(void)
@@ -432,8 +487,6 @@ static float get_video_output_aspect(void)
          return 4.0f / 3.0f;
       case VIDEO_VIEW_MODE_STRETCH_16_9:
          return 16.0f / 9.0f;
-      case VIDEO_VIEW_MODE_CUSTOM:
-         return native_aspect * video_pixel_ratio;
       case VIDEO_VIEW_MODE_AUTO:
       default:
          return native_aspect;
@@ -443,10 +496,50 @@ static float get_video_output_aspect(void)
 static void get_video_texture_window(float *u_min, float *u_max,
       float *v_min, float *v_max)
 {
-   float visible_width  = 1.0f;
-   float visible_height = 1.0f;
+   float base_u_min = 0.0f;
+   float base_u_max = 1.0f;
+   float base_v_min = 0.0f;
+   float base_v_max = 1.0f;
+   float visible_width;
+   float visible_height;
+   float base_width;
+   float base_height;
    float source_aspect  = get_video_native_aspect();
    float zoom           = 1.0f;
+
+   if (media.width > 0)
+   {
+      unsigned crop_left = video_crop_left;
+      unsigned crop_right = video_crop_right;
+
+      if (crop_left + crop_right >= media.width)
+         crop_left = crop_right = 0;
+
+      base_u_min = (float)crop_left / (float)media.width;
+      base_u_max = (float)(media.width - crop_right) / (float)media.width;
+   }
+
+   if (media.height > 0)
+   {
+      unsigned crop_top = video_crop_top;
+      unsigned crop_bottom = video_crop_bottom;
+
+      if (crop_top + crop_bottom >= media.height)
+         crop_top = crop_bottom = 0;
+
+      base_v_min = (float)crop_top / (float)media.height;
+      base_v_max = (float)(media.height - crop_bottom) / (float)media.height;
+   }
+
+   base_width = base_u_max - base_u_min;
+   base_height = base_v_max - base_v_min;
+   if (base_width <= 0.0f)
+      base_width = 1.0f;
+   if (base_height <= 0.0f)
+      base_height = 1.0f;
+
+   visible_width = base_width;
+   visible_height = base_height;
 
    if (video_view_mode == VIDEO_VIEW_MODE_ZOOM)
    {
@@ -455,14 +548,10 @@ static void get_video_texture_window(float *u_min, float *u_max,
       if (source_aspect > 0.0f && target_aspect > 0.0f)
       {
          if (source_aspect > target_aspect)
-            visible_width = target_aspect / source_aspect;
+            visible_width = base_width * (target_aspect / source_aspect);
          else if (source_aspect < target_aspect)
-            visible_height = source_aspect / target_aspect;
+            visible_height = base_height * (source_aspect / target_aspect);
       }
-   }
-   else if (video_view_mode == VIDEO_VIEW_MODE_CUSTOM)
-   {
-      zoom = video_custom_zoom;
    }
 
    if (zoom > 1.0f)
@@ -473,17 +562,17 @@ static void get_video_texture_window(float *u_min, float *u_max,
 
    if (visible_width < 0.0f)
       visible_width = 0.0f;
-   else if (visible_width > 1.0f)
-      visible_width = 1.0f;
+   else if (visible_width > base_width)
+      visible_width = base_width;
 
    if (visible_height < 0.0f)
       visible_height = 0.0f;
-   else if (visible_height > 1.0f)
-      visible_height = 1.0f;
+   else if (visible_height > base_height)
+      visible_height = base_height;
 
-   *u_min = (1.0f - visible_width) * 0.5f;
+   *u_min = base_u_min + (base_width - visible_width) * 0.5f;
    *u_max = *u_min + visible_width;
-   *v_min = (1.0f - visible_height) * 0.5f;
+   *v_min = base_v_min + (base_height - visible_height) * 0.5f;
    *v_max = *v_min + visible_height;
 }
 
@@ -494,31 +583,23 @@ static void update_video_quad(void)
    float u_max;
    float v_min;
    float v_max;
-   float vertex_scale = 1.0f;
 
    get_video_texture_window(&u_min, &u_max, &v_min, &v_max);
 
-   if (video_view_mode == VIDEO_VIEW_MODE_CUSTOM &&
-       video_custom_zoom > 0.0f &&
-       video_custom_zoom < 1.0f)
-   {
-      vertex_scale = video_custom_zoom;
-   }
-
-   vertex_data[0]  = -vertex_scale;
-   vertex_data[1]  = -vertex_scale;
+   vertex_data[0]  = -1.0f;
+   vertex_data[1]  = -1.0f;
    vertex_data[2]  = u_min;
    vertex_data[3]  = v_min;
-   vertex_data[4]  = vertex_scale;
-   vertex_data[5]  = -vertex_scale;
+   vertex_data[4]  = 1.0f;
+   vertex_data[5]  = -1.0f;
    vertex_data[6]  = u_max;
    vertex_data[7]  = v_min;
-   vertex_data[8]  = -vertex_scale;
-   vertex_data[9]  = vertex_scale;
+   vertex_data[8]  = -1.0f;
+   vertex_data[9]  = 1.0f;
    vertex_data[10] = u_min;
    vertex_data[11] = v_max;
-   vertex_data[12] = vertex_scale;
-   vertex_data[13] = vertex_scale;
+   vertex_data[12] = 1.0f;
+   vertex_data[13] = 1.0f;
    vertex_data[14] = u_max;
    vertex_data[15] = v_max;
 
@@ -1164,45 +1245,8 @@ void retro_set_environment(retro_environment_t cb)
             {"zoom", "Zoom"},
             {"stretch_4_3", "Stretch 4:3"},
             {"stretch_16_9", "Stretch 16:9"},
-            {"custom", "Custom"},
             {NULL, NULL}
          }, "auto"
-      },
-      {
-         "aplayer_video_custom_zoom", "Zoom Amount", "Custom mode only. Shrinks below 1.00x and crops above 1.00x.",
-         NULL, NULL, "video",
-         {
-            {"0.50", "0.50x"},
-            {"0.67", "0.67x"},
-            {"0.75", "0.75x"},
-            {"0.80", "0.80x"},
-            {"0.90", "0.90x"},
-            {"0.95", "0.95x"},
-            {"1.00", "1.00x"},
-            {"1.05", "1.05x"},
-            {"1.10", "1.10x"},
-            {"1.15", "1.15x"},
-            {"1.20", "1.20x"},
-            {"1.25", "1.25x"},
-            {"1.33", "1.33x"},
-            {"1.50", "1.50x"},
-            {NULL, NULL}
-         }, "1.00"
-      },
-      {
-         "aplayer_video_pixel_ratio", "Aspect Correction", "Custom mode only. Widens or narrows the displayed image.",
-         NULL, NULL, "video",
-         {
-            {"0.75", "0.75x"},
-            {"0.90", "0.90x"},
-            {"1.00", "1.00x"},
-            {"1.10", "1.10x"},
-            {"1.25", "1.25x"},
-            {"1.33", "1.33x"},
-            {"1.50", "1.50x"},
-            {"1.78", "1.78x"},
-            {NULL, NULL}
-         }, "1.00"
       },
       {
          "aplayer_video_blending", "Frame Blending", "Crossfades adjacent frames to smooth motion when content and display refresh do not match.",
@@ -1429,8 +1473,6 @@ static void check_variables(bool firststart)
    struct retro_variable fft_toggle_var = {0};
    struct retro_variable subtitle_font_name_var = {0};
    struct retro_variable video_view_mode_var = {0};
-   struct retro_variable video_custom_zoom_var = {0};
-   struct retro_variable video_pixel_ratio_var = {0};
    struct retro_variable video_blending_var = {0};
 
    fft_width  = 640;
@@ -1495,28 +1537,6 @@ static void check_variables(bool firststart)
          video_view_mode = VIDEO_VIEW_MODE_STRETCH_4_3;
       else if (string_is_equal(video_view_mode_var.value, "stretch_16_9"))
          video_view_mode = VIDEO_VIEW_MODE_STRETCH_16_9;
-      else if (string_is_equal(video_view_mode_var.value, "custom"))
-         video_view_mode = VIDEO_VIEW_MODE_CUSTOM;
-   }
-
-   video_custom_zoom = 1.0f;
-   video_custom_zoom_var.key = "aplayer_video_custom_zoom";
-   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &video_custom_zoom_var) &&
-         video_custom_zoom_var.value)
-   {
-      video_custom_zoom = strtof(video_custom_zoom_var.value, NULL);
-      if (video_custom_zoom <= 0.0f)
-         video_custom_zoom = 1.0f;
-   }
-
-   video_pixel_ratio = 1.0f;
-   video_pixel_ratio_var.key = "aplayer_video_pixel_ratio";
-   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &video_pixel_ratio_var) &&
-         video_pixel_ratio_var.value)
-   {
-      video_pixel_ratio = strtof(video_pixel_ratio_var.value, NULL);
-      if (video_pixel_ratio <= 0.0f)
-         video_pixel_ratio = 1.0f;
    }
 
    video_blend_strength = 1.0f;
@@ -4092,6 +4112,7 @@ static void decode_video(AVCodecContext *ctx, AVPacket *pkt, size_t frame_size, 
          break;
       }
 
+      update_video_presentation_from_frame(decoder_ctx->source);
       decoder_ctx->ass_track_active = ass_track_active;
       /* Submit to worker thread which does sws_scale, etc. */
       tpool_add_work(tpool, sws_worker_thread, decoder_ctx);
