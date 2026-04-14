@@ -263,6 +263,8 @@ static tpool_t *tpool;
 
 #define MAX_STREAMS 8
 #define SUBTITLE_STREAM_DISABLED (-1)
+#define SUBTITLE_UNKNOWN_DURATION_MS (((INT_MAX / 1000) * 1000))
+#define SUBTITLE_FIX_TIMING_THRESHOLD_MS 210
 static AVCodecContext *actx[MAX_STREAMS];
 static AVCodecContext *sctx[MAX_STREAMS];
 static int audio_streams[MAX_STREAMS];
@@ -273,6 +275,7 @@ static int subtitle_streams_num;
 static int subtitle_streams_ptr;
 static bool subtitle_is_ass[MAX_STREAMS];
 static bool subtitle_is_external[MAX_STREAMS];
+static bool subtitle_uses_native_text_header[MAX_STREAMS];
 
 /* ASS/SSA and text-based subtitles via libass. */
 static ASS_Library *ass;
@@ -1341,7 +1344,7 @@ static void ass_scale_all_tracks(double scale)
    for (int i = 0; i < subtitle_streams_num; i++)
    {
       /* Respect authored ASS/SSA script sizing; only scale generated text tracks. */
-      if (subtitle_is_ass[i])
+      if (subtitle_is_ass[i] || subtitle_uses_native_text_header[i])
          continue;
       ass_scale_track_styles(ass_track[i], scale);
    }
@@ -1817,6 +1820,80 @@ static void subtitle_selection_label(int subtitle_ptr, char *label, size_t label
       snprintf(label, label_size, "External Subtitle #%d", subtitle_ptr);
    else
       snprintf(label, label_size, "Subtitle Track #%d", subtitle_ptr);
+}
+
+static bool ass_event_has_layout_overrides(const char *text)
+{
+   if (!text)
+      return false;
+
+   return strstr(text, "\\pos") || strstr(text, "\\move") ||
+         strstr(text, "\\clip") || strstr(text, "\\iclip") ||
+         strstr(text, "\\org") || strstr(text, "\\p");
+}
+
+static long long subtitle_adjust_render_time_ms(ASS_Track *track,
+      int subtitle_ptr, long long now_ms)
+{
+   ASS_Event *overlap[2] = {0};
+   int count = 0;
+
+   if (!track || subtitle_ptr < 0 || subtitle_ptr >= MAX_STREAMS ||
+         subtitle_is_ass[subtitle_ptr])
+      return now_ms;
+
+   for (int i = 0; i < track->n_events; i++)
+   {
+      ASS_Event *event = &track->events[i];
+      long long start = event->Start;
+      long long end = event->Start + event->Duration;
+
+      if (now_ms >= start - SUBTITLE_FIX_TIMING_THRESHOLD_MS &&
+            now_ms <= end + SUBTITLE_FIX_TIMING_THRESHOLD_MS)
+      {
+         if (count >= 2)
+            return now_ms;
+         overlap[count++] = event;
+      }
+   }
+
+   if (count != 2)
+      return now_ms;
+
+   if (overlap[0]->Style != overlap[1]->Style ||
+         ass_event_has_layout_overrides(overlap[0]->Text) ||
+         ass_event_has_layout_overrides(overlap[1]->Text))
+      return now_ms;
+
+   if (overlap[0]->Start > overlap[1]->Start)
+   {
+      ASS_Event *tmp = overlap[0];
+      overlap[0] = overlap[1];
+      overlap[1] = tmp;
+   }
+
+   {
+      long long first_end = overlap[0]->Start + overlap[0]->Duration;
+      long long second_start = overlap[1]->Start;
+      long long second_end = overlap[1]->Start + overlap[1]->Duration;
+
+      if (first_end >= second_end)
+         return now_ms;
+
+      if (now_ms >= first_end &&
+            now_ms < second_start &&
+            first_end < second_start &&
+            first_end + SUBTITLE_FIX_TIMING_THRESHOLD_MS >= second_start)
+         return first_end - 1;
+
+      if (now_ms >= second_start &&
+            now_ms <= first_end &&
+            first_end > second_start &&
+            first_end <= second_start + SUBTITLE_FIX_TIMING_THRESHOLD_MS)
+         return first_end;
+   }
+
+   return now_ms;
 }
 
 static void render_subtitles_on_buffer(uint32_t *buffer, unsigned width,
@@ -2579,6 +2656,144 @@ static bool codec_name_is_text_subtitle(enum AVCodecID id)
    return false;
 }
 
+static void subtitle_store_codec_private(unsigned slot, AVCodecContext *ctx, bool is_text)
+{
+   const uint8_t *src = NULL;
+   size_t size = 0;
+   bool has_native_header = false;
+
+   if (slot >= MAX_STREAMS || !ctx)
+      return;
+
+   av_freep(&ass_extra_data[slot]);
+   ass_extra_data_size[slot] = 0;
+   subtitle_uses_native_text_header[slot] = false;
+
+   if (is_text && ctx->subtitle_header && ctx->subtitle_header_size > 0)
+   {
+      src = (const uint8_t*)ctx->subtitle_header;
+      size = (size_t)ctx->subtitle_header_size;
+      has_native_header = true;
+   }
+   else if (ctx->extradata && ctx->extradata_size > 0)
+   {
+      src = ctx->extradata;
+      size = (size_t)ctx->extradata_size;
+   }
+
+   if (!src || size == 0)
+      return;
+
+   ass_extra_data[slot] = (uint8_t*)av_malloc(size);
+   if (!ass_extra_data[slot])
+      return;
+
+   memcpy(ass_extra_data[slot], src, size);
+   ass_extra_data_size[slot] = size;
+   subtitle_uses_native_text_header[slot] = has_native_header;
+}
+
+static bool open_subtitle_codec(AVCodecContext **ctx, unsigned index, bool is_text)
+{
+   bool use_text_opts = is_text;
+   const AVCodec *codec = avcodec_find_decoder(fctx->streams[index]->codecpar->codec_id);
+
+   if (!codec)
+   {
+      log_cb(RETRO_LOG_ERROR, "[APLAYER] Couldn't find suitable subtitle decoder\n");
+      return false;
+   }
+
+   do
+   {
+      int ret = 0;
+      AVDictionary *opts = NULL;
+
+      *ctx = avcodec_alloc_context3(codec);
+      if (!*ctx)
+         return false;
+
+      ret = avcodec_parameters_to_context(*ctx, fctx->streams[index]->codecpar);
+      if (ret < 0)
+      {
+         avcodec_free_context(ctx);
+         return false;
+      }
+
+      if (use_text_opts)
+      {
+         av_dict_set(&opts, "sub_text_format", "ass", 0);
+         av_dict_set(&opts, "flags2", "+ass_ro_flush_noop", 0);
+#ifdef FF_SUB_CHARENC_MODE_IGNORE
+         (*ctx)->sub_charenc_mode = FF_SUB_CHARENC_MODE_IGNORE;
+#endif
+      }
+
+      ret = avcodec_open2(*ctx, codec, &opts);
+      av_dict_free(&opts);
+
+      if (ret >= 0)
+         return true;
+
+      avcodec_free_context(ctx);
+      if (!use_text_opts)
+      {
+         log_cb(RETRO_LOG_ERROR, "[APLAYER] Could not open subtitle codec: %s\n",
+               av_err2str(ret));
+         return false;
+      }
+
+      log_cb(RETRO_LOG_WARN,
+            "[APLAYER] Retrying text subtitle decoder without ASS conversion options: %s\n",
+            av_err2str(ret));
+      use_text_opts = false;
+   } while (true);
+
+   return false;
+}
+
+static AVCodecContext *open_text_subtitle_converter(enum AVCodecID codec_id)
+{
+   const AVCodec *codec = avcodec_find_decoder(codec_id);
+   bool use_text_opts = true;
+
+   if (!codec)
+      return NULL;
+
+   do
+   {
+      int ret = 0;
+      AVDictionary *opts = NULL;
+      AVCodecContext *ctx = avcodec_alloc_context3(codec);
+
+      if (!ctx)
+         return NULL;
+
+      if (use_text_opts)
+      {
+         av_dict_set(&opts, "sub_text_format", "ass", 0);
+         av_dict_set(&opts, "flags2", "+ass_ro_flush_noop", 0);
+#ifdef FF_SUB_CHARENC_MODE_IGNORE
+         ctx->sub_charenc_mode = FF_SUB_CHARENC_MODE_IGNORE;
+#endif
+      }
+
+      ret = avcodec_open2(ctx, codec, &opts);
+      av_dict_free(&opts);
+
+      if (ret >= 0)
+         return ctx;
+
+      avcodec_free_context(&ctx);
+      if (!use_text_opts)
+         return NULL;
+
+      use_text_opts = false;
+   } while (true);
+
+   return NULL;
+}
+
 static void ass_init_default_track(ASS_Track *track)
 {
    unsigned play_res_x = media.width ? media.width : 640;
@@ -2607,6 +2822,26 @@ static void ass_init_default_track(ASS_Track *track)
       len = (int)sizeof(header) - 1;
 
    ass_process_codec_private(track, header, len);
+}
+
+static void ass_init_subtitle_track(ASS_Track *track, unsigned slot)
+{
+   if (!track || slot >= MAX_STREAMS)
+      return;
+
+   if (ass_extra_data_size[slot] > 0)
+      ass_process_codec_private(track, (char*)ass_extra_data[slot], ass_extra_data_size[slot]);
+   else
+      ass_init_default_track(track);
+
+   if (!subtitle_is_ass[slot] && !subtitle_uses_native_text_header[slot])
+      ass_scale_track_styles(track, subtitle_font_scale);
+
+#ifdef LIBASS_VERSION
+#if LIBASS_VERSION >= 0x01302000
+   ass_set_check_readorder(track, 1);
+#endif
+#endif
 }
 
 static int subtitle_slot_for_stream(int stream_index)
@@ -2638,6 +2873,7 @@ static bool open_codecs(void)
    memset(subtitle_streams, 0, sizeof(subtitle_streams));
    memset(subtitle_is_ass,  0, sizeof(subtitle_is_ass));
    memset(subtitle_is_external, 0, sizeof(subtitle_is_external));
+   memset(subtitle_uses_native_text_header, 0, sizeof(subtitle_uses_native_text_header));
    first_subtitle_event_logged = false;
    first_ass_render_logged = false;
    memset(first_ass_image_logged, 0, sizeof(first_ass_image_logged));
@@ -2672,8 +2908,8 @@ static bool open_codecs(void)
          case AVMEDIA_TYPE_SUBTITLE:
             if (subtitle_streams_num < MAX_STREAMS)
             {
-               int size;
-               AVCodecContext **s = &sctx[subtitle_streams_num];
+               unsigned slot = subtitle_streams_num;
+               AVCodecContext **s = &sctx[slot];
                const enum AVCodecID sub_id = fctx->streams[i]->codecpar->codec_id;
                const char *codec_name = avcodec_get_name(sub_id);
                bool is_ass = codec_id_is_ass(sub_id);
@@ -2690,19 +2926,12 @@ static bool open_codecs(void)
                   break;
                }
 
-               subtitle_streams[subtitle_streams_num] = i;
-               subtitle_is_ass[subtitle_streams_num] = is_ass;
-               if (!open_codec(s, type, i))
+               subtitle_streams[slot] = i;
+               subtitle_is_ass[slot] = is_ass;
+               if (!open_subtitle_codec(s, i, is_text))
                   return false;
 
-               size = (*s)->extradata ? (*s)->extradata_size : 0;
-               ass_extra_data_size[subtitle_streams_num] = size;
-
-               if (size)
-               {
-                  ass_extra_data[subtitle_streams_num] = (uint8_t*)av_malloc(size);
-                  memcpy(ass_extra_data[subtitle_streams_num], (*s)->extradata, size);
-               }
+               subtitle_store_codec_private(slot, *s, is_text);
 
                subtitle_streams_num++;
                log_cb(RETRO_LOG_INFO, "[APLAYER] Subtitle stream %u registered: %s (%s)\n",
@@ -2839,16 +3068,7 @@ static bool init_media_info(void)
       {
          ass_track[i] = ass_new_track(ass);
          if (ass_track[i])
-         {
-            if (subtitle_is_ass[i] && ass_extra_data_size[i] > 0)
-               ass_process_codec_private(ass_track[i], (char*)ass_extra_data[i],
-                     ass_extra_data_size[i]);
-            else
-               ass_init_default_track(ass_track[i]);
-
-            if (!subtitle_is_ass[i])
-               ass_scale_track_styles(ass_track[i], subtitle_font_scale);
-         }
+            ass_init_subtitle_track(ass_track[i], i);
       }
    }
 
@@ -2975,7 +3195,8 @@ static void render_subtitles_on_buffer(uint32_t *buffer, unsigned width,
    if (ass_render)
    {
       int change = 0;
-      long long now_ms = (long long)(time_sec * 1000.0);
+      long long now_ms = subtitle_adjust_render_time_ms(render_track,
+            subtitle_ptr, (long long)(time_sec * 1000.0));
       ASS_Image *img = ass_render_frame(ass_render, render_track, now_ms, &change);
 
       if (!first_ass_render_logged)
@@ -3073,25 +3294,6 @@ static void ass_process_line(ASS_Track *track, const char *line)
    free(buf);
 }
 
-static const char *ass_event_payload(const char *ass)
-{
-   const char *last_comma = NULL;
-
-   if (!ass)
-      return NULL;
-
-   for (const char *p = ass; *p; p++)
-   {
-      if (*p == ',')
-         last_comma = p;
-   }
-
-   if (!last_comma || !last_comma[1])
-      return ass;
-
-   return last_comma + 1;
-}
-
 static void ass_format_time(int64_t ms, char *buf, size_t buf_len)
 {
    if (!buf || buf_len == 0)
@@ -3182,6 +3384,35 @@ static void ass_add_embedded_event(ASS_Track *track, int64_t start_ms,
       duration_ms = 2000;
 
    ass_process_chunk(track, (char*)chunk, (int)strlen(chunk), start_ms, duration_ms);
+}
+
+static void ass_backfill_unknown_event_durations(ASS_Track *track)
+{
+   int last = 0;
+
+   if (!track || track->n_events <= 1)
+      return;
+
+   last = track->n_events - 1;
+   for (int i = last - 1; i >= 0; i--)
+   {
+      ASS_Event *event = &track->events[i];
+      ASS_Event *next = &track->events[i + 1];
+
+      if (track->events[last].Start == event->Start)
+         continue;
+
+      if (event->Duration == SUBTITLE_UNKNOWN_DURATION_MS)
+      {
+         if (event->Start < next->Start)
+            event->Duration = next->Start - event->Start;
+         else if (event->Start == next->Start)
+            event->Duration = next->Duration;
+      }
+
+      if (i > 0 && event->Start != track->events[i - 1].Start)
+         break;
+   }
 }
 
 static bool path_replace_extension(const char *path, const char *new_ext, char *out, size_t out_size)
@@ -3443,7 +3674,8 @@ static bool parse_srt_time_range_ms(const char *line, int64_t *start_ms, int64_t
    return true;
 }
 
-static bool srt_add_events_from_buffer(ASS_Track *track, char *buf, size_t buf_size, int64_t *first_start_ms_out)
+static bool srt_add_events_from_buffer(ASS_Track *track, char *buf, size_t buf_size,
+      int64_t *first_start_ms_out, AVCodecContext *converter)
 {
    char *cursor = buf;
    char *end = buf + buf_size;
@@ -3548,10 +3780,55 @@ static bool srt_add_events_from_buffer(ASS_Track *track, char *buf, size_t buf_s
 
          if (text && text_len > 0)
          {
-            ass_add_text_event(track, start_ms, end_ms, text);
-            any = true;
-            if (first_start_ms < 0)
-               first_start_ms = start_ms;
+            bool added = false;
+
+            if (converter)
+            {
+               AVPacket pkt;
+               AVSubtitle sub;
+               int got_sub = 0;
+
+               memset(&pkt, 0, sizeof(pkt));
+               memset(&sub, 0, sizeof(sub));
+               pkt.data = (uint8_t*)text;
+               pkt.size = (int)text_len;
+
+               if (avcodec_decode_subtitle2(converter, &sub, &got_sub, &pkt) >= 0 &&
+                     got_sub)
+               {
+                  for (int i = 0; i < sub.num_rects; i++)
+                  {
+                     if (!sub.rects[i])
+                        continue;
+
+                     if (sub.rects[i]->ass)
+                     {
+                        ass_add_embedded_event(track, start_ms, end_ms, sub.rects[i]->ass);
+                        added = true;
+                     }
+                     else if (sub.rects[i]->text)
+                     {
+                        ass_add_text_event(track, start_ms, end_ms, sub.rects[i]->text);
+                        added = true;
+                     }
+                  }
+               }
+
+               avsubtitle_free(&sub);
+            }
+
+            if (!added)
+            {
+               ass_add_text_event(track, start_ms, end_ms, text);
+               added = true;
+            }
+
+            if (added)
+            {
+               any = true;
+               if (first_start_ms < 0)
+                  first_start_ms = start_ms;
+            }
          }
 
          free(text);
@@ -3616,6 +3893,7 @@ static void maybe_load_external_subtitles(const char *media_path)
       size_t buf_size = 0;
       char *buf = NULL;
       ASS_Track *track = NULL;
+      AVCodecContext *converter = NULL;
       bool is_ass = false;
       bool any_events = false;
       int64_t first_start_ms = -1;
@@ -3657,18 +3935,32 @@ static void maybe_load_external_subtitles(const char *media_path)
       }
       else
       {
-         ass_init_default_track(track);
-         any_events = srt_add_events_from_buffer(track, buf, buf_size, &first_start_ms);
+#ifdef AV_CODEC_ID_SUBRIP
+         converter = open_text_subtitle_converter(AV_CODEC_ID_SUBRIP);
+#endif
+         if (converter)
+            subtitle_store_codec_private(slot, converter, true);
+
+         ass_init_subtitle_track(track, slot);
+         any_events = srt_add_events_from_buffer(track, buf, buf_size,
+               &first_start_ms, converter);
          if (!any_events)
          {
             ass_free_track(track);
+            av_freep(&ass_extra_data[slot]);
+            ass_extra_data_size[slot] = 0;
+            subtitle_uses_native_text_header[slot] = false;
+            avcodec_free_context(&converter);
             free(buf);
             continue;
          }
       }
 
-      if (!is_ass)
-         ass_scale_track_styles(track, subtitle_font_scale);
+#ifdef LIBASS_VERSION
+#if LIBASS_VERSION >= 0x01302000
+      ass_set_check_readorder(track, 1);
+#endif
+#endif
 
       sctx[slot] = NULL;
       ass_track[slot] = track;
@@ -3683,6 +3975,7 @@ static void maybe_load_external_subtitles(const char *media_path)
       log_cb(RETRO_LOG_INFO, "[APLAYER] Loaded external subtitles: %s (%s)\n",
             sub_path, is_ass ? "ass" : "text");
 
+      avcodec_free_context(&converter);
       free(buf);
       break;
    }
@@ -4392,6 +4685,7 @@ static void decode_thread(void *data)
             int64_t base_time_ms = 0;
             int64_t start_ms = 0;
             int64_t end_ms = 0;
+            int64_t duration_ms = 0;
 
             memset(&sub, 0, sizeof(sub));
 
@@ -4410,8 +4704,23 @@ static void decode_thread(void *data)
             else if (sub.pts != AV_NOPTS_VALUE)
                base_time_ms = sub.pts / 1000;
 
-            start_ms = base_time_ms + sub.start_display_time;
-            end_ms = base_time_ms + sub.end_display_time;
+            start_ms = base_time_ms + (int64_t)sub.start_display_time;
+            if (sub.end_display_time != UINT32_MAX &&
+                  sub.end_display_time > sub.start_display_time)
+               duration_ms = (int64_t)sub.end_display_time - (int64_t)sub.start_display_time;
+
+            if (duration_ms <= 0 && pkt_local->duration > 0)
+            {
+               double packet_duration_ms = pkt_local->duration *
+                     av_q2d(fctx->streams[pkt_local->stream_index]->time_base) * 1000.0;
+               if (packet_duration_ms > 0.0)
+                  duration_ms = (int64_t)(packet_duration_ms + 0.5);
+            }
+
+            if (duration_ms <= 0)
+               duration_ms = SUBTITLE_UNKNOWN_DURATION_MS;
+
+            end_ms = start_ms + duration_ms;
 
             for (i = 0; i < sub.num_rects; i++)
             {
@@ -4460,14 +4769,11 @@ static void decode_thread(void *data)
                   else
                   {
                      const char *raw_text = sub.rects[i]->text;
-                     const char *ass_payload = NULL;
-
-                     if (!raw_text && sub.rects[i]->ass)
-                        ass_payload = ass_event_payload(sub.rects[i]->ass);
+                     const char *ass_payload = sub.rects[i]->ass;
 
                      if (!first_subtitle_event_logged)
                      {
-                        const char *payload = raw_text ? raw_text : ass_payload;
+                        const char *payload = ass_payload ? ass_payload : raw_text;
                         if (first_subtitle_start_ms[subtitle_slot] < 0)
                            first_subtitle_start_ms[subtitle_slot] = start_ms;
                         log_cb(RETRO_LOG_INFO,
@@ -4478,12 +4784,18 @@ static void decode_thread(void *data)
                         first_subtitle_event_logged = true;
                      }
 
-                     if (raw_text)
+                     if (ass_payload)
+                        ass_add_embedded_event(ass_track_sub, start_ms, end_ms, ass_payload);
+                     else if (raw_text)
                         ass_add_text_event(ass_track_sub, start_ms, end_ms, raw_text);
-                     else if (ass_payload)
-                        ass_add_text_event_raw(ass_track_sub, start_ms, end_ms, ass_payload);
                   }
                }
+               slock_unlock(ass_lock);
+            }
+            if (ass_track_sub && !subtitle_is_ass[subtitle_slot])
+            {
+               slock_lock(ass_lock);
+               ass_backfill_unknown_event_durations(ass_track_sub);
                slock_unlock(ass_lock);
             }
             avsubtitle_free(&sub);
@@ -4698,6 +5010,7 @@ void retro_unload_game(void)
       if (ass_track[i])
          ass_free_track(ass_track[i]);
       ass_track[i] = NULL;
+      subtitle_uses_native_text_header[i] = false;
 
       av_freep(&ass_extra_data[i]);
       ass_extra_data_size[i] = 0;
