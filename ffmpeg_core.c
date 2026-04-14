@@ -260,6 +260,8 @@ static tpool_t *tpool;
 #define SUBTITLE_STREAM_DISABLED (-1)
 #define SUBTITLE_UNKNOWN_DURATION_MS (((INT_MAX / 1000) * 1000))
 #define SUBTITLE_FIX_TIMING_THRESHOLD_MS 210
+#define BITMAP_SUBTITLE_MAX_EVENTS 64
+#define BITMAP_SUBTITLE_TRAILING_LIMIT_MS (60 * 1000)
 static AVCodecContext *actx[MAX_STREAMS];
 static AVCodecContext *sctx[MAX_STREAMS];
 static int audio_streams[MAX_STREAMS];
@@ -269,6 +271,7 @@ static int subtitle_streams[MAX_STREAMS];
 static int subtitle_streams_num;
 static int subtitle_streams_ptr;
 static bool subtitle_is_ass[MAX_STREAMS];
+static bool subtitle_is_bitmap[MAX_STREAMS];
 static bool subtitle_is_external[MAX_STREAMS];
 static bool subtitle_uses_native_text_header[MAX_STREAMS];
 
@@ -284,6 +287,30 @@ static bool first_ass_render_logged;
 static bool first_ass_image_logged[MAX_STREAMS];
 static bool first_ass_after_sub_logged[MAX_STREAMS];
 static int64_t first_subtitle_start_ms[MAX_STREAMS];
+
+struct bitmap_subtitle_rect
+{
+   int x;
+   int y;
+   int w;
+   int h;
+   uint32_t *pixels;
+};
+
+struct bitmap_subtitle_event
+{
+   int64_t start_ms;
+   int64_t end_ms;
+   bool end_known;
+   int canvas_w;
+   int canvas_h;
+   unsigned rect_count;
+   struct bitmap_subtitle_rect *rects;
+};
+
+static struct bitmap_subtitle_event *bitmap_subtitle_events[MAX_STREAMS];
+static size_t bitmap_subtitle_event_count[MAX_STREAMS];
+static size_t bitmap_subtitle_event_cap[MAX_STREAMS];
 
 static struct attachment *attachments;
 static size_t attachments_size;
@@ -1343,7 +1370,161 @@ static void print_ffmpeg_version()
 
 static bool subtitle_track_is_text(unsigned slot)
 {
-   return slot < MAX_STREAMS && !subtitle_is_ass[slot];
+   return slot < MAX_STREAMS &&
+         !subtitle_is_ass[slot] &&
+         !subtitle_is_bitmap[slot];
+}
+
+static bool subtitle_track_is_bitmap(unsigned slot)
+{
+   return slot < MAX_STREAMS && subtitle_is_bitmap[slot];
+}
+
+static void bitmap_subtitle_clear_event(struct bitmap_subtitle_event *event)
+{
+   unsigned i = 0;
+
+   if (!event)
+      return;
+
+   for (i = 0; i < event->rect_count; i++)
+      free(event->rects[i].pixels);
+   free(event->rects);
+
+   memset(event, 0, sizeof(*event));
+}
+
+static void bitmap_subtitle_clear_slot(unsigned slot)
+{
+   size_t i = 0;
+
+   if (slot >= MAX_STREAMS)
+      return;
+
+   for (i = 0; i < bitmap_subtitle_event_count[slot]; i++)
+      bitmap_subtitle_clear_event(&bitmap_subtitle_events[slot][i]);
+
+   free(bitmap_subtitle_events[slot]);
+   bitmap_subtitle_events[slot] = NULL;
+   bitmap_subtitle_event_count[slot] = 0;
+   bitmap_subtitle_event_cap[slot] = 0;
+}
+
+static void bitmap_subtitle_prune_locked(unsigned slot, int64_t now_ms)
+{
+   size_t remove_count = 0;
+
+   if (slot >= MAX_STREAMS)
+      return;
+
+   while (remove_count < bitmap_subtitle_event_count[slot])
+   {
+      struct bitmap_subtitle_event *event = &bitmap_subtitle_events[slot][remove_count];
+      bool expired = false;
+
+      if (event->end_known)
+         expired = event->end_ms < now_ms;
+      else
+         expired = now_ms >= event->start_ms + BITMAP_SUBTITLE_TRAILING_LIMIT_MS;
+
+      if (!expired)
+         break;
+
+      bitmap_subtitle_clear_event(event);
+      remove_count++;
+   }
+
+   if (remove_count == 0)
+      return;
+
+   if (remove_count < bitmap_subtitle_event_count[slot])
+   {
+      memmove(bitmap_subtitle_events[slot],
+            bitmap_subtitle_events[slot] + remove_count,
+            (bitmap_subtitle_event_count[slot] - remove_count) *
+            sizeof(bitmap_subtitle_events[slot][0]));
+   }
+
+   bitmap_subtitle_event_count[slot] -= remove_count;
+}
+
+static void bitmap_subtitle_end_previous_locked(unsigned slot, int64_t end_ms)
+{
+   struct bitmap_subtitle_event *prev = NULL;
+
+   if (slot >= MAX_STREAMS || bitmap_subtitle_event_count[slot] == 0)
+      return;
+
+   prev = &bitmap_subtitle_events[slot][bitmap_subtitle_event_count[slot] - 1];
+   if (!prev->end_known || prev->end_ms > end_ms)
+   {
+      prev->end_ms = end_ms;
+      prev->end_known = true;
+   }
+}
+
+static bool bitmap_subtitle_append_locked(unsigned slot,
+      const struct bitmap_subtitle_event *event)
+{
+   struct bitmap_subtitle_event *events = NULL;
+   size_t new_cap = 0;
+
+   if (slot >= MAX_STREAMS || !event)
+      return false;
+
+   if (bitmap_subtitle_event_count[slot] >= bitmap_subtitle_event_cap[slot])
+   {
+      new_cap = bitmap_subtitle_event_cap[slot] ? bitmap_subtitle_event_cap[slot] * 2 : 8;
+      events = (struct bitmap_subtitle_event*)realloc(bitmap_subtitle_events[slot],
+            new_cap * sizeof(*events));
+      if (!events)
+         return false;
+
+      bitmap_subtitle_events[slot] = events;
+      bitmap_subtitle_event_cap[slot] = new_cap;
+   }
+
+   bitmap_subtitle_events[slot][bitmap_subtitle_event_count[slot]++] = *event;
+
+   if (bitmap_subtitle_event_count[slot] > BITMAP_SUBTITLE_MAX_EVENTS)
+   {
+      bitmap_subtitle_clear_event(&bitmap_subtitle_events[slot][0]);
+      memmove(bitmap_subtitle_events[slot],
+            bitmap_subtitle_events[slot] + 1,
+            (bitmap_subtitle_event_count[slot] - 1) *
+            sizeof(bitmap_subtitle_events[slot][0]));
+      bitmap_subtitle_event_count[slot]--;
+   }
+
+   return true;
+}
+
+static struct bitmap_subtitle_event *bitmap_subtitle_current_locked(unsigned slot,
+      int64_t now_ms)
+{
+   size_t i = 0;
+
+   if (slot >= MAX_STREAMS)
+      return NULL;
+
+   for (i = bitmap_subtitle_event_count[slot]; i > 0; i--)
+   {
+      struct bitmap_subtitle_event *event = &bitmap_subtitle_events[slot][i - 1];
+      bool active = false;
+
+      if (now_ms < event->start_ms)
+         continue;
+
+      if (event->end_known)
+         active = now_ms < event->end_ms;
+      else
+         active = now_ms < event->start_ms + BITMAP_SUBTITLE_TRAILING_LIMIT_MS;
+
+      if (active)
+         return event;
+   }
+
+   return NULL;
 }
 
 static double subtitle_scale_for_playres(double value, int play_res_y)
@@ -1799,7 +1980,7 @@ static long long subtitle_adjust_render_time_ms(ASS_Track *track,
    int count = 0;
 
    if (!track || subtitle_ptr < 0 || subtitle_ptr >= MAX_STREAMS ||
-         subtitle_is_ass[subtitle_ptr])
+         !subtitle_track_is_text((unsigned)subtitle_ptr))
       return now_ms;
 
    for (int i = 0; i < track->n_events; i++)
@@ -2579,18 +2760,10 @@ static bool codec_id_is_text_subtitle(enum AVCodecID id)
 #endif
    switch (id)
    {
-#ifdef AV_CODEC_ID_SUBRIP
       case AV_CODEC_ID_SUBRIP:
-#endif
-#ifdef AV_CODEC_ID_TEXT
       case AV_CODEC_ID_TEXT:
-#endif
-#ifdef AV_CODEC_ID_WEBVTT
       case AV_CODEC_ID_WEBVTT:
-#endif
-#ifdef AV_CODEC_ID_MOV_TEXT
       case AV_CODEC_ID_MOV_TEXT:
-#endif
          return true;
       default:
          break;
@@ -2612,6 +2785,22 @@ static bool codec_name_is_text_subtitle(enum AVCodecID id)
          strcmp(name, "mov_text") == 0 ||
          strcmp(name, "text") == 0)
       return true;
+
+   return false;
+}
+
+static bool codec_id_is_bitmap_subtitle(enum AVCodecID id)
+{
+   switch (id)
+   {
+      case AV_CODEC_ID_DVD_SUBTITLE:
+      case AV_CODEC_ID_DVB_SUBTITLE:
+      case AV_CODEC_ID_HDMV_PGS_SUBTITLE:
+      case AV_CODEC_ID_XSUB:
+         return true;
+      default:
+         break;
+   }
 
    return false;
 }
@@ -2833,6 +3022,7 @@ static bool open_codecs(void)
    memset(audio_streams,    0, sizeof(audio_streams));
    memset(subtitle_streams, 0, sizeof(subtitle_streams));
    memset(subtitle_is_ass,  0, sizeof(subtitle_is_ass));
+   memset(subtitle_is_bitmap, 0, sizeof(subtitle_is_bitmap));
    memset(subtitle_is_external, 0, sizeof(subtitle_is_external));
    memset(subtitle_uses_native_text_header, 0, sizeof(subtitle_uses_native_text_header));
    first_subtitle_event_logged = false;
@@ -2876,11 +3066,12 @@ static bool open_codecs(void)
                bool is_ass = codec_id_is_ass(sub_id);
                bool is_text = codec_id_is_text_subtitle(sub_id) ||
                      codec_name_is_text_subtitle(sub_id);
+               bool is_bitmap = codec_id_is_bitmap_subtitle(sub_id);
 
                log_cb(RETRO_LOG_INFO, "[APLAYER] Found subtitle stream %u: %s\n",
                      i, codec_name ? codec_name : "unknown");
 
-               if (!is_ass && !is_text)
+               if (!is_ass && !is_text && !is_bitmap)
                {
                   log_cb(RETRO_LOG_WARN, "[APLAYER] Subtitle codec not supported: %s\n",
                         codec_name ? codec_name : "unknown");
@@ -2889,15 +3080,17 @@ static bool open_codecs(void)
 
                subtitle_streams[slot] = i;
                subtitle_is_ass[slot] = is_ass;
+               subtitle_is_bitmap[slot] = is_bitmap;
                if (!open_subtitle_codec(s, i, is_text))
                   return false;
 
-               subtitle_store_codec_private(slot, *s, is_text);
+               if (!is_bitmap)
+                  subtitle_store_codec_private(slot, *s, is_text);
 
                subtitle_streams_num++;
                log_cb(RETRO_LOG_INFO, "[APLAYER] Subtitle stream %u registered: %s (%s)\n",
                      i, codec_name ? codec_name : "unknown",
-                     is_ass ? "ass" : "text");
+                     is_ass ? "ass" : (is_bitmap ? "bitmap" : "text"));
             }
             break;
 
@@ -3009,6 +3202,19 @@ static bool init_media_info(void)
    if (sctx[0])
    {
       unsigned i;
+      bool need_ass_context = false;
+
+      for (i = 0; i < (unsigned)subtitle_streams_num; i++)
+      {
+         if (!subtitle_track_is_bitmap(i))
+         {
+            need_ass_context = true;
+            break;
+         }
+      }
+
+      if (!need_ass_context)
+         return true;
 
       ass = ass_library_init();
       ass_set_message_cb(ass, ass_msg_cb, NULL);
@@ -3026,6 +3232,9 @@ static bool init_media_info(void)
 
       for (i = 0; i < (unsigned)subtitle_streams_num; i++)
       {
+         if (subtitle_track_is_bitmap(i))
+            continue;
+
          ass_track[i] = ass_new_track(ass);
          if (ass_track[i])
             ass_init_subtitle_track(ass_track[i], i);
@@ -3116,17 +3325,154 @@ static void render_ass_img(AVFrame *conv_frame, ASS_Image *img)
    }
 }
 
+static int bitmap_subtitle_scale_coord(int value, int src_size, int dst_size)
+{
+   if (src_size <= 0)
+      return value;
+
+   return (int)(((int64_t)value * dst_size + src_size / 2) / src_size);
+}
+
+static void blend_bitmap_subtitle_pixel(uint32_t *dst, uint32_t src)
+{
+   unsigned src_a = (src >> 24) & 0xff;
+   unsigned src_r = (src >> 16) & 0xff;
+   unsigned src_g = (src >>  8) & 0xff;
+   unsigned src_b = (src >>  0) & 0xff;
+   unsigned inv_a = 255 - src_a;
+   uint32_t dst_color = *dst;
+   unsigned dst_r = (dst_color >> 16) & 0xff;
+   unsigned dst_g = (dst_color >>  8) & 0xff;
+   unsigned dst_b = (dst_color >>  0) & 0xff;
+
+   if (src_a == 0)
+      return;
+
+   if (src_a == 255)
+   {
+      *dst = src;
+      return;
+   }
+
+   dst_r = src_r + ((dst_r * inv_a + 127) / 255);
+   dst_g = src_g + ((dst_g * inv_a + 127) / 255);
+   dst_b = src_b + ((dst_b * inv_a + 127) / 255);
+
+   *dst = (0xffu << 24) | (dst_r << 16) | (dst_g << 8) | dst_b;
+}
+
+static void render_bitmap_subtitle_event(uint32_t *buffer, unsigned width,
+      unsigned height, const struct bitmap_subtitle_event *event)
+{
+   unsigned rect_index = 0;
+   int canvas_w = 0;
+   int canvas_h = 0;
+
+   if (!buffer || width == 0 || height == 0 || !event)
+      return;
+
+   canvas_w = event->canvas_w > 0 ? event->canvas_w : (int)width;
+   canvas_h = event->canvas_h > 0 ? event->canvas_h : (int)height;
+
+   for (rect_index = 0; rect_index < event->rect_count; rect_index++)
+   {
+      const struct bitmap_subtitle_rect *rect = &event->rects[rect_index];
+      int full_x0 = 0;
+      int full_y0 = 0;
+      int full_x1 = 0;
+      int full_y1 = 0;
+      int dst_x0 = 0;
+      int dst_y0 = 0;
+      int dst_x1 = 0;
+      int dst_y1 = 0;
+      int dst_w = 0;
+      int dst_h = 0;
+      int full_w = 0;
+      int full_h = 0;
+      int src_y = 0;
+
+      if (!rect->pixels || rect->w <= 0 || rect->h <= 0)
+         continue;
+
+      full_x0 = bitmap_subtitle_scale_coord(rect->x, canvas_w, (int)width);
+      full_y0 = bitmap_subtitle_scale_coord(rect->y, canvas_h, (int)height);
+      full_x1 = bitmap_subtitle_scale_coord(rect->x + rect->w, canvas_w, (int)width);
+      full_y1 = bitmap_subtitle_scale_coord(rect->y + rect->h, canvas_h, (int)height);
+
+      dst_x0 = full_x0;
+      dst_y0 = full_y0;
+      dst_x1 = full_x1;
+      dst_y1 = full_y1;
+
+      if (dst_x1 <= dst_x0)
+         dst_x1 = dst_x0 + 1;
+      if (dst_y1 <= dst_y0)
+         dst_y1 = dst_y0 + 1;
+
+      full_w = full_x1 - full_x0;
+      full_h = full_y1 - full_y0;
+      if (full_w <= 0)
+         full_w = 1;
+      if (full_h <= 0)
+         full_h = 1;
+
+      if (dst_x0 >= (int)width || dst_y0 >= (int)height || dst_x1 <= 0 || dst_y1 <= 0)
+         continue;
+
+      if (dst_x0 < 0)
+         dst_x0 = 0;
+      if (dst_y0 < 0)
+         dst_y0 = 0;
+      if (dst_x1 > (int)width)
+         dst_x1 = (int)width;
+      if (dst_y1 > (int)height)
+         dst_y1 = (int)height;
+
+      dst_w = dst_x1 - dst_x0;
+      dst_h = dst_y1 - dst_y0;
+      if (dst_w <= 0 || dst_h <= 0)
+         continue;
+
+      for (int dy = 0; dy < dst_h; dy++)
+      {
+         uint32_t *dst_row = buffer + (dst_y0 + dy) * width + dst_x0;
+         int full_dy = (dst_y0 - full_y0) + dy;
+         src_y = ((int64_t)full_dy * rect->h) / full_h;
+         if (src_y >= rect->h)
+            src_y = rect->h - 1;
+         if (src_y < 0)
+            src_y = 0;
+
+         for (int dx = 0; dx < dst_w; dx++)
+         {
+            int full_dx = (dst_x0 - full_x0) + dx;
+            int src_x = ((int64_t)full_dx * rect->w) / full_w;
+            uint32_t src = 0;
+
+            if (src_x >= rect->w)
+               src_x = rect->w - 1;
+            if (src_x < 0)
+               src_x = 0;
+
+            src = rect->pixels[src_y * rect->w + src_x];
+            blend_bitmap_subtitle_pixel(&dst_row[dx], src);
+         }
+      }
+   }
+}
+
 static void render_subtitles_on_buffer(uint32_t *buffer, unsigned width,
       unsigned height, double time_sec)
 {
    ASS_Track *render_track = NULL;
+   struct bitmap_subtitle_event *bitmap_event = NULL;
    int subtitle_ptr = -1;
    int64_t track_start_ms = -1;
 
    if (!buffer || width == 0 || height == 0)
       return;
 
-   if (!ass_render || subtitle_streams_num <= 0)
+   if (subtitle_streams_num <= 0)
       return;
 
    if (decode_thread_lock)
@@ -3140,7 +3486,7 @@ static void render_subtitles_on_buffer(uint32_t *buffer, unsigned width,
       slock_unlock(decode_thread_lock);
    }
 
-   if (!render_track)
+   if (subtitle_ptr < 0 || subtitle_ptr >= MAX_STREAMS)
       return;
 
    if (subtitle_ptr >= 0 && subtitle_ptr < MAX_STREAMS)
@@ -3152,7 +3498,16 @@ static void render_subtitles_on_buffer(uint32_t *buffer, unsigned width,
    tmp_frame.linesize[0] = (int)width * (int)sizeof(uint32_t);
 
    slock_lock(ass_lock);
-   if (ass_render)
+   if (subtitle_track_is_bitmap((unsigned)subtitle_ptr))
+   {
+      long long now_ms = subtitle_adjust_render_time_ms(render_track,
+            subtitle_ptr, (long long)(time_sec * 1000.0));
+      bitmap_subtitle_prune_locked((unsigned)subtitle_ptr, now_ms);
+      bitmap_event = bitmap_subtitle_current_locked((unsigned)subtitle_ptr, now_ms);
+      if (bitmap_event)
+         render_bitmap_subtitle_event(buffer, width, height, bitmap_event);
+   }
+   else if (render_track && ass_render)
    {
       int change = 0;
       long long now_ms = subtitle_adjust_render_time_ms(render_track,
@@ -3190,6 +3545,116 @@ static void render_subtitles_on_buffer(uint32_t *buffer, unsigned width,
          render_ass_img(&tmp_frame, img);
    }
    slock_unlock(ass_lock);
+}
+
+static void bitmap_subtitle_convert_palette(uint32_t *colors, size_t count)
+{
+   size_t i = 0;
+
+   if (!colors)
+      return;
+
+   for (i = 0; i < count; i++)
+   {
+      uint32_t c = colors[i];
+      uint32_t b = c & 0xff;
+      uint32_t g = (c >> 8) & 0xff;
+      uint32_t r = (c >> 16) & 0xff;
+      uint32_t a = (c >> 24) & 0xff;
+
+      b = b * a / 255;
+      g = g * a / 255;
+      r = r * a / 255;
+
+      colors[i] = b | (g << 8) | (r << 16) | (a << 24);
+   }
+}
+
+static bool bitmap_subtitle_build_event(AVCodecContext *ctx, const AVSubtitle *sub,
+      int64_t start_ms, int64_t end_ms, bool end_known,
+      struct bitmap_subtitle_event *event)
+{
+   int canvas_w = 0;
+   int canvas_h = 0;
+   unsigned rect_count = 0;
+
+   if (!sub || !event || sub->num_rects <= 0)
+      return false;
+
+   memset(event, 0, sizeof(*event));
+   event->start_ms = start_ms;
+   event->end_ms = end_ms;
+   event->end_known = end_known;
+
+   if (ctx)
+   {
+      canvas_w = ctx->width;
+      canvas_h = ctx->height;
+   }
+
+   event->rects = (struct bitmap_subtitle_rect*)calloc((size_t)sub->num_rects,
+         sizeof(*event->rects));
+   if (!event->rects)
+      return false;
+
+   for (int i = 0; i < sub->num_rects; i++)
+   {
+      const AVSubtitleRect *rect = sub->rects[i];
+      struct bitmap_subtitle_rect *dst = NULL;
+      uint32_t palette[256] = {0};
+      uint32_t *pixels = NULL;
+      int palette_size = 0;
+
+      if (!rect || rect->type != SUBTITLE_BITMAP ||
+            rect->w <= 0 || rect->h <= 0 ||
+            !rect->data[0] || !rect->data[1] || rect->linesize[0] <= 0)
+      {
+         continue;
+      }
+
+      palette_size = rect->nb_colors;
+      if (palette_size <= 0 || palette_size > 256)
+         continue;
+
+      pixels = (uint32_t*)malloc((size_t)rect->w * (size_t)rect->h * sizeof(*pixels));
+      if (!pixels)
+         continue;
+
+      memcpy(palette, rect->data[1], (size_t)palette_size * sizeof(palette[0]));
+      bitmap_subtitle_convert_palette(palette, 256);
+
+      for (int y = 0; y < rect->h; y++)
+      {
+         const uint8_t *src_row = rect->data[0] + y * rect->linesize[0];
+         uint32_t *dst_row = pixels + (size_t)y * (size_t)rect->w;
+
+         for (int x = 0; x < rect->w; x++)
+            dst_row[x] = palette[src_row[x]];
+      }
+
+      dst = &event->rects[rect_count++];
+      dst->x = rect->x;
+      dst->y = rect->y;
+      dst->w = rect->w;
+      dst->h = rect->h;
+      dst->pixels = pixels;
+
+      if (dst->x + dst->w > canvas_w)
+         canvas_w = dst->x + dst->w;
+      if (dst->y + dst->h > canvas_h)
+         canvas_h = dst->y + dst->h;
+   }
+
+   if (rect_count == 0)
+   {
+      bitmap_subtitle_clear_event(event);
+      return false;
+   }
+
+   event->rect_count = rect_count;
+   event->canvas_w = canvas_w > 0 ? canvas_w : media.width;
+   event->canvas_h = canvas_h > 0 ? canvas_h : media.height;
+   return true;
 }
 
 static char *ass_escape_text(const char *text)
@@ -3925,6 +4390,7 @@ static void maybe_load_external_subtitles(const char *media_path)
       ass_track[slot] = track;
       subtitle_streams[slot] = -1;
       subtitle_is_ass[slot] = is_ass;
+      subtitle_is_bitmap[slot] = false;
       subtitle_is_external[slot] = true;
       first_subtitle_start_ms[slot] = first_start_ms;
       subtitle_streams_num++;
@@ -4209,6 +4675,8 @@ static void decode_thread_seek(double time)
          avcodec_flush_buffers(sctx[i]);
       if (ass_track[i] && !subtitle_is_external[i])
          ass_flush_events(ass_track[i]);
+      if (subtitle_track_is_bitmap((unsigned)i))
+         bitmap_subtitle_clear_slot((unsigned)i);
    }
 }
 
@@ -4636,16 +5104,15 @@ static void decode_thread(void *data)
                continue;
             }
 
-            /**
-             * Decode subtitle packets right away for ASS/SSA and text subtitles.
-             * Bitmap subtitles would need buffering and blending.
-             **/
+            /* Decode subtitle packets immediately. Text/ASS are appended to
+             * libass tracks; bitmap subtitles are queued for later blending. */
             AVSubtitle sub;
             int finished = 0;
             int64_t base_time_ms = 0;
             int64_t start_ms = 0;
             int64_t end_ms = 0;
             int64_t duration_ms = 0;
+            bool end_known = false;
 
             memset(&sub, 0, sizeof(sub));
 
@@ -4667,14 +5134,65 @@ static void decode_thread(void *data)
             start_ms = base_time_ms + (int64_t)sub.start_display_time;
             if (sub.end_display_time != UINT32_MAX &&
                   sub.end_display_time > sub.start_display_time)
+            {
                duration_ms = (int64_t)sub.end_display_time - (int64_t)sub.start_display_time;
+               end_known = true;
+            }
 
             if (duration_ms <= 0 && pkt_local->duration > 0)
             {
                double packet_duration_ms = pkt_local->duration *
                      av_q2d(fctx->streams[pkt_local->stream_index]->time_base) * 1000.0;
                if (packet_duration_ms > 0.0)
+               {
                   duration_ms = (int64_t)(packet_duration_ms + 0.5);
+                  end_known = true;
+               }
+            }
+
+            if (end_known)
+               end_ms = start_ms + duration_ms;
+            else
+               end_ms = start_ms;
+
+            if (subtitle_track_is_bitmap((unsigned)subtitle_slot))
+            {
+               slock_lock(ass_lock);
+               bitmap_subtitle_end_previous_locked((unsigned)subtitle_slot, start_ms);
+
+               if (sub.num_rects > 0)
+               {
+                  struct bitmap_subtitle_event bitmap_event;
+
+                  if (bitmap_subtitle_build_event(sctx_sub, &sub, start_ms, end_ms,
+                           end_known, &bitmap_event))
+                  {
+                     if (!first_subtitle_event_logged)
+                     {
+                        if (first_subtitle_start_ms[subtitle_slot] < 0)
+                           first_subtitle_start_ms[subtitle_slot] = start_ms;
+                        log_cb(RETRO_LOG_INFO,
+                              "[APLAYER] First subtitle event (bitmap): stream=%d slot=%d start_ms=%lld end_ms=%s%lld rects=%u\n",
+                              pkt_local->stream_index, subtitle_slot,
+                              (long long)start_ms,
+                              end_known ? "" : "unknown/",
+                              (long long)end_ms,
+                              bitmap_event.rect_count);
+                        first_subtitle_event_logged = true;
+                     }
+
+                     if (!bitmap_subtitle_append_locked((unsigned)subtitle_slot,
+                              &bitmap_event))
+                     {
+                        bitmap_subtitle_clear_event(&bitmap_event);
+                     }
+                  }
+               }
+
+               slock_unlock(ass_lock);
+               avsubtitle_free(&sub);
+               av_packet_unref(pkt_local);
+               continue;
             }
 
             if (duration_ms <= 0)
@@ -4970,7 +5488,10 @@ void retro_unload_game(void)
       if (ass_track[i])
          ass_free_track(ass_track[i]);
       ass_track[i] = NULL;
+      subtitle_is_bitmap[i] = false;
       subtitle_uses_native_text_header[i] = false;
+
+      bitmap_subtitle_clear_slot(i);
 
       av_freep(&ass_extra_data[i]);
       ass_extra_data_size[i] = 0;
