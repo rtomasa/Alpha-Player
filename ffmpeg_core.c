@@ -119,14 +119,6 @@ static const struct retro_controller_description aplayer_controller_types[] =
 
 static struct retro_controller_info aplayer_controller_info[APLAYER_MAX_PORTS + 1];
 
-enum video_view_mode
-{
-   VIDEO_VIEW_MODE_AUTO = 0,
-   VIDEO_VIEW_MODE_ZOOM,
-   VIDEO_VIEW_MODE_STRETCH_4_3,
-   VIDEO_VIEW_MODE_STRETCH_16_9
-};
-
 static void fallback_log(enum retro_log_level level, const char *fmt, ...)
 {
     (void)level;
@@ -344,7 +336,6 @@ static volatile bool audio_switch_requested = false;
 static bool seek_supported = true;
 static bool time_supported = true;
 static bool gme_seek_disabled = false;
-static enum video_view_mode video_view_mode = VIDEO_VIEW_MODE_AUTO;
 static float video_blend_strength = 1.0f;
 static unsigned video_crop_left = 0;
 static unsigned video_crop_top = 0;
@@ -493,27 +484,9 @@ static float get_video_native_aspect(void)
    return 4.0f / 3.0f;
 }
 
-static float get_video_zoom_target_aspect(void)
-{
-   return is_crt ? (4.0f / 3.0f) : (16.0f / 9.0f);
-}
-
 static float get_video_output_aspect(void)
 {
-   float native_aspect = get_video_native_aspect();
-
-   switch (video_view_mode)
-   {
-      case VIDEO_VIEW_MODE_ZOOM:
-         return get_video_zoom_target_aspect();
-      case VIDEO_VIEW_MODE_STRETCH_4_3:
-         return 4.0f / 3.0f;
-      case VIDEO_VIEW_MODE_STRETCH_16_9:
-         return 16.0f / 9.0f;
-      case VIDEO_VIEW_MODE_AUTO:
-      default:
-         return native_aspect;
-   }
+   return get_video_native_aspect();
 }
 
 static void get_video_texture_window(float *u_min, float *u_max,
@@ -527,9 +500,6 @@ static void get_video_texture_window(float *u_min, float *u_max,
    float visible_height;
    float base_width;
    float base_height;
-   float source_aspect  = get_video_native_aspect();
-   float zoom           = 1.0f;
-
    if (media.width > 0)
    {
       unsigned crop_left = video_crop_left;
@@ -563,25 +533,6 @@ static void get_video_texture_window(float *u_min, float *u_max,
 
    visible_width = base_width;
    visible_height = base_height;
-
-   if (video_view_mode == VIDEO_VIEW_MODE_ZOOM)
-   {
-      float target_aspect = get_video_output_aspect();
-
-      if (source_aspect > 0.0f && target_aspect > 0.0f)
-      {
-         if (source_aspect > target_aspect)
-            visible_width = base_width * (target_aspect / source_aspect);
-         else if (source_aspect < target_aspect)
-            visible_height = base_height * (source_aspect / target_aspect);
-      }
-   }
-
-   if (zoom > 1.0f)
-   {
-      visible_width  /= zoom;
-      visible_height /= zoom;
-   }
 
    if (visible_width < 0.0f)
       visible_width = 0.0f;
@@ -1261,17 +1212,6 @@ void retro_set_environment(retro_environment_t cb)
          }, "auto"
       },
       {
-         "aplayer_video_view_mode", "View Mode", "Controls how the video is fitted or stretched.",
-         NULL, NULL, "video",
-         {
-            {"auto", "Auto"},
-            {"zoom", "Zoom"},
-            {"stretch_4_3", "Stretch 4:3"},
-            {"stretch_16_9", "Stretch 16:9"},
-            {NULL, NULL}
-         }, "auto"
-      },
-      {
          "aplayer_video_blending", "Frame Blending", "Crossfades adjacent frames to smooth motion when content and display refresh do not match.",
          NULL, NULL, "video",
          {
@@ -1632,7 +1572,6 @@ static void check_variables(bool firststart)
    struct retro_variable auto_resume_var = {0};
    struct retro_variable replay_is_crt = {0};
    struct retro_variable fft_toggle_var = {0};
-   struct retro_variable video_view_mode_var = {0};
    struct retro_variable video_blending_var = {0};
 
    fft_width  = 640;
@@ -1647,19 +1586,6 @@ static void check_variables(bool firststart)
    }
 
    subtitle_font_name = "sans-serif";
-
-   video_view_mode = VIDEO_VIEW_MODE_AUTO;
-   video_view_mode_var.key = "aplayer_video_view_mode";
-   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &video_view_mode_var) &&
-         video_view_mode_var.value)
-   {
-      if (string_is_equal(video_view_mode_var.value, "zoom"))
-         video_view_mode = VIDEO_VIEW_MODE_ZOOM;
-      else if (string_is_equal(video_view_mode_var.value, "stretch_4_3"))
-         video_view_mode = VIDEO_VIEW_MODE_STRETCH_4_3;
-      else if (string_is_equal(video_view_mode_var.value, "stretch_16_9"))
-         video_view_mode = VIDEO_VIEW_MODE_STRETCH_16_9;
-   }
 
    video_blend_strength = 1.0f;
    video_blending_var.key = "aplayer_video_blending";
