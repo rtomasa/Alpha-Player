@@ -57,6 +57,8 @@ This core has been modified focusing on Raspberry Pi devices using a development
 # Video Options
 
 * Frame Blending - Off, Low, Medium, High or Full
+* Zoom Mode - `Uniform`, `Fill 16:9`, `Fill 4:3`, `Fill 21:9`, `Fill 8:3`, `Fill 3:2`, `Fill 1:1`
+* In `Uniform` mode, it preserves the video’s aspect and just scales/crops uniformly
 * Zoom - `0.75x` to `1.35x` in `0.05x` increments
 
 # Subtitles
@@ -66,7 +68,7 @@ If a video has an external subtitle file with the same name and a `.srt` extensi
 # Changelog
 
 # v2.4.0
-- [X] Added new video `ZOOM` option
+- [X] Added new video `ZOOM MODE` and `ZOOM` options
 - [X] Added new `AUTO RESUME` option (when supported)
 - [X] Added new `PREFERRED LANGUAGE` option to select the prefferred audio track
 - [X] Added check for videos with no alternate audio tracks
