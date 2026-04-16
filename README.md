@@ -70,10 +70,10 @@ If a video has an external subtitle file with the same name and a `.srt` extensi
 # v2.4.0
 - [X] Added new video `ZOOM MODE` and `ZOOM` options
 - [X] Added new `AUTO RESUME` option (when supported)
+- [X] Added new `FRAME BLENDING` with configurable strength: Off, Low, Medium, High, Full
 - [X] Added new `PREFERRED LANGUAGE` option to select the prefferred audio track
 - [X] Added check for videos with no alternate audio tracks
 - [X] Added fallback to display the file name when no metadata exists
-- [X] Added frame blending with configurable strength: Off, Low, Medium, High, Full
 - [X] Added `DISABLED SUBTITLES` virtual track cycling state
 - [X] Added support for embedded VobSub/DVD subtitles
 - [X] Improved support for SSA subtitles
