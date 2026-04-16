@@ -337,6 +337,7 @@ static bool seek_supported = true;
 static bool time_supported = true;
 static bool gme_seek_disabled = false;
 static float video_blend_strength = 1.0f;
+static float video_zoom = 1.0f;
 static unsigned video_crop_left = 0;
 static unsigned video_crop_top = 0;
 static unsigned video_crop_right = 0;
@@ -484,9 +485,50 @@ static float get_video_native_aspect(void)
    return 4.0f / 3.0f;
 }
 
+static float get_video_zoom(void);
+
+static bool use_crt_fill_zoom(void)
+{
+   return is_crt && get_video_zoom() > 1.0f;
+}
+
 static float get_video_output_aspect(void)
 {
-   return get_video_native_aspect();
+   float aspect = get_video_native_aspect();
+
+   if (use_crt_fill_zoom())
+      aspect /= get_video_zoom();
+
+   return aspect;
+}
+
+static float clamp_video_zoom(float zoom)
+{
+   if (zoom < 0.75f)
+      return 0.75f;
+   if (zoom > 1.35f)
+      return 1.35f;
+   return zoom;
+}
+
+static float parse_video_zoom_value(const char *value)
+{
+   char *end = NULL;
+   float zoom;
+
+   if (!value || !*value)
+      return 1.0f;
+
+   zoom = strtof(value, &end);
+   if (end == value)
+      return 1.0f;
+
+   return clamp_video_zoom(zoom);
+}
+
+static float get_video_zoom(void)
+{
+   return clamp_video_zoom(video_zoom);
 }
 
 static void get_video_texture_window(float *u_min, float *u_max,
@@ -500,6 +542,7 @@ static void get_video_texture_window(float *u_min, float *u_max,
    float visible_height;
    float base_width;
    float base_height;
+   float zoom = get_video_zoom();
    if (media.width > 0)
    {
       unsigned crop_left = video_crop_left;
@@ -534,6 +577,9 @@ static void get_video_texture_window(float *u_min, float *u_max,
    visible_width = base_width;
    visible_height = base_height;
 
+   if (zoom > 1.0f && use_crt_fill_zoom())
+      visible_width /= zoom;
+
    if (visible_width < 0.0f)
       visible_width = 0.0f;
    else if (visible_width > base_width)
@@ -557,23 +603,27 @@ static void update_video_quad(void)
    float u_max;
    float v_min;
    float v_max;
+   float quad_scale = get_video_zoom();
+
+   if (use_crt_fill_zoom())
+      quad_scale = 1.0f;
 
    get_video_texture_window(&u_min, &u_max, &v_min, &v_max);
 
-   vertex_data[0]  = -1.0f;
-   vertex_data[1]  = -1.0f;
+   vertex_data[0]  = -quad_scale;
+   vertex_data[1]  = -quad_scale;
    vertex_data[2]  = u_min;
    vertex_data[3]  = v_min;
-   vertex_data[4]  = 1.0f;
-   vertex_data[5]  = -1.0f;
+   vertex_data[4]  = quad_scale;
+   vertex_data[5]  = -quad_scale;
    vertex_data[6]  = u_max;
    vertex_data[7]  = v_min;
-   vertex_data[8]  = -1.0f;
-   vertex_data[9]  = 1.0f;
+   vertex_data[8]  = -quad_scale;
+   vertex_data[9]  = quad_scale;
    vertex_data[10] = u_min;
    vertex_data[11] = v_max;
-   vertex_data[12] = 1.0f;
-   vertex_data[13] = 1.0f;
+   vertex_data[12] = quad_scale;
+   vertex_data[13] = quad_scale;
    vertex_data[14] = u_max;
    vertex_data[15] = v_max;
 
@@ -1213,6 +1263,26 @@ void retro_set_environment(retro_environment_t cb)
          }, "off"
       },
       {
+         "aplayer_video_zoom", "Zoom", "Scales the displayed video image from 0.75x to 1.35x.",
+         NULL, NULL, "video",
+         {
+            {"0.75", "0.75x"},
+            {"0.80", "0.80x"},
+            {"0.85", "0.85x"},
+            {"0.90", "0.90x"},
+            {"0.95", "0.95x"},
+            {"1.00", "1.00x"},
+            {"1.05", "1.05x"},
+            {"1.10", "1.10x"},
+            {"1.15", "1.15x"},
+            {"1.20", "1.20x"},
+            {"1.25", "1.25x"},
+            {"1.30", "1.30x"},
+            {"1.35", "1.35x"},
+            {NULL, NULL}
+         }, "1.00"
+      },
+      {
          "aplayer_visualizer", "Visualizer", NULL, NULL, NULL, "music",
          {
             {"enabled", "Enabled"},
@@ -1561,6 +1631,7 @@ static void check_variables(bool firststart)
    struct retro_variable replay_is_crt = {0};
    struct retro_variable fft_toggle_var = {0};
    struct retro_variable video_blending_var = {0};
+   struct retro_variable video_zoom_var = {0};
 
    fft_width  = 640;
    fft_height = 480;
@@ -1591,6 +1662,12 @@ static void check_variables(bool firststart)
       else
          video_blend_strength = 1.0f;
    }
+
+   video_zoom = 1.0f;
+   video_zoom_var.key = "aplayer_video_zoom";
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &video_zoom_var) &&
+         video_zoom_var.value)
+      video_zoom = parse_video_zoom_value(video_zoom_var.value);
 
    update_subtitle_font_settings();
    auto_resume_enabled = false;
@@ -2000,6 +2077,7 @@ void retro_run(void)
    unsigned old_fft_width       = fft_width;
    unsigned old_fft_height      = fft_height;
    float old_video_aspect       = video_stream_index >= 0 ? get_video_output_aspect() : 0.0f;
+   bool geometry_changed        = false;
    double old_interpolate_fps   = media.interpolate_fps;
    uint64_t old_frame_cnt       = frame_cnt;
    bool refresh_updated         = false;
@@ -2034,12 +2112,18 @@ void retro_run(void)
       }
    }
 
-   if (fft_width != old_fft_width || fft_height != old_fft_height ||
-       (video_stream_index >= 0 && old_video_aspect != get_video_output_aspect()) ||
-       refresh_updated)
+   geometry_changed = fft_width != old_fft_width ||
+      fft_height != old_fft_height ||
+      (video_stream_index >= 0 && old_video_aspect != get_video_output_aspect());
+
+   if (geometry_changed || refresh_updated)
    {
       struct retro_system_av_info info;
       retro_get_system_av_info(&info);
+
+      if (geometry_changed)
+         environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &info.geometry);
+
       if (!environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &info))
       {
          fft_width = old_fft_width;

@@ -51,6 +51,7 @@ This core has been modified focusing on Raspberry Pi devices using a development
 # Video Options
 
 * Frame Blending - Off, Low, Medium, High or Full
+* Zoom - `0.75x` to `1.35x` in `0.05x` increments
 
 # Subtitles
 
@@ -59,6 +60,7 @@ If a video has an external subtitle file with the same name and a `.srt` extensi
 # Changelog
 
 # v2.4.0
+- [X] Added new video `ZOOM` option
 - [X] Added new `AUTO RESUME` option (when supported)
 - [X] Added check for videos with no alternate audio tracks
 - [X] Added fallback to display the file name when no metadata exists
