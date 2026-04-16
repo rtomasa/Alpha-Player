@@ -1201,17 +1201,6 @@ void retro_set_environment(retro_environment_t cb)
    struct retro_core_option_v2_definition option_definitions[] =
    {
       {
-         "aplayer_sw_decoder_threads", "Software Decoder Threads (restart)", NULL, INFO_RESTART, NULL, "video",
-         {
-            {"auto", "Automatic"},
-            {"1", NULL},
-            {"2", NULL},
-            {"3", NULL},
-            {"4", NULL},
-            {NULL, NULL}
-         }, "auto"
-      },
-      {
          "aplayer_video_blending", "Frame Blending", "Crossfades adjacent frames to smooth motion when content and display refresh do not match.",
          NULL, NULL, "video",
          {
@@ -1567,7 +1556,6 @@ static void update_subtitle_font_settings(void)
 
 static void check_variables(bool firststart)
 {
-   struct retro_variable sw_threads_var = {0};
    struct retro_variable loop_content = {0};
    struct retro_variable auto_resume_var = {0};
    struct retro_variable replay_is_crt = {0};
@@ -1638,20 +1626,11 @@ static void check_variables(bool firststart)
 
    if (firststart)
    {
-      sw_threads_var.key = "aplayer_sw_decoder_threads";
-      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &sw_threads_var) && sw_threads_var.value)
-      {
-         if (string_is_equal(sw_threads_var.value, "auto"))
-         {
-            sw_decoder_threads = cpu_features_get_core_amount();
-         }
-         else
-         {
-            sw_decoder_threads = strtoul(sw_threads_var.value, NULL, 0);
-         }
-         /* Scale the sws threads based on core count but use at least 2 and at most 4 threads */
-         sw_sws_threads = MIN(MAX(2, sw_decoder_threads / 2), 4);
-      }
+      unsigned available_cores = cpu_features_get_core_amount();
+
+      sw_decoder_threads = available_cores > 1 ? available_cores - 1 : 1;
+      /* Scale the sws threads based on core count but use at least 2 and at most 4 threads */
+      sw_sws_threads = MIN(MAX(2, sw_decoder_threads / 2), 4);
    }
 }
 
