@@ -48,6 +48,12 @@ This core has been modified focusing on Raspberry Pi devices using a development
 
 * Auto Resume - ON/OFF, stores the current position for supported seekable files on unload and resumes on the next load
 
+# Audio Options
+
+* Preferred Language - `Default`, `English`, `Japanese`, `Spanish`, `Spanish (Latin America)`, `French`, `German`, `Italian`, `Portuguese`, `Portuguese (Brazil)`, `Dutch`, `Russian`, `Ukrainian`, `Polish`, `Czech`, `Hungarian`, `Romanian`, `Turkish`, `Arabic`, `Hebrew`, `Hindi`, `Korean`, `Chinese (Simplified)`, `Chinese (Traditional)`, `Cantonese`, `Thai`, `Vietnamese`
+* `Default` uses the file default audio track when flagged, otherwise the first audio track
+* If the selected language is not available, playback falls back to the `Default` behavior
+
 # Video Options
 
 * Frame Blending - Off, Low, Medium, High or Full
@@ -62,6 +68,7 @@ If a video has an external subtitle file with the same name and a `.srt` extensi
 # v2.4.0
 - [X] Added new video `ZOOM` option
 - [X] Added new `AUTO RESUME` option (when supported)
+- [X] Added new `PREFERRED LANGUAGE` option to select the prefferred audio track
 - [X] Added check for videos with no alternate audio tracks
 - [X] Added fallback to display the file name when no metadata exists
 - [X] Added frame blending with configurable strength: Off, Low, Medium, High, Full

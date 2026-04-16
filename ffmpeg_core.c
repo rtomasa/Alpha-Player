@@ -254,6 +254,7 @@ static tpool_t *tpool;
 #define SUBTITLE_FIX_TIMING_THRESHOLD_MS 210
 #define BITMAP_SUBTITLE_MAX_EVENTS 64
 #define BITMAP_SUBTITLE_TRAILING_LIMIT_MS (60 * 1000)
+#define APLAYER_AUDIO_LANGUAGE_DEFAULT "default"
 static AVCodecContext *actx[MAX_STREAMS];
 static AVCodecContext *sctx[MAX_STREAMS];
 static int audio_streams[MAX_STREAMS];
@@ -344,6 +345,34 @@ static unsigned video_crop_right = 0;
 static unsigned video_crop_bottom = 0;
 static bool target_refresh_retry_active = false;
 static unsigned target_refresh_retry_frames = 0;
+static char preferred_audio_language[16] = APLAYER_AUDIO_LANGUAGE_DEFAULT;
+
+static const char *const spanish_latam_language_tags[] =
+{
+   "es-419", "es-mx", "es-ar", "es-cl", "es-co", "es-pe", "es-ve", "es-uy",
+   "es-py", "es-bo", "es-ec", "es-gt", "es-hn", "es-ni", "es-sv", "es-cr",
+   "es-pa", "es-do", "es-pr", "es-cu", "es-us", NULL
+};
+
+static const char *const portuguese_brazil_language_tags[] =
+{
+   "pt-br", "pob", NULL
+};
+
+static const char *const chinese_simplified_language_tags[] =
+{
+   "zh-hans", "zh-cn", "zh-sg", "cmn-hans", "cmn-cn", "cmn-sg", NULL
+};
+
+static const char *const chinese_traditional_language_tags[] =
+{
+   "zh-hant", "zh-tw", "zh-hk", "zh-mo", "cmn-hant", "cmn-tw", NULL
+};
+
+static const char *const cantonese_language_tags[] =
+{
+   "yue", "zh-yue", NULL
+};
 
 /* GL stuff */
 static struct frame frames[2];
@@ -381,6 +410,307 @@ static void media_reset_defaults(void)
    frames[1].valid       = false;
    target_refresh_retry_active = false;
    target_refresh_retry_frames = 0;
+}
+
+static const char *stream_metadata_value(AVStream *stream, const char *key)
+{
+   AVDictionaryEntry *tag = NULL;
+
+   if (!stream || string_is_empty(key))
+      return NULL;
+
+   tag = av_dict_get(stream->metadata, key, NULL, 0);
+   if (tag && !string_is_empty(tag->value))
+      return tag->value;
+
+   while ((tag = av_dict_get(stream->metadata, "", tag, AV_DICT_IGNORE_SUFFIX)))
+   {
+      if (string_is_equal_case_insensitive(tag->key, key) &&
+            !string_is_empty(tag->value))
+         return tag->value;
+   }
+
+   return NULL;
+}
+
+static bool audio_selection_is_valid(int audio_ptr)
+{
+   return audio_ptr >= 0 && audio_ptr < audio_streams_num;
+}
+
+static bool audio_stream_is_default(int audio_ptr)
+{
+   int stream_index;
+
+   if (!fctx || !audio_selection_is_valid(audio_ptr))
+      return false;
+
+   stream_index = audio_streams[audio_ptr];
+   if (stream_index < 0 || stream_index >= (int)fctx->nb_streams)
+      return false;
+
+   return (fctx->streams[stream_index]->disposition & AV_DISPOSITION_DEFAULT) != 0;
+}
+
+static const char *audio_stream_language_tag(int audio_ptr)
+{
+   int stream_index;
+
+   if (!fctx || !audio_selection_is_valid(audio_ptr))
+      return NULL;
+
+   stream_index = audio_streams[audio_ptr];
+   if (stream_index < 0 || stream_index >= (int)fctx->nb_streams)
+      return NULL;
+
+   return stream_metadata_value(fctx->streams[stream_index], "language");
+}
+
+static void audio_language_normalize_tag(const char *input, char *output,
+      size_t output_size)
+{
+   size_t len = 0;
+   bool last_was_dash = false;
+
+   if (!output || output_size == 0)
+      return;
+
+   output[0] = '\0';
+
+   if (!input)
+      return;
+
+   while (*input && len + 1 < output_size)
+   {
+      unsigned char c = (unsigned char)*input++;
+
+      if (isalnum(c))
+      {
+         output[len++] = (char)tolower(c);
+         last_was_dash = false;
+      }
+      else if ((c == '-' || c == '_') && len > 0 && !last_was_dash)
+      {
+         output[len++] = '-';
+         last_was_dash = true;
+      }
+   }
+
+   if (len > 0 && output[len - 1] == '-')
+      len--;
+
+   output[len] = '\0';
+}
+
+static bool audio_language_tag_matches_prefix(const char *tag, const char *prefix)
+{
+   size_t prefix_len;
+
+   if (string_is_empty(tag) || string_is_empty(prefix))
+      return false;
+
+   if (string_is_equal(tag, prefix))
+      return true;
+
+   prefix_len = strlen(prefix);
+   return string_starts_with(tag, prefix) && tag[prefix_len] == '-';
+}
+
+static int audio_language_base_match_score(const char *tag, const char *iso639_1,
+      const char *iso639_2_term, const char *iso639_2_bibl)
+{
+   int score = 0;
+
+   if (!string_is_empty(iso639_1) && audio_language_tag_matches_prefix(tag, iso639_1))
+      score = string_is_equal(tag, iso639_1) ? 120 : 110;
+
+   if (!string_is_empty(iso639_2_term) &&
+         audio_language_tag_matches_prefix(tag, iso639_2_term) &&
+         score < (string_is_equal(tag, iso639_2_term) ? 120 : 110))
+      score = string_is_equal(tag, iso639_2_term) ? 120 : 110;
+
+   if (!string_is_empty(iso639_2_bibl) &&
+         audio_language_tag_matches_prefix(tag, iso639_2_bibl) &&
+         score < (string_is_equal(tag, iso639_2_bibl) ? 120 : 110))
+      score = string_is_equal(tag, iso639_2_bibl) ? 120 : 110;
+
+   return score;
+}
+
+static int audio_language_prefix_list_match_score(const char *tag,
+      const char *const *prefixes)
+{
+   unsigned i;
+
+   if (!tag || !prefixes)
+      return 0;
+
+   for (i = 0; prefixes[i]; i++)
+      if (audio_language_tag_matches_prefix(tag, prefixes[i]))
+         return string_is_equal(tag, prefixes[i]) ? 140 : 130;
+
+   return 0;
+}
+
+static int audio_language_match_score(const char *preferred_language,
+      const char *track_language)
+{
+   char normalized_tag[32];
+
+   if (string_is_empty(preferred_language) ||
+       string_is_equal(preferred_language, APLAYER_AUDIO_LANGUAGE_DEFAULT))
+      return 0;
+
+   audio_language_normalize_tag(track_language, normalized_tag, sizeof(normalized_tag));
+
+   if (string_is_empty(normalized_tag) ||
+       string_is_equal(normalized_tag, "und") ||
+       string_is_equal(normalized_tag, "unk"))
+      return 0;
+
+   if (string_is_equal(preferred_language, "en"))
+      return audio_language_base_match_score(normalized_tag, "en", "eng", NULL);
+   if (string_is_equal(preferred_language, "ja"))
+      return audio_language_base_match_score(normalized_tag, "ja", "jpn", NULL);
+   if (string_is_equal(preferred_language, "es"))
+      return audio_language_base_match_score(normalized_tag, "es", "spa", NULL);
+   if (string_is_equal(preferred_language, "es-419"))
+      return audio_language_prefix_list_match_score(normalized_tag,
+            spanish_latam_language_tags);
+   if (string_is_equal(preferred_language, "fr"))
+      return audio_language_base_match_score(normalized_tag, "fr", "fra", "fre");
+   if (string_is_equal(preferred_language, "de"))
+      return audio_language_base_match_score(normalized_tag, "de", "deu", "ger");
+   if (string_is_equal(preferred_language, "it"))
+      return audio_language_base_match_score(normalized_tag, "it", "ita", NULL);
+   if (string_is_equal(preferred_language, "pt"))
+      return audio_language_base_match_score(normalized_tag, "pt", "por", NULL);
+   if (string_is_equal(preferred_language, "pt-br"))
+      return audio_language_prefix_list_match_score(normalized_tag,
+            portuguese_brazil_language_tags);
+   if (string_is_equal(preferred_language, "nl"))
+      return audio_language_base_match_score(normalized_tag, "nl", "nld", "dut");
+   if (string_is_equal(preferred_language, "ru"))
+      return audio_language_base_match_score(normalized_tag, "ru", "rus", NULL);
+   if (string_is_equal(preferred_language, "uk"))
+      return audio_language_base_match_score(normalized_tag, "uk", "ukr", NULL);
+   if (string_is_equal(preferred_language, "pl"))
+      return audio_language_base_match_score(normalized_tag, "pl", "pol", NULL);
+   if (string_is_equal(preferred_language, "cs"))
+      return audio_language_base_match_score(normalized_tag, "cs", "ces", "cze");
+   if (string_is_equal(preferred_language, "hu"))
+      return audio_language_base_match_score(normalized_tag, "hu", "hun", NULL);
+   if (string_is_equal(preferred_language, "ro"))
+      return audio_language_base_match_score(normalized_tag, "ro", "ron", "rum");
+   if (string_is_equal(preferred_language, "tr"))
+      return audio_language_base_match_score(normalized_tag, "tr", "tur", NULL);
+   if (string_is_equal(preferred_language, "ar"))
+      return audio_language_base_match_score(normalized_tag, "ar", "ara", NULL);
+   if (string_is_equal(preferred_language, "he"))
+      return audio_language_base_match_score(normalized_tag, "he", "heb", "iw");
+   if (string_is_equal(preferred_language, "hi"))
+      return audio_language_base_match_score(normalized_tag, "hi", "hin", NULL);
+   if (string_is_equal(preferred_language, "ko"))
+      return audio_language_base_match_score(normalized_tag, "ko", "kor", NULL);
+   if (string_is_equal(preferred_language, "zh-hans"))
+      return audio_language_prefix_list_match_score(normalized_tag,
+            chinese_simplified_language_tags);
+   if (string_is_equal(preferred_language, "zh-hant"))
+      return audio_language_prefix_list_match_score(normalized_tag,
+            chinese_traditional_language_tags);
+   if (string_is_equal(preferred_language, "yue"))
+      return audio_language_prefix_list_match_score(normalized_tag,
+            cantonese_language_tags);
+   if (string_is_equal(preferred_language, "th"))
+      return audio_language_base_match_score(normalized_tag, "th", "tha", NULL);
+   if (string_is_equal(preferred_language, "vi"))
+      return audio_language_base_match_score(normalized_tag, "vi", "vie", NULL);
+
+   return 0;
+}
+
+static int audio_default_stream_ptr(void)
+{
+   int i;
+
+   if (audio_streams_num <= 0)
+      return -1;
+
+   for (i = 0; i < audio_streams_num; i++)
+      if (audio_stream_is_default(i))
+         return i;
+
+   return 0;
+}
+
+static int audio_select_initial_stream_ptr(void)
+{
+   int best_ptr = -1;
+   int best_score = 0;
+   int default_ptr = audio_default_stream_ptr();
+   int i;
+
+   if (audio_streams_num <= 0)
+      return -1;
+
+   if (string_is_equal(preferred_audio_language, APLAYER_AUDIO_LANGUAGE_DEFAULT))
+      return default_ptr;
+
+   for (i = 0; i < audio_streams_num; i++)
+   {
+      int score = audio_language_match_score(preferred_audio_language,
+            audio_stream_language_tag(i));
+
+      if (score <= 0)
+         continue;
+
+      if (audio_stream_is_default(i))
+         score += 10;
+
+      if (score > best_score)
+      {
+         best_score = score;
+         best_ptr = i;
+      }
+   }
+
+   if (best_ptr >= 0)
+      return best_ptr;
+
+   return default_ptr;
+}
+
+static void audio_selection_label(int audio_ptr, char *label, size_t label_size)
+{
+   const char *title = NULL;
+   const char *language = NULL;
+   int stream_index = -1;
+
+   if (!label || label_size == 0)
+      return;
+
+   if (!audio_selection_is_valid(audio_ptr))
+   {
+      snprintf(label, label_size, "Audio Track");
+      return;
+   }
+
+   stream_index = audio_streams[audio_ptr];
+   if (fctx && stream_index >= 0 && stream_index < (int)fctx->nb_streams)
+   {
+      AVStream *stream = fctx->streams[stream_index];
+      title = stream_metadata_value(stream, "title");
+      language = stream_metadata_value(stream, "language");
+   }
+
+   if (title && language)
+      snprintf(label, label_size, "%s [%s] #%d", title, language, audio_ptr);
+   else if (title)
+      snprintf(label, label_size, "%s #%d", title, audio_ptr);
+   else if (language)
+      snprintf(label, label_size, "%s #%d", language, audio_ptr);
+   else
+      snprintf(label, label_size, "Audio Track #%d", audio_ptr);
 }
 
 static void init_aspect_ratio(void)
@@ -1244,6 +1574,7 @@ void retro_set_environment(retro_environment_t cb)
    struct retro_core_option_v2_category option_categories[] =
    {
       {"video", "Video", "Video settings"},
+      {"audio", "Audio", "Audio settings"},
       {"music", "Music", "Music Settings"},
       {NULL, NULL, NULL}
    };
@@ -1281,6 +1612,40 @@ void retro_set_environment(retro_environment_t cb)
             {"1.35", "1.35x"},
             {NULL, NULL}
          }, "1.00"
+      },
+      {
+         "aplayer_audio_language", "Preferred Language", "Selects the default audio track language when matching streams are tagged in the media file. Falls back to the file default track, or the first audio track when no default is flagged.",
+         NULL, NULL, "audio",
+         {
+            {"default", "Default"},
+            {"en", "English"},
+            {"ja", "Japanese"},
+            {"es", "Spanish"},
+            {"es-419", "Spanish (Latin America)"},
+            {"fr", "French"},
+            {"de", "German"},
+            {"it", "Italian"},
+            {"pt", "Portuguese"},
+            {"pt-br", "Portuguese (Brazil)"},
+            {"nl", "Dutch"},
+            {"ru", "Russian"},
+            {"uk", "Ukrainian"},
+            {"pl", "Polish"},
+            {"cs", "Czech"},
+            {"hu", "Hungarian"},
+            {"ro", "Romanian"},
+            {"tr", "Turkish"},
+            {"ar", "Arabic"},
+            {"he", "Hebrew"},
+            {"hi", "Hindi"},
+            {"ko", "Korean"},
+            {"zh-hans", "Chinese (Simplified)"},
+            {"zh-hant", "Chinese (Traditional)"},
+            {"yue", "Cantonese"},
+            {"th", "Thai"},
+            {"vi", "Vietnamese"},
+            {NULL, NULL}
+         }, "default"
       },
       {
          "aplayer_visualizer", "Visualizer", NULL, NULL, NULL, "music",
@@ -1628,6 +1993,7 @@ static void check_variables(bool firststart)
 {
    struct retro_variable loop_content = {0};
    struct retro_variable auto_resume_var = {0};
+   struct retro_variable audio_language_var = {0};
    struct retro_variable replay_is_crt = {0};
    struct retro_variable fft_toggle_var = {0};
    struct retro_variable video_blending_var = {0};
@@ -1668,6 +2034,14 @@ static void check_variables(bool firststart)
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &video_zoom_var) &&
          video_zoom_var.value)
       video_zoom = parse_video_zoom_value(video_zoom_var.value);
+
+   snprintf(preferred_audio_language, sizeof(preferred_audio_language), "%s",
+         APLAYER_AUDIO_LANGUAGE_DEFAULT);
+   audio_language_var.key = "aplayer_audio_language";
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &audio_language_var) &&
+         !string_is_empty(audio_language_var.value))
+      audio_language_normalize_tag(audio_language_var.value,
+            preferred_audio_language, sizeof(preferred_audio_language));
 
    update_subtitle_font_settings();
    auto_resume_enabled = false;
@@ -2300,9 +2674,7 @@ void retro_run(void)
 
          if (audio_streams_num > 1)
          {
-            int audio_stream_index;
             int next_audio_stream_ptr;
-            AVDictionaryEntry *tag;
 
             // Safely update the new audio track index.
             slock_lock(decode_thread_lock);
@@ -2319,13 +2691,7 @@ void retro_run(void)
             slock_unlock(time_lock);
             scond_signal(fifo_cond);
             slock_unlock(fifo_lock);
-
-            audio_stream_index = audio_streams[next_audio_stream_ptr];
-            tag = av_dict_get(fctx->streams[audio_stream_index]->metadata, "title", NULL, 0);
-            if (tag)
-               snprintf(msg, sizeof(msg), "%s #%d", tag->value, next_audio_stream_ptr);
-            else
-               snprintf(msg, sizeof(msg), "Audio Track #%d", next_audio_stream_ptr);
+            audio_selection_label(next_audio_stream_ptr, msg, sizeof(msg));
          }
          else
             snprintf(msg, sizeof(msg), "No alternate audio tracks");
@@ -3095,6 +3461,9 @@ static bool open_codecs(void)
             break;
       }
    }
+
+   if (audio_streams_num > 0)
+      audio_streams_ptr = audio_select_initial_stream_ptr();
 
    return actx[0] || vctx;
 }
