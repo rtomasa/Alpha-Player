@@ -76,18 +76,6 @@ static bool auto_resume_enabled = false;
 static bool content_loaded = false;
 static bool playlist_source_active = false;
 static bool internal_playlist_reload_pending = false;
-
-enum aplayer_zoom_mode
-{
-   APLAYER_ZOOM_MODE_UNIFORM = 0,
-   APLAYER_ZOOM_MODE_FILL_16_9,
-   APLAYER_ZOOM_MODE_FILL_4_3,
-   APLAYER_ZOOM_MODE_FILL_21_9,
-   APLAYER_ZOOM_MODE_FILL_8_3,
-   APLAYER_ZOOM_MODE_FILL_3_2,
-   APLAYER_ZOOM_MODE_FILL_1_1
-};
-
 struct aplayer_bookmark
 {
    uint32_t magic;
@@ -352,7 +340,7 @@ static bool time_supported = true;
 static bool gme_seek_disabled = false;
 static float video_blend_strength = 1.0f;
 static float video_zoom = 1.0f;
-static enum aplayer_zoom_mode video_zoom_mode = APLAYER_ZOOM_MODE_UNIFORM;
+static float video_fill_target_aspect = 0.0f;
 static unsigned video_crop_left = 0;
 static unsigned video_crop_top = 0;
 static unsigned video_crop_right = 0;
@@ -406,6 +394,7 @@ static void media_reset_defaults(void)
    media.interpolate_fps = 60.0;   // your current default
    media.sample_rate     = 32000.0; // safe default until audio stream is opened
    media.aspect          = 0.0f;    // force recompute
+   video_fill_target_aspect = 0.0f;
    video_crop_left       = 0;
    video_crop_top        = 0;
    video_crop_right      = 0;
@@ -831,54 +820,78 @@ static float get_video_native_aspect(void)
 
 static float get_video_zoom(void);
 
-static float get_zoom_mode_target_aspect(void)
+static bool aspect_values_differ(float lhs, float rhs)
 {
-   switch (video_zoom_mode)
-   {
-      case APLAYER_ZOOM_MODE_FILL_16_9:
-         return 16.0f / 9.0f;
-      case APLAYER_ZOOM_MODE_FILL_4_3:
-         return 4.0f / 3.0f;
-      case APLAYER_ZOOM_MODE_FILL_21_9:
-         return 21.0f / 9.0f;
-      case APLAYER_ZOOM_MODE_FILL_8_3:
-         return 8.0f / 3.0f;
-      case APLAYER_ZOOM_MODE_FILL_3_2:
-         return 3.0f / 2.0f;
-      case APLAYER_ZOOM_MODE_FILL_1_1:
-         return 1.0f;
-      case APLAYER_ZOOM_MODE_UNIFORM:
-      default:
-         return 0.0f;
-   }
+   return lhs < rhs - 0.0005f || lhs > rhs + 0.0005f;
 }
 
-static const char *get_zoom_mode_label(void)
+static float get_display_target_aspect(const struct retro_display_info *display_info)
 {
-   switch (video_zoom_mode)
+   if (!display_info)
+      return 0.0f;
+
+   if ((display_info->flags & RETRO_DISPLAY_INFO_VALID_DISPLAY_AR) &&
+       display_info->display_aspect_ratio > 0.0f)
+      return display_info->display_aspect_ratio;
+
+   if ((display_info->flags & RETRO_DISPLAY_INFO_VALID_DISPLAY_SIZE) &&
+       display_info->display_width > 0 &&
+       display_info->display_height > 0)
+      return (float)display_info->display_width /
+         (float)display_info->display_height;
+
+   if ((display_info->flags & RETRO_DISPLAY_INFO_VALID_VIEWPORT_AR) &&
+       display_info->viewport_aspect_ratio > 0.0f)
+      return display_info->viewport_aspect_ratio;
+
+   if ((display_info->flags & RETRO_DISPLAY_INFO_VALID_VIEWPORT) &&
+       display_info->viewport_width > 0 &&
+       display_info->viewport_height > 0)
+      return (float)display_info->viewport_width /
+         (float)display_info->viewport_height;
+
+   return 0.0f;
+}
+
+static void refresh_video_fill_target_aspect(void)
+{
+   struct retro_display_info display_info;
+   float target_aspect = 0.0f;
+
+   if (!environ_cb)
+      return;
+
+   memset(&display_info, 0, sizeof(display_info));
+   display_info.struct_size = sizeof(display_info);
+
+   if (environ_cb(RETRO_ENVIRONMENT_GET_DISPLAY_INFO, &display_info))
+      target_aspect = get_display_target_aspect(&display_info);
+
+   if (target_aspect <= 0.0f)
    {
-      case APLAYER_ZOOM_MODE_FILL_16_9:
-         return "Fill 16:9";
-      case APLAYER_ZOOM_MODE_FILL_4_3:
-         return "Fill 4:3";
-      case APLAYER_ZOOM_MODE_FILL_21_9:
-         return "Fill 21:9";
-      case APLAYER_ZOOM_MODE_FILL_8_3:
-         return "Fill 8:3";
-      case APLAYER_ZOOM_MODE_FILL_3_2:
-         return "Fill 3:2";
-      case APLAYER_ZOOM_MODE_FILL_1_1:
-         return "Fill 1:1";
-      case APLAYER_ZOOM_MODE_UNIFORM:
-      default:
-         return "Uniform";
+      if (log_cb && video_fill_target_aspect > 0.0f)
+         log_cb(RETRO_LOG_INFO,
+               "[APLAYER] Automatic zoom fill target unavailable.\n");
+
+      video_fill_target_aspect = 0.0f;
+      return;
    }
+
+   if (log_cb && aspect_values_differ(video_fill_target_aspect, target_aspect))
+   {
+      log_cb(RETRO_LOG_INFO,
+            "[APLAYER] Automatic zoom fill target aspect: %.3f\n",
+            target_aspect);
+   }
+
+   video_fill_target_aspect = target_aspect;
 }
 
 static bool use_fill_zoom(void)
 {
-   return video_zoom_mode != APLAYER_ZOOM_MODE_UNIFORM &&
-      get_video_zoom() > 1.0f;
+   return video_fill_target_aspect > 0.0f &&
+      get_video_zoom() > 1.0f &&
+      aspect_values_differ(video_fill_target_aspect, get_video_native_aspect());
 }
 
 static float get_fill_zoom_blend(void)
@@ -893,7 +906,7 @@ static float get_fill_zoom_blend(void)
 
 static float get_fill_zoom_output_aspect(float native_aspect)
 {
-   float target_aspect = get_zoom_mode_target_aspect();
+   float target_aspect = video_fill_target_aspect;
    float blend = get_fill_zoom_blend();
 
    if (target_aspect <= 0.0f || blend <= 0.0f)
@@ -922,24 +935,6 @@ static float clamp_video_zoom(float zoom)
    if (zoom > APLAYER_VIDEO_ZOOM_MAX)
       return APLAYER_VIDEO_ZOOM_MAX;
    return zoom;
-}
-
-static enum aplayer_zoom_mode parse_video_zoom_mode_value(const char *value)
-{
-   if (string_is_equal(value, "fill_16_9"))
-      return APLAYER_ZOOM_MODE_FILL_16_9;
-   if (string_is_equal(value, "fill_4_3"))
-      return APLAYER_ZOOM_MODE_FILL_4_3;
-   if (string_is_equal(value, "fill_21_9"))
-      return APLAYER_ZOOM_MODE_FILL_21_9;
-   if (string_is_equal(value, "fill_8_3"))
-      return APLAYER_ZOOM_MODE_FILL_8_3;
-   if (string_is_equal(value, "fill_3_2"))
-      return APLAYER_ZOOM_MODE_FILL_3_2;
-   if (string_is_equal(value, "fill_1_1"))
-      return APLAYER_ZOOM_MODE_FILL_1_1;
-
-   return APLAYER_ZOOM_MODE_UNIFORM;
 }
 
 static float parse_video_zoom_value(const char *value)
@@ -1653,6 +1648,9 @@ void retro_get_system_info(struct retro_system_info *info)
 
 void retro_get_system_av_info(struct retro_system_av_info *info)
 {
+   if (vctx)
+      refresh_video_fill_target_aspect();
+
    unsigned width  = vctx ? media.width : 320;
    unsigned height = vctx ? media.height : 240;
    float aspect    = vctx ? get_video_output_aspect() : (float)width / (float)height;
@@ -1703,21 +1701,7 @@ void retro_set_environment(retro_environment_t cb)
          }, "off"
       },
       {
-         "aplayer_video_zoom_mode", "Zoom Mode", "Selects whether zoom preserves the original aspect ratio or progressively fills a target display aspect as zoom approaches 1.35x.",
-         NULL, NULL, "video",
-         {
-            {"uniform", "Uniform"},
-            {"fill_16_9", "Fill 16:9"},
-            {"fill_4_3", "Fill 4:3"},
-            {"fill_21_9", "Fill 21:9"},
-            {"fill_8_3", "Fill 8:3"},
-            {"fill_3_2", "Fill 3:2"},
-            {"fill_1_1", "Fill 1:1"},
-            {NULL, NULL}
-         }, "uniform"
-      },
-      {
-         "aplayer_video_zoom", "Zoom", "Scales the displayed video image from 0.75x to 1.35x.",
+         "aplayer_video_zoom", "Zoom", "Scales the displayed video image from 0.75x to 1.35x. Above 1.00x, the image progressively crops toward the current frontend display aspect, falling back to the viewport aspect when display information is incomplete.",
          NULL, NULL, "video",
          {
             {"0.75", "0.75x"},
@@ -2121,7 +2105,6 @@ static void check_variables(bool firststart)
    struct retro_variable fft_toggle_var = {0};
    struct retro_variable video_blending_var = {0};
    struct retro_variable video_zoom_var = {0};
-   struct retro_variable video_zoom_mode_var = {0};
 
    fft_width  = 640;
    fft_height = 480;
@@ -2158,12 +2141,6 @@ static void check_variables(bool firststart)
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &video_zoom_var) &&
          video_zoom_var.value)
       video_zoom = parse_video_zoom_value(video_zoom_var.value);
-
-   video_zoom_mode = APLAYER_ZOOM_MODE_UNIFORM;
-   video_zoom_mode_var.key = "aplayer_video_zoom_mode";
-   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &video_zoom_mode_var) &&
-         video_zoom_mode_var.value)
-      video_zoom_mode = parse_video_zoom_mode_value(video_zoom_mode_var.value);
 
    snprintf(preferred_audio_language, sizeof(preferred_audio_language), "%s",
          APLAYER_AUDIO_LANGUAGE_DEFAULT);
@@ -2588,15 +2565,22 @@ void retro_run(void)
    bool refresh_updated         = false;
    double target_refresh_rate   = 0.0;
 
+   refresh_video_fill_target_aspect();
+
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
       check_variables(false);
 
    if (old_video_zoom < get_video_zoom() - 0.0005f ||
        old_video_zoom > get_video_zoom() + 0.0005f)
    {
-      log_cb(RETRO_LOG_INFO,
-            "[APLAYER] Zoom updated: %.2f -> %.2f (%s)\n",
-            old_video_zoom, get_video_zoom(), get_zoom_mode_label());
+      if (use_fill_zoom())
+         log_cb(RETRO_LOG_INFO,
+               "[APLAYER] Zoom updated: %.2f -> %.2f (auto fill %.3f)\n",
+               old_video_zoom, get_video_zoom(), video_fill_target_aspect);
+      else
+         log_cb(RETRO_LOG_INFO,
+               "[APLAYER] Zoom updated: %.2f -> %.2f\n",
+               old_video_zoom, get_video_zoom());
    }
 
    if (target_refresh_retry_active && target_refresh_retry_frames > 0)
@@ -2627,7 +2611,8 @@ void retro_run(void)
 
    geometry_changed = fft_width != old_fft_width ||
       fft_height != old_fft_height ||
-      (video_stream_index >= 0 && old_video_aspect != get_video_output_aspect());
+      (video_stream_index >= 0 &&
+       aspect_values_differ(old_video_aspect, get_video_output_aspect()));
 
    if (geometry_changed || refresh_updated)
    {

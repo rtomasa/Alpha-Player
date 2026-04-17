@@ -2587,6 +2587,25 @@ enum retro_mod
 */
 #define RETRO_ENVIRONMENT_GET_TARGET_SAMPLE_RATE (81 | RETRO_ENVIRONMENT_EXPERIMENTAL)
 
+/**
+ * Returns information about the frontend's current display and content viewport.
+ *
+ * This can be used by a core to adapt to the frontend's effective presentation
+ * geometry when user settings or runtime conditions cause it to differ from
+ * the core's nominal geometry.
+ *
+ * @param[in,out] data <tt>struct retro_display_info *</tt>.
+ * Pointer to the display information struct. The core should initialize
+ * \c struct_size to <tt>sizeof(struct retro_display_info)</tt> before calling.
+ * Behavior is undefined if \c data is <tt>NULL</tt>.
+ * @return \c true if this environment call is available,
+ * regardless of which fields are reported as valid.
+ *
+ * @note The returned values are advisory only; the frontend remains fully
+ * in control of presentation and may change them at runtime.
+ */
+#define RETRO_ENVIRONMENT_GET_DISPLAY_INFO (82 | RETRO_ENVIRONMENT_EXPERIMENTAL)
+
 /**@}*/
 
 /**
@@ -6296,6 +6315,87 @@ struct retro_game_geometry
     * @note A frontend may ignore this setting.
     */
    float    aspect_ratio;
+};
+
+/**
+ * Bit flags describing which members of \ref retro_display_info are valid,
+ * along with basic frontend display state hints.
+ * @see retro_display_info
+ */
+#define RETRO_DISPLAY_INFO_VALID_DISPLAY_SIZE (1ULL << 0)
+#define RETRO_DISPLAY_INFO_VALID_VIEWPORT     (1ULL << 1)
+#define RETRO_DISPLAY_INFO_VALID_DISPLAY_AR   (1ULL << 2)
+#define RETRO_DISPLAY_INFO_VALID_VIEWPORT_AR  (1ULL << 3)
+#define RETRO_DISPLAY_INFO_WINDOWED           (1ULL << 4)
+#define RETRO_DISPLAY_INFO_FULLSCREEN         (1ULL << 5)
+
+/**
+ * Describes the frontend's effective display and content viewport geometry.
+ * @see RETRO_ENVIRONMENT_GET_DISPLAY_INFO
+ */
+struct retro_display_info
+{
+   /**
+    * Size of this struct, in bytes.
+    * Set by the core to <tt>sizeof(struct retro_display_info)</tt>.
+    */
+   uint32_t struct_size;
+
+   /**
+    * Validity/state flags describing which fields are available.
+    * Set by the frontend.
+    */
+   uint64_t flags;
+
+   /**
+    * Width of the frontend output surface, in physical pixels, when known.
+    * Set by the frontend.
+    */
+   unsigned display_width;
+
+   /**
+    * Height of the frontend output surface, in physical pixels, when known.
+    * Set by the frontend.
+    */
+   unsigned display_height;
+
+   /**
+    * X offset of the content viewport within the output surface, in pixels,
+    * when known. Set by the frontend.
+    */
+   unsigned viewport_x;
+
+   /**
+    * Y offset of the content viewport within the output surface, in pixels,
+    * when known. Set by the frontend.
+    */
+   unsigned viewport_y;
+
+   /**
+    * Width of the content viewport actually used to present the core image,
+    * in pixels, when known. Set by the frontend.
+    */
+   unsigned viewport_width;
+
+   /**
+    * Height of the content viewport actually used to present the core image,
+    * in pixels, when known. Set by the frontend.
+    */
+   unsigned viewport_height;
+
+   /**
+    * Aspect ratio of the full output surface, when known.
+    * A value of zero or less indicates an unknown aspect ratio.
+    * Set by the frontend.
+    */
+   float display_aspect_ratio;
+
+   /**
+    * Effective aspect ratio of the content viewport used to present the core image,
+    * when known. A value of zero or less indicates an unknown aspect ratio.
+    * Set by the frontend.
+    */
+   float viewport_aspect_ratio;
 };
 
 /**
