@@ -10,6 +10,7 @@
 #include <libswscale/swscale.h>
 #include <libavutil/error.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/pixdesc.h>
 #include <libavutil/time.h>
 #include <libavutil/opt.h>
 #include <libavutil/log.h>
@@ -36,6 +37,17 @@
 #include <ctype.h>
 #include <libgen.h> // for dirname()
 #include <limits.h> // for PATH_MAX
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
+
+typedef struct AVFilter AVFilter;
+typedef struct AVFilterContext AVFilterContext;
+typedef struct AVFilterGraph AVFilterGraph;
+
+#ifndef AV_BUFFERSRC_FLAG_KEEP_REF
+#define AV_BUFFERSRC_FLAG_KEEP_REF 8
+#endif
 
 // Retro callbacks
 static retro_environment_t environ_cb;
@@ -61,6 +73,49 @@ retro_log_printf_t log_cb;
 #define APLAYER_BOOKMARK_MIN_TIME 1.0
 #define APLAYER_VIDEO_ZOOM_MIN 0.75f
 #define APLAYER_VIDEO_ZOOM_MAX 1.35f
+
+enum aplayer_deinterlace_mode
+{
+   APLAYER_DEINTERLACE_DISABLED = 0,
+   APLAYER_DEINTERLACE_AUTO,
+   APLAYER_DEINTERLACE_FORCED
+};
+
+struct aplayer_avfilter_api
+{
+   bool load_attempted;
+   bool available;
+   void *handle;
+   const AVFilter *(*avfilter_get_by_name)(const char *name);
+   AVFilterGraph *(*avfilter_graph_alloc)(void);
+   int (*avfilter_graph_create_filter)(AVFilterContext **filt_ctx,
+         const AVFilter *filt, const char *name, const char *args,
+         void *opaque, AVFilterGraph *graph_ctx);
+   int (*avfilter_link)(AVFilterContext *src, unsigned srcpad,
+         AVFilterContext *dst, unsigned dstpad);
+   int (*avfilter_graph_config)(AVFilterGraph *graphctx, void *log_ctx);
+   void (*avfilter_graph_free)(AVFilterGraph **graph);
+   int (*av_buffersrc_add_frame_flags)(AVFilterContext *buffer_src,
+         AVFrame *frame, int flags);
+   int (*av_buffersink_get_frame)(AVFilterContext *ctx, AVFrame *frame);
+};
+
+struct aplayer_deinterlace_state
+{
+   AVFilterGraph *graph;
+   AVFilterContext *buffer_src_ctx;
+   AVFilterContext *yadif_ctx;
+   AVFilterContext *buffer_sink_ctx;
+   unsigned width;
+   unsigned height;
+   enum AVPixelFormat pix_fmt;
+   AVRational time_base;
+   AVRational sample_aspect_ratio;
+   enum aplayer_deinterlace_mode mode;
+   bool enabled_logged;
+   bool unavailable_logged;
+};
+
 static char playlist[MAX_PLAYLIST_ENTRIES][PATH_MAX];
 static unsigned playlist_count = 0;
 static unsigned playlist_index = 0;
@@ -348,6 +403,10 @@ static unsigned video_crop_bottom = 0;
 static bool target_refresh_retry_active = false;
 static unsigned target_refresh_retry_frames = 0;
 static char preferred_audio_language[16] = APLAYER_AUDIO_LANGUAGE_DEFAULT;
+static enum aplayer_deinterlace_mode video_deinterlace_mode = APLAYER_DEINTERLACE_AUTO;
+static volatile bool video_deinterlace_reset_pending = false;
+static struct aplayer_avfilter_api avfilter_api = {0};
+static struct aplayer_deinterlace_state video_deinterlace = {0};
 
 static const char *const spanish_latam_language_tags[] =
 {
@@ -413,6 +472,360 @@ static void media_reset_defaults(void)
    frames[1].valid       = false;
    target_refresh_retry_active = false;
    target_refresh_retry_frames = 0;
+   video_deinterlace_reset_pending = true;
+}
+
+static const char *video_deinterlace_mode_name(enum aplayer_deinterlace_mode mode)
+{
+   switch (mode)
+   {
+      case APLAYER_DEINTERLACE_DISABLED:
+         return "Off";
+      case APLAYER_DEINTERLACE_FORCED:
+         return "YADIF Always";
+      case APLAYER_DEINTERLACE_AUTO:
+      default:
+         return "YADIF Auto";
+   }
+}
+
+static const char *video_deinterlace_filter_args(enum aplayer_deinterlace_mode mode)
+{
+   if (mode == APLAYER_DEINTERLACE_FORCED)
+      return "mode=send_frame:parity=auto:deint=all";
+
+   return "mode=send_frame:parity=auto:deint=interlaced";
+}
+
+static bool rationals_differ(AVRational lhs, AVRational rhs)
+{
+   return lhs.num != rhs.num || lhs.den != rhs.den;
+}
+
+static AVRational video_deinterlace_frame_sar(const AVFrame *frame)
+{
+   AVRational sar = {1, 1};
+
+   if (frame)
+      sar = frame->sample_aspect_ratio;
+
+   if ((sar.num <= 0 || sar.den <= 0) && fctx && video_stream_index >= 0)
+      sar = av_guess_sample_aspect_ratio(fctx, fctx->streams[video_stream_index],
+            (AVFrame*)frame);
+
+   if (sar.num <= 0 || sar.den <= 0)
+      sar = (AVRational){1, 1};
+
+   return sar;
+}
+
+static bool video_frame_is_interlaced(const AVFrame *frame)
+{
+   return frame && (frame->flags & AV_FRAME_FLAG_INTERLACED);
+}
+
+static bool video_stream_is_interlaced(void)
+{
+   return vctx &&
+         vctx->field_order != AV_FIELD_PROGRESSIVE &&
+         vctx->field_order != AV_FIELD_UNKNOWN;
+}
+
+static void video_deinterlace_close(void)
+{
+   if (avfilter_api.available && avfilter_api.avfilter_graph_free &&
+         video_deinterlace.graph)
+      avfilter_api.avfilter_graph_free(&video_deinterlace.graph);
+   else
+      video_deinterlace.graph = NULL;
+
+   video_deinterlace.buffer_src_ctx = NULL;
+   video_deinterlace.yadif_ctx = NULL;
+   video_deinterlace.buffer_sink_ctx = NULL;
+   video_deinterlace.width = 0;
+   video_deinterlace.height = 0;
+   video_deinterlace.pix_fmt = AV_PIX_FMT_NONE;
+   video_deinterlace.time_base = (AVRational){0, 1};
+   video_deinterlace.sample_aspect_ratio = (AVRational){0, 1};
+   video_deinterlace.mode = APLAYER_DEINTERLACE_DISABLED;
+   video_deinterlace.enabled_logged = false;
+}
+
+static bool avfilter_api_load(void)
+{
+   if (avfilter_api.load_attempted)
+      return avfilter_api.available;
+
+   avfilter_api.load_attempted = true;
+
+#ifndef _WIN32
+   {
+      static const char *const candidates[] =
+      {
+         "libavfilter.so.10",
+         "libavfilter.so.9",
+         "libavfilter.so.8",
+         "libavfilter.so.7",
+         "libavfilter.so",
+         NULL
+      };
+      unsigned i;
+
+      for (i = 0; candidates[i]; i++)
+      {
+         avfilter_api.handle = dlopen(candidates[i], RTLD_LAZY | RTLD_LOCAL);
+         if (avfilter_api.handle)
+            break;
+      }
+
+      if (!avfilter_api.handle)
+         return false;
+
+#define LOAD_AVFILTER_SYMBOL(name) \
+      do { \
+         *(void**)(&avfilter_api.name) = dlsym(avfilter_api.handle, #name); \
+         if (!avfilter_api.name) \
+            goto error; \
+      } while (0)
+
+      LOAD_AVFILTER_SYMBOL(avfilter_get_by_name);
+      LOAD_AVFILTER_SYMBOL(avfilter_graph_alloc);
+      LOAD_AVFILTER_SYMBOL(avfilter_graph_create_filter);
+      LOAD_AVFILTER_SYMBOL(avfilter_link);
+      LOAD_AVFILTER_SYMBOL(avfilter_graph_config);
+      LOAD_AVFILTER_SYMBOL(avfilter_graph_free);
+      LOAD_AVFILTER_SYMBOL(av_buffersrc_add_frame_flags);
+      LOAD_AVFILTER_SYMBOL(av_buffersink_get_frame);
+
+#undef LOAD_AVFILTER_SYMBOL
+
+      avfilter_api.available = true;
+      return true;
+
+error:
+      dlclose(avfilter_api.handle);
+      avfilter_api.handle = NULL;
+   }
+#endif
+
+   return false;
+}
+
+static bool video_deinterlace_should_process(const AVFrame *frame)
+{
+   if (video_deinterlace_mode == APLAYER_DEINTERLACE_DISABLED)
+      return false;
+
+   if (video_deinterlace_mode == APLAYER_DEINTERLACE_FORCED)
+      return true;
+
+   if (video_deinterlace.graph)
+      return true;
+
+   return video_frame_is_interlaced(frame) || video_stream_is_interlaced();
+}
+
+static bool video_deinterlace_ensure_graph(const AVFrame *frame)
+{
+   char buffer_args[256];
+   int ret;
+   unsigned width;
+   unsigned height;
+   AVRational time_base;
+   AVRational sar;
+   const char *pix_fmt_name = NULL;
+   const AVFilter *buffer = NULL;
+   const AVFilter *yadif = NULL;
+   const AVFilter *buffersink = NULL;
+
+   if (!frame)
+      return false;
+
+   if (!avfilter_api_load())
+   {
+      if (!video_deinterlace.unavailable_logged)
+      {
+         log_cb(RETRO_LOG_WARN,
+               "[APLAYER] %s requested but libavfilter could not be loaded; video will remain untouched.\n",
+               video_deinterlace_mode_name(video_deinterlace_mode));
+         video_deinterlace.unavailable_logged = true;
+      }
+      return false;
+   }
+
+   width = frame->width > 0 ? (unsigned)frame->width : media.width;
+   height = frame->height > 0 ? (unsigned)frame->height : media.height;
+   time_base = (fctx && video_stream_index >= 0) ?
+         fctx->streams[video_stream_index]->time_base : (AVRational){1, AV_TIME_BASE};
+   if (time_base.num <= 0 || time_base.den <= 0)
+      time_base = (AVRational){1, AV_TIME_BASE};
+   sar = video_deinterlace_frame_sar(frame);
+   pix_fmt_name = av_get_pix_fmt_name((enum AVPixelFormat)frame->format);
+
+   if (video_deinterlace_reset_pending ||
+       (video_deinterlace.graph &&
+        (video_deinterlace.width != width ||
+         video_deinterlace.height != height ||
+         video_deinterlace.pix_fmt != (enum AVPixelFormat)frame->format ||
+         rationals_differ(video_deinterlace.time_base, time_base) ||
+         rationals_differ(video_deinterlace.sample_aspect_ratio, sar) ||
+         video_deinterlace.mode != video_deinterlace_mode)))
+   {
+      video_deinterlace_close();
+      video_deinterlace_reset_pending = false;
+   }
+
+   if (video_deinterlace.graph)
+      return true;
+
+   buffer = avfilter_api.avfilter_get_by_name("buffer");
+   yadif = avfilter_api.avfilter_get_by_name("yadif");
+   buffersink = avfilter_api.avfilter_get_by_name("buffersink");
+
+   if (!buffer || !yadif || !buffersink)
+   {
+      if (!video_deinterlace.unavailable_logged)
+      {
+         log_cb(RETRO_LOG_WARN,
+               "[APLAYER] libavfilter is present but required filters (buffer/yadif/buffersink) are unavailable.\n");
+         video_deinterlace.unavailable_logged = true;
+      }
+      return false;
+   }
+
+   snprintf(buffer_args, sizeof(buffer_args),
+         "video_size=%ux%u:pix_fmt=%d:time_base=%d/%d:pixel_aspect=%d/%d",
+         width, height, frame->format,
+         time_base.num, time_base.den,
+         sar.num, sar.den);
+
+   video_deinterlace.graph = avfilter_api.avfilter_graph_alloc();
+   if (!video_deinterlace.graph)
+   {
+      log_cb(RETRO_LOG_ERROR, "[APLAYER] Failed to allocate the YADIF filter graph.\n");
+      return false;
+   }
+
+   ret = avfilter_api.avfilter_graph_create_filter(
+         &video_deinterlace.buffer_src_ctx,
+         buffer, "aplayer_buffer", buffer_args, NULL,
+         video_deinterlace.graph);
+   if (ret < 0)
+      goto error;
+
+   ret = avfilter_api.avfilter_graph_create_filter(
+         &video_deinterlace.yadif_ctx,
+         yadif, "aplayer_yadif",
+         video_deinterlace_filter_args(video_deinterlace_mode), NULL,
+         video_deinterlace.graph);
+   if (ret < 0)
+      goto error;
+
+   ret = avfilter_api.avfilter_graph_create_filter(
+         &video_deinterlace.buffer_sink_ctx,
+         buffersink, "aplayer_buffersink", NULL, NULL,
+         video_deinterlace.graph);
+   if (ret < 0)
+      goto error;
+
+   ret = avfilter_api.avfilter_link(video_deinterlace.buffer_src_ctx, 0,
+         video_deinterlace.yadif_ctx, 0);
+   if (ret < 0)
+      goto error;
+
+   ret = avfilter_api.avfilter_link(video_deinterlace.yadif_ctx, 0,
+         video_deinterlace.buffer_sink_ctx, 0);
+   if (ret < 0)
+      goto error;
+
+   ret = avfilter_api.avfilter_graph_config(video_deinterlace.graph, NULL);
+   if (ret < 0)
+      goto error;
+
+   video_deinterlace.width = width;
+   video_deinterlace.height = height;
+   video_deinterlace.pix_fmt = (enum AVPixelFormat)frame->format;
+   video_deinterlace.time_base = time_base;
+   video_deinterlace.sample_aspect_ratio = sar;
+   video_deinterlace.mode = video_deinterlace_mode;
+   video_deinterlace.unavailable_logged = false;
+
+   if (!video_deinterlace.enabled_logged)
+   {
+      log_cb(RETRO_LOG_INFO,
+            "[APLAYER] Video deinterlacing enabled: %s (%ux%u %s)\n",
+            video_deinterlace_mode_name(video_deinterlace_mode),
+            width, height,
+            pix_fmt_name ? pix_fmt_name : "unknown");
+      video_deinterlace.enabled_logged = true;
+   }
+
+   return true;
+
+error:
+   log_cb(RETRO_LOG_ERROR,
+         "[APLAYER] Failed to initialize the YADIF filter graph: %s\n",
+         av_err2str(ret));
+   video_deinterlace_close();
+   return false;
+}
+
+static AVFrame *video_deinterlace_filter_frame(video_decoder_context_t *ctx)
+{
+   int ret;
+
+   if (!ctx || !ctx->source || !ctx->filtered)
+      return ctx ? ctx->source : NULL;
+
+   av_frame_unref(ctx->filtered);
+
+   if (video_deinterlace_reset_pending ||
+       video_deinterlace_mode == APLAYER_DEINTERLACE_DISABLED)
+   {
+      if (video_deinterlace.graph)
+         video_deinterlace_close();
+      video_deinterlace_reset_pending = false;
+
+      if (video_deinterlace_mode == APLAYER_DEINTERLACE_DISABLED)
+         return ctx->source;
+   }
+
+   if (!video_deinterlace_should_process(ctx->source))
+      return ctx->source;
+
+   if (!video_deinterlace_ensure_graph(ctx->source))
+      return ctx->source;
+
+   ret = avfilter_api.av_buffersrc_add_frame_flags(
+         video_deinterlace.buffer_src_ctx,
+         ctx->source,
+         AV_BUFFERSRC_FLAG_KEEP_REF);
+   if (ret < 0)
+   {
+      log_cb(RETRO_LOG_ERROR,
+            "[APLAYER] Failed to queue a frame into YADIF: %s\n",
+            av_err2str(ret));
+      video_deinterlace_close();
+      return ctx->source;
+   }
+
+   ret = avfilter_api.av_buffersink_get_frame(
+         video_deinterlace.buffer_sink_ctx,
+         ctx->filtered);
+   if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+      return ctx->source;
+
+   if (ret < 0)
+   {
+      log_cb(RETRO_LOG_ERROR,
+            "[APLAYER] Failed to receive a YADIF frame: %s\n",
+            av_err2str(ret));
+      av_frame_unref(ctx->filtered);
+      video_deinterlace_close();
+      return ctx->source;
+   }
+
+   return ctx->filtered;
 }
 
 static const char *stream_metadata_value(AVStream *stream, const char *key)
@@ -1607,6 +2020,8 @@ void retro_init(void)
 void retro_deinit(void)
 {
    libretro_supports_bitmasks = false;
+   video_deinterlace_close();
+   video_deinterlace_reset_pending = false;
 
    if (video_buffer)
    {
@@ -1641,7 +2056,7 @@ void retro_get_system_info(struct retro_system_info *info)
 {
    memset(info, 0, sizeof(*info));
    info->library_name     = "Alpha Player";
-   info->library_version  = "v2.4.0";
+   info->library_version  = "v2.5.0";
    info->need_fullpath    = true;
    info->valid_extensions = "mkv|avi|f4v|f4f|3gp|ogm|flv|mp4|mp3|flac|ogg|m4a|webm|3g2|mov|wmv|mpg|mpeg|vob|asf|divx|m2p|m2ts|ps|ts|mxf|wma|wav|m3u|s3m|it|xm|mod|ay|gbs|gym|hes|kss|nsf|nsfe|sap|spc|vgm|vgz";
 }
@@ -1719,6 +2134,16 @@ void retro_set_environment(retro_environment_t cb)
             {"1.35", "1.35x"},
             {NULL, NULL}
          }, "1.00"
+      },
+      {
+         "aplayer_video_deinterlace", "Deinterlace", "Uses FFmpeg YADIF deinterlacing for interlaced video. Auto only deinterlaces frames marked as interlaced, while YADIF Always forces the filter on every frame.",
+         NULL, NULL, "video",
+         {
+            {"disabled", "Off"},
+            {"auto", "Auto"},
+            {"forced", "Always"},
+            {NULL, NULL}
+         }, "auto"
       },
       {
          "aplayer_audio_language", "Preferred Language", "Selects the default audio track language when matching streams are tagged in the media file. Falls back to the file default track, or the first audio track when no default is flagged.",
@@ -2105,6 +2530,8 @@ static void check_variables(bool firststart)
    struct retro_variable fft_toggle_var = {0};
    struct retro_variable video_blending_var = {0};
    struct retro_variable video_zoom_var = {0};
+   struct retro_variable video_deinterlace_var = {0};
+   enum aplayer_deinterlace_mode old_deinterlace_mode = video_deinterlace_mode;
 
    fft_width  = 640;
    fft_height = 480;
@@ -2141,6 +2568,31 @@ static void check_variables(bool firststart)
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &video_zoom_var) &&
          video_zoom_var.value)
       video_zoom = parse_video_zoom_value(video_zoom_var.value);
+
+   video_deinterlace_mode = APLAYER_DEINTERLACE_AUTO;
+   video_deinterlace_var.key = "aplayer_video_deinterlace";
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &video_deinterlace_var) &&
+         video_deinterlace_var.value)
+   {
+      if (string_is_equal(video_deinterlace_var.value, "disabled"))
+         video_deinterlace_mode = APLAYER_DEINTERLACE_DISABLED;
+      else if (string_is_equal(video_deinterlace_var.value, "forced"))
+         video_deinterlace_mode = APLAYER_DEINTERLACE_FORCED;
+   }
+
+   if (!firststart && old_deinterlace_mode != video_deinterlace_mode)
+   {
+      if (decode_thread_lock)
+         slock_lock(decode_thread_lock);
+      video_deinterlace_reset_pending = true;
+      if (decode_thread_lock)
+         slock_unlock(decode_thread_lock);
+
+      log_cb(RETRO_LOG_INFO,
+            "[APLAYER] Deinterlace updated: %s -> %s\n",
+            video_deinterlace_mode_name(old_deinterlace_mode),
+            video_deinterlace_mode_name(video_deinterlace_mode));
+   }
 
    snprintf(preferred_audio_language, sizeof(preferred_audio_language), "%s",
          APLAYER_AUDIO_LANGUAGE_DEFAULT);
@@ -4900,31 +5352,39 @@ static void sws_worker_thread(void *arg)
    AVFrame *tmp_frame = NULL;
    video_decoder_context_t *ctx = (video_decoder_context_t*) arg;
 
-   tmp_frame = ctx->source;
+   tmp_frame = ctx->filtered && ctx->filtered->data[0] ?
+         ctx->filtered : ctx->source;
 
    ctx->sws = sws_getCachedContext(ctx->sws,
-         media.width, media.height, (enum AVPixelFormat)tmp_frame->format,
+         tmp_frame->width > 0 ? tmp_frame->width : media.width,
+         tmp_frame->height > 0 ? tmp_frame->height : media.height,
+         (enum AVPixelFormat)tmp_frame->format,
          media.width, media.height, AV_PIX_FMT_RGB32,
          SWS_FAST_BILINEAR, NULL, NULL, NULL);
 
-   set_colorspace(ctx->sws, media.width, media.height,
+   set_colorspace(ctx->sws,
+         tmp_frame->width > 0 ? (unsigned)tmp_frame->width : media.width,
+         tmp_frame->height > 0 ? (unsigned)tmp_frame->height : media.height,
          tmp_frame->colorspace,
          tmp_frame->color_range);
 
    if ((ret = sws_scale(ctx->sws, (const uint8_t *const*)tmp_frame->data,
-         tmp_frame->linesize, 0, media.height,
+         tmp_frame->linesize, 0,
+         tmp_frame->height > 0 ? tmp_frame->height : (int)media.height,
          (uint8_t * const*)ctx->target->data, ctx->target->linesize)) < 0)
    {
       log_cb(RETRO_LOG_ERROR, "[APLAYER] Error while scaling image: %s\n", av_err2str(ret));
    }
 
-   ctx->pts = ctx->source->best_effort_timestamp;
+   ctx->pts = tmp_frame->best_effort_timestamp != AV_NOPTS_VALUE ?
+         tmp_frame->best_effort_timestamp : tmp_frame->pts;
 
    av_frame_unref(ctx->source);
+   av_frame_unref(ctx->filtered);
    video_buffer_finish_slot(video_buffer, ctx);
 }
 
-static void decode_video(AVCodecContext *ctx, AVPacket *pkt, size_t frame_size, ASS_Track *ass_track_active)
+static void decode_video(AVCodecContext *ctx, AVPacket *pkt, ASS_Track *ass_track_active)
 {
    int ret = 0;
    video_decoder_context_t *decoder_ctx = NULL;
@@ -5006,6 +5466,7 @@ static void decode_video(AVCodecContext *ctx, AVPacket *pkt, size_t frame_size, 
       }
 
       update_video_presentation_from_frame(decoder_ctx->source);
+      (void)video_deinterlace_filter_frame(decoder_ctx);
       decoder_ctx->ass_track_active = ass_track_active;
       /* Submit to worker thread which does sws_scale, etc. */
       tpool_add_work(tpool, sws_worker_thread, decoder_ctx);
@@ -5152,6 +5613,9 @@ static void decode_thread_seek(double time)
       tpool_wait(tpool);
       video_buffer_clear(video_buffer);
    }
+
+   video_deinterlace_close();
+   video_deinterlace_reset_pending = false;
 
    if (actx[audio_streams_ptr])
       avcodec_flush_buffers(actx[audio_streams_ptr]);
@@ -5385,7 +5849,7 @@ static void decode_thread(void *data)
       {
          packet_buffer_get_packet(video_packet_buffer, pkt_local);
 
-         decode_video(vctx, pkt_local, frame_size, ass_track_active);
+         decode_video(vctx, pkt_local, ass_track_active);
 
          av_packet_unref(pkt_local);
       }
@@ -5912,6 +6376,9 @@ void retro_unload_game(void)
       video_buffer_destroy(video_buffer);
       video_buffer = NULL;
    }
+
+   video_deinterlace_close();
+   video_deinterlace_reset_pending = false;
 
    if (fifo_cond)
       scond_free(fifo_cond);

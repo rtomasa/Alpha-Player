@@ -29,6 +29,8 @@ video_buffer_t *video_buffer_create(
 {
    unsigned i;
    video_buffer_t *b = (video_buffer_t*)malloc(sizeof(video_buffer_t));
+   (void)frame_size;
+
    if (!b)
       return NULL;
 
@@ -64,6 +66,7 @@ video_buffer_t *video_buffer_create(
       b->buffer[i].pts       = 0;
       b->buffer[i].sws       = sws_alloc_context();
       b->buffer[i].source    = av_frame_alloc();
+      b->buffer[i].filtered  = av_frame_alloc();
       b->buffer[i].target    = av_frame_alloc();
 
       AVFrame* frame = b->buffer[i].target;
@@ -72,6 +75,7 @@ video_buffer_t *video_buffer_create(
 
       if (!b->buffer[i].sws       ||
           !b->buffer[i].source    ||
+          !b->buffer[i].filtered  ||
           !b->buffer[i].target)
          goto fail;
    }
@@ -97,6 +101,7 @@ void video_buffer_destroy(video_buffer_t *video_buffer)
       for (i = 0; i < video_buffer->capacity; i++)
       {
          av_frame_free(&video_buffer->buffer[i].source);
+         av_frame_free(&video_buffer->buffer[i].filtered);
          av_freep((AVFrame*)video_buffer->buffer[i].target);
          av_frame_free(&video_buffer->buffer[i].target);
          sws_freeContext(video_buffer->buffer[i].sws);
@@ -120,7 +125,11 @@ void video_buffer_clear(video_buffer_t *video_buffer)
    video_buffer->head = 0;
    video_buffer->tail = 0;
    for (i = 0; i < video_buffer->capacity; i++)
+   {
+      av_frame_unref(video_buffer->buffer[i].source);
+      av_frame_unref(video_buffer->buffer[i].filtered);
       video_buffer->status[i] = KB_OPEN;
+   }
 
    slock_unlock(video_buffer->lock);
 }

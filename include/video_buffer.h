@@ -34,6 +34,7 @@ struct video_decoder_context
    int64_t pts;
    struct SwsContext *sws;
    AVFrame *source;
+   AVFrame *filtered;
    AVFrame *target;
    ASS_Track *ass_track_active;
    uint8_t *frame_buf;

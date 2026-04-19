@@ -93,6 +93,7 @@ ifeq ($(OPENGL),1)
 	HAVE_OPENGL = 1
 	HAVE_GL_FFT := 1
 endif
+   LIBS += -ldl
    HAVE_SSA := 1
 
 	HAVE_POLL_H = 1
@@ -113,6 +114,7 @@ else ifneq (,$(findstring raspberrypi,$(platform)))
    GL_LIB := -lGLESv2
    GLES := 1
    CFLAGS += -DHAVE_OPENGLES -DHAVE_OPENGLES3
+   LIBS += -ldl
 
    HAVE_SSA := 1
 	HAVE_POLL_H = 1
