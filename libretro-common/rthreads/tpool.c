@@ -255,10 +255,11 @@ void tpool_wait(tpool_t *tp)
 
    for (;;)
    {
-      /* working_cond is dual use. It signals when we're not stopping but the
-       * working_cnt is 0 indicating there isn't any work processing. If we
-       * are stopping it will trigger when there aren't any threads running. */
-      if ((!tp->stop && tp->working_cnt != 0) || (tp->stop && tp->thread_cnt != 0))
+      /* working_cond is dual use. It signals when we're not stopping and
+       * there is neither queued nor active work left to process. If we are
+       * stopping it will trigger when there aren't any threads running. */
+      if ((!tp->stop && (tp->working_cnt != 0 || tp->work_first != NULL)) ||
+            (tp->stop && tp->thread_cnt != 0))
          scond_wait(tp->working_cond, tp->work_mutex);
       else
          break;

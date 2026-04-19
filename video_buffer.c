@@ -66,7 +66,7 @@ video_buffer_t *video_buffer_create(
    {
       b->buffer[i].index     = i;
       b->buffer[i].pts       = 0;
-      b->buffer[i].sws       = sws_alloc_context();
+      b->buffer[i].sws       = NULL;
       b->buffer[i].source    = av_frame_alloc();
       b->buffer[i].filtered  = av_frame_alloc();
       b->buffer[i].target    = av_frame_alloc();
@@ -75,8 +75,7 @@ video_buffer_t *video_buffer_create(
       av_image_alloc(frame->data, frame->linesize,
             width, height, AV_PIX_FMT_RGB32, 1);
 
-      if (!b->buffer[i].sws       ||
-          !b->buffer[i].source    ||
+      if (!b->buffer[i].source    ||
           !b->buffer[i].filtered  ||
           !b->buffer[i].target)
          goto fail;
