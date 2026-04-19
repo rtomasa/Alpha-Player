@@ -405,6 +405,8 @@ static unsigned target_refresh_retry_frames = 0;
 static char preferred_audio_language[16] = APLAYER_AUDIO_LANGUAGE_DEFAULT;
 static enum aplayer_deinterlace_mode video_deinterlace_mode = APLAYER_DEINTERLACE_AUTO;
 static volatile bool video_deinterlace_reset_pending = false;
+static volatile bool playback_restart_request = false;
+static volatile bool playback_restart_pending = false;
 static struct aplayer_avfilter_api avfilter_api = {0};
 static struct aplayer_deinterlace_state video_deinterlace = {0};
 
@@ -473,6 +475,37 @@ static void media_reset_defaults(void)
    target_refresh_retry_active = false;
    target_refresh_retry_frames = 0;
    video_deinterlace_reset_pending = true;
+   playback_restart_request = false;
+   playback_restart_pending = false;
+   video_deinterlace.enabled_logged = false;
+   video_deinterlace.unavailable_logged = false;
+}
+
+static void aplayer_reset_playback_timing_to_start(void)
+{
+   frame_cnt = 0;
+   audio_frames = 0;
+   pts_bias = 0.0;
+   frames[0].pts = 0.0;
+   frames[1].pts = 0.0;
+   frames[0].valid = false;
+   frames[1].valid = false;
+
+   if (time_lock)
+      slock_lock(time_lock);
+   g_current_time = 0.0;
+   if (time_lock)
+      slock_unlock(time_lock);
+}
+
+static bool aplayer_consume_playback_restart_pending(void)
+{
+   if (!playback_restart_pending)
+      return false;
+
+   playback_restart_pending = false;
+   aplayer_reset_playback_timing_to_start();
+   return true;
 }
 
 static const char *video_deinterlace_mode_name(enum aplayer_deinterlace_mode mode)
@@ -548,7 +581,6 @@ static void video_deinterlace_close(void)
    video_deinterlace.time_base = (AVRational){0, 1};
    video_deinterlace.sample_aspect_ratio = (AVRational){0, 1};
    video_deinterlace.mode = APLAYER_DEINTERLACE_DISABLED;
-   video_deinterlace.enabled_logged = false;
 }
 
 static bool avfilter_api_load(void)
@@ -2022,6 +2054,8 @@ void retro_deinit(void)
    libretro_supports_bitmasks = false;
    video_deinterlace_close();
    video_deinterlace_reset_pending = false;
+   playback_restart_request = false;
+   playback_restart_pending = false;
 
    if (video_buffer)
    {
@@ -2585,6 +2619,7 @@ static void check_variables(bool firststart)
       if (decode_thread_lock)
          slock_lock(decode_thread_lock);
       video_deinterlace_reset_pending = true;
+      video_deinterlace.enabled_logged = false;
       if (decode_thread_lock)
          slock_unlock(decode_thread_lock);
 
@@ -3339,6 +3374,9 @@ void retro_run(void)
       // Do not process audio or advance frames.
       return;
    }
+
+   aplayer_consume_playback_restart_pending();
+
    /* M3U */
    if (do_seek && seek_time == 0.0 && playlist_count > 0)
    {
@@ -3490,7 +3528,15 @@ void retro_run(void)
             video_decoder_context_t *ctx = NULL;
             uint32_t               *pixels = NULL;
 
-            video_buffer_wait_for_finished_slot(video_buffer);
+            if (!video_buffer_wait_for_finished_slot(video_buffer))
+            {
+               if (aplayer_consume_playback_restart_pending())
+                  min_pts = frame_cnt / media.interpolate_fps + pts_bias;
+               continue;
+            }
+
+            if (aplayer_consume_playback_restart_pending())
+               min_pts = frame_cnt / media.interpolate_fps + pts_bias;
 
             video_buffer_get_finished_slot(video_buffer, &ctx);
             pts                          = ctx->pts;
@@ -5616,6 +5662,8 @@ static void decode_thread_seek(double time)
 
    video_deinterlace_close();
    video_deinterlace_reset_pending = false;
+   playback_restart_request = false;
+   playback_restart_pending = false;
 
    if (actx[audio_streams_ptr])
       avcodec_flush_buffers(actx[audio_streams_ptr]);
@@ -5759,6 +5807,8 @@ static void decode_thread(void *data)
 
       if (seek)
       {
+         bool restart_request = playback_restart_request;
+
          decode_thread_seek(seek_time_thread);
 
          slock_lock(fifo_lock);
@@ -5775,6 +5825,12 @@ static void decode_thread(void *data)
          // Reset packet buffer states
          packet_buffer_clear(&audio_packet_buffer);
          packet_buffer_clear(&video_packet_buffer);
+
+         if (restart_request)
+         {
+            playback_restart_pending = true;
+            playback_restart_request = false;
+         }
 
          scond_signal(fifo_cond);
          slock_unlock(fifo_lock);
@@ -5867,7 +5923,11 @@ static void decode_thread(void *data)
          break;
       case MEDIA_TYPE_VIDEO:
       default:
-         loop_content = packet_buffer_empty(audio_packet_buffer) && packet_buffer_empty(video_packet_buffer) && eof;
+         loop_content = packet_buffer_empty(audio_packet_buffer) &&
+                        packet_buffer_empty(video_packet_buffer) &&
+                        eof &&
+                        (!audio_decode_fifo || FIFO_READ_AVAIL(audio_decode_fifo) <= 1024 * 10) &&
+                        (!video_buffer || !video_buffer_has_finished_slot(video_buffer));
          break;
       }
 
@@ -5908,6 +5968,7 @@ static void decode_thread(void *data)
          case LOOP_TRACK:
             // Always loop the current track, regardless of whether we're part of a playlist.
             slock_lock(fifo_lock);
+            playback_restart_request = true;
             do_seek = true;
             seek_time = 0.0;
             eof = false; // Reset the EOF flag.
@@ -5937,6 +5998,7 @@ static void decode_thread(void *data)
             {
                // If no playlist (single file), behave like LOOP_TRACK.
                slock_lock(fifo_lock);
+               playback_restart_request = true;
                do_seek = true;
                seek_time = 0.0;
                eof = false;
@@ -5968,6 +6030,7 @@ static void decode_thread(void *data)
             {
                // If playing a single file, behave like LOOP_TRACK.
                slock_lock(fifo_lock);
+               playback_restart_request = true;
                do_seek = true;
                seek_time = 0.0;
                eof = false;

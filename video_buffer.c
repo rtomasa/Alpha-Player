@@ -16,6 +16,7 @@ struct video_buffer
 {
    int64_t head;
    int64_t tail;
+   uint64_t clear_count;
    video_decoder_context_t *buffer;
    enum kbStatus *status;
    slock_t *lock;
@@ -41,6 +42,7 @@ video_buffer_t *video_buffer_create(
    b->finished_cond = NULL;
    b->head          = 0;
    b->tail          = 0;
+   b->clear_count   = 0;
    b->status        = (enum kbStatus*)malloc(sizeof(enum kbStatus) * capacity);
 
    if (!b->status)
@@ -124,6 +126,7 @@ void video_buffer_clear(video_buffer_t *video_buffer)
 
    video_buffer->head = 0;
    video_buffer->tail = 0;
+   video_buffer->clear_count++;
    for (i = 0; i < video_buffer->capacity; i++)
    {
       av_frame_unref(video_buffer->buffer[i].source);
@@ -224,14 +227,25 @@ bool video_buffer_wait_for_open_slot(video_buffer_t *video_buffer)
 
 bool video_buffer_wait_for_finished_slot(video_buffer_t *video_buffer)
 {
+   uint64_t clear_count = 0;
+   bool ready = false;
+
    slock_lock(video_buffer->lock);
+   clear_count = video_buffer->clear_count;
 
    while (video_buffer->status[video_buffer->tail] != KB_FINISHED)
+   {
       scond_wait(video_buffer->finished_cond, video_buffer->lock);
+      if (clear_count != video_buffer->clear_count &&
+            video_buffer->status[video_buffer->tail] != KB_FINISHED)
+         break;
+   }
+
+   ready = video_buffer->status[video_buffer->tail] == KB_FINISHED;
 
    slock_unlock(video_buffer->lock);
 
-   return true;
+   return ready;
 }
 
 bool video_buffer_has_open_slot(video_buffer_t *video_buffer)
