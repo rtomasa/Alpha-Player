@@ -73,6 +73,8 @@ retro_log_printf_t log_cb;
 #define APLAYER_BOOKMARK_MIN_TIME 1.0
 #define APLAYER_VIDEO_ZOOM_MIN 0.75f
 #define APLAYER_VIDEO_ZOOM_MAX 1.35f
+#define APLAYER_AUDIO_PACKET_BUFFER_LIMIT 128
+#define APLAYER_AUDIO_SWITCH_PREROLL_SECONDS 0.15
 
 enum aplayer_deinterlace_mode
 {
@@ -3396,20 +3398,17 @@ void retro_run(void)
          {
             int next_audio_stream_ptr;
 
-            // Safely update the new audio track index.
+            /* Select the new audio track without disturbing video decode state.
+             * A full seek here can restart H.264 between reference frames. */
             slock_lock(decode_thread_lock);
             audio_streams_ptr = (audio_streams_ptr + 1) % audio_streams_num;
             next_audio_stream_ptr = audio_streams_ptr;
+            audio_switch_requested = true;
             slock_unlock(decode_thread_lock);
 
-            // Flush the decode pipelines so the new track starts in sync.
             slock_lock(fifo_lock);
-            do_seek = true;
-
-            slock_lock(time_lock);
-            seek_time = g_current_time;
-            slock_unlock(time_lock);
             scond_signal(fifo_cond);
+            scond_signal(fifo_decode_cond);
             slock_unlock(fifo_lock);
             audio_selection_label(next_audio_stream_ptr, msg, sizeof(msg));
          }
@@ -4089,6 +4088,34 @@ static int subtitle_slot_for_stream(int stream_index)
    }
 
    return -1;
+}
+
+static int audio_slot_for_stream(int stream_index)
+{
+   for (int i = 0; i < audio_streams_num; i++)
+   {
+      if (audio_streams[i] == stream_index)
+         return i;
+   }
+
+   return -1;
+}
+
+static void audio_packet_buffer_drop_stale(packet_buffer_t *buffer,
+      double timebase, double target_time)
+{
+   if (!buffer || timebase <= 0.0)
+      return;
+
+   while (!packet_buffer_empty(buffer))
+   {
+      int64_t end_pts = packet_buffer_peek_end_pts(buffer);
+      if (end_pts == AV_NOPTS_VALUE || end_pts < 0)
+         break;
+      if ((double)end_pts * timebase >= target_time)
+         break;
+      packet_buffer_drop_packet(buffer);
+   }
 }
 
 static bool open_codecs(void)
@@ -5679,7 +5706,7 @@ static void decode_video(AVCodecContext *ctx, AVPacket *pkt, ASS_Track *ass_trac
 
 static int16_t *decode_audio(AVCodecContext *ctx, AVPacket *pkt,
       AVFrame *frame, int16_t *buffer, size_t *buffer_cap,
-      SwrContext *swr)
+      SwrContext *swr, bool *clock_rebase_pending)
 {
    int ret = 0;
    int64_t pts = 0;
@@ -5763,6 +5790,11 @@ static int16_t *decode_audio(AVCodecContext *ctx, AVPacket *pkt,
       while (!decode_thread_dead &&
             FIFO_WRITE_AVAIL(audio_decode_fifo) < required_buffer)
       {
+         if (audio_switch_requested)
+         {
+            scond_signal(fifo_cond);
+            break;
+         }
          if (do_seek)
          {
             scond_signal(fifo_cond);
@@ -5784,8 +5816,24 @@ static int16_t *decode_audio(AVCodecContext *ctx, AVPacket *pkt,
          }
       }
 
-      decode_last_audio_time = pts * av_q2d(
-            fctx->streams[audio_streams[audio_streams_ptr]]->time_base);
+      if (audio_switch_requested)
+      {
+         scond_signal(fifo_cond);
+         slock_unlock(fifo_lock);
+         break;
+      }
+
+      if (clock_rebase_pending && *clock_rebase_pending)
+      {
+         double queued_seconds = (double)(FIFO_READ_AVAIL(audio_decode_fifo) +
+               required_buffer) / (media.sample_rate * bytes_per_frame);
+         decode_last_audio_time = (double)audio_frames / media.sample_rate +
+               pts_bias + queued_seconds;
+         *clock_rebase_pending = false;
+      }
+      else
+         decode_last_audio_time = pts * av_q2d(
+               fctx->streams[audio_streams[audio_streams_ptr]]->time_base);
 
       if (!decode_thread_dead &&
             FIFO_WRITE_AVAIL(audio_decode_fifo) >= required_buffer)
@@ -5859,7 +5907,9 @@ static void decode_thread(void *data)
    size_t frame_size       = 0;
    int16_t *audio_buffer   = NULL;
    size_t audio_buffer_cap = 0;
-   packet_buffer_t *audio_packet_buffer;
+   bool audio_clock_rebase_pending = false;
+   packet_buffer_t *audio_packet_buffers[MAX_STREAMS] = {0};
+   packet_buffer_t *audio_packet_buffer = NULL;
    packet_buffer_t *video_packet_buffer;
    double last_audio_end  = 0;
 
@@ -5916,7 +5966,8 @@ static void decode_thread(void *data)
    }
 
    aud_frame = av_frame_alloc();
-   audio_packet_buffer = packet_buffer_create();
+   for (i = 0; (int)i < audio_streams_num; i++)
+      audio_packet_buffers[i] = packet_buffer_create();
    video_packet_buffer = packet_buffer_create();
 
    if (video_stream_index >= 0)
@@ -5981,7 +6032,8 @@ static void decode_thread(void *data)
             fifo_clear(audio_decode_fifo);
 
          // Reset packet buffer states
-         packet_buffer_clear(&audio_packet_buffer);
+         for (i = 0; (int)i < audio_streams_num; i++)
+            packet_buffer_clear(&audio_packet_buffers[i]);
          packet_buffer_clear(&video_packet_buffer);
 
          if (restart_request)
@@ -5995,6 +6047,48 @@ static void decode_thread(void *data)
       }
 
       slock_lock(decode_thread_lock);
+      if (audio_switch_requested)
+      {
+         int ret;
+         int switched_audio_stream_ptr = audio_streams_ptr;
+         for (i = 0; (int)i < audio_streams_num; i++)
+         {
+            if (actx[i])
+               avcodec_flush_buffers(actx[i]);
+            if (swr[i])
+            {
+               swr_close(swr[i]);
+               ret = swr_init(swr[i]);
+               if (ret < 0)
+                  log_cb(RETRO_LOG_ERROR,
+                        "[APLAYER] Failed to reset audio resampler: %s\n",
+                        av_err2str(ret));
+            }
+         }
+         audio_switch_requested = false;
+         if (aud_frame)
+            av_frame_unref(aud_frame);
+         slock_unlock(decode_thread_lock);
+
+         slock_lock(fifo_lock);
+         if (audio_decode_fifo)
+            fifo_clear(audio_decode_fifo);
+         audio_packet_buffer = audio_packet_buffers[switched_audio_stream_ptr];
+         audio_packet_buffer_drop_stale(audio_packet_buffer,
+               av_q2d(fctx->streams[audio_streams[switched_audio_stream_ptr]]->time_base),
+               (double)audio_frames / media.sample_rate + pts_bias -
+                  APLAYER_AUDIO_SWITCH_PREROLL_SECONDS);
+         decode_last_audio_time = (double)audio_frames / media.sample_rate + pts_bias;
+         last_audio_end = decode_last_audio_time;
+         audio_clock_rebase_pending = true;
+         scond_signal(fifo_cond);
+         scond_signal(fifo_decode_cond);
+         slock_unlock(fifo_lock);
+      }
+      else
+         slock_unlock(decode_thread_lock);
+
+      slock_lock(decode_thread_lock);
       audio_stream_index          = audio_streams[audio_streams_ptr];
       audio_stream_ptr            = audio_streams_ptr;
       actx_active                 = actx[audio_streams_ptr];
@@ -6004,6 +6098,7 @@ static void decode_thread(void *data)
       if (video_stream_index >= 0)
          video_timebase = av_q2d(fctx->streams[video_stream_index]->time_base);
       slock_unlock(decode_thread_lock);
+      audio_packet_buffer = audio_packet_buffers[audio_stream_ptr];
 
       video_filter_drain_to_buffer(ass_track_active);
 
@@ -6045,9 +6140,13 @@ static void decode_thread(void *data)
          last_audio_end = audio_timebase * (pkt_local->pts + pkt_local->duration);
          audio_buffer = decode_audio(actx_active, pkt_local, aud_frame,
                                     audio_buffer, &audio_buffer_cap,
-                                    swr[audio_stream_ptr]);
+                                    swr[audio_stream_ptr],
+                                    &audio_clock_rebase_pending);
          av_packet_unref(pkt_local);
       }
+
+      if (audio_switch_requested)
+         continue;
 
       /*
        * Decode video packet if:
@@ -6055,7 +6154,8 @@ static void decode_thread(void *data)
        *  2. there is no audio stream to play
        *  3. EOF
        **/
-      if (!packet_buffer_empty(video_packet_buffer) &&
+      if (!audio_clock_rebase_pending &&
+            !packet_buffer_empty(video_packet_buffer) &&
             (
                (!eof && earlier_or_close_enough(next_video_end, last_audio_end)) ||
                !actx_active ||
@@ -6212,35 +6312,6 @@ static void decode_thread(void *data)
             break;
       }
 
-      // Check if an audio track switch has been requested.
-      if (audio_switch_requested)
-      {
-         // Acquire the FIFO lock if necessary (or other audio state lock)
-         slock_lock(fifo_lock);
-
-         // Flush FIFO to drop any packets from the old track.
-         if (audio_decode_fifo) {
-            fifo_clear(audio_decode_fifo);
-         }
-
-         // Flush the audio codec buffers for the old track.
-         if (actx[audio_streams_ptr]) {
-            avcodec_flush_buffers(actx[audio_streams_ptr]);
-         }
-         
-         // Reset timing variables (as an example; adjust to your logic).
-         decode_last_audio_time = 0;
-         audio_frames = 0;
-         
-         // Signal any condition variable to re-awaken waiting threads.
-         scond_signal(fifo_cond);
-
-         // Clear the switch request flag.
-         audio_switch_requested = false;
-         
-         slock_unlock(fifo_lock);
-      }
-
       // Read the next frame and stage it in case of audio or video frame.
       if (av_read_frame(fctx, pkt_local) < 0)
       {
@@ -6258,8 +6329,14 @@ static void decode_thread(void *data)
             slock_unlock(time_lock);
          }
 
-         if (pkt_local->stream_index == audio_stream_index && actx_active)
-            packet_buffer_add_packet(audio_packet_buffer, pkt_local);
+         int audio_slot = audio_slot_for_stream(pkt_local->stream_index);
+         if (audio_slot >= 0 && actx[audio_slot])
+         {
+            packet_buffer_add_packet(audio_packet_buffers[audio_slot], pkt_local);
+            if (audio_slot != audio_stream_ptr)
+               packet_buffer_trim(audio_packet_buffers[audio_slot],
+                     APLAYER_AUDIO_PACKET_BUFFER_LIMIT);
+         }
          else if (pkt_local->stream_index == video_stream_index)
             packet_buffer_add_packet(video_packet_buffer, pkt_local);
          else
@@ -6466,7 +6543,8 @@ end:
    for (i = 0; (int)i < audio_streams_num; i++)
       swr_free(&swr[i]);
 
-   packet_buffer_destroy(audio_packet_buffer);
+   for (i = 0; (int)i < audio_streams_num; i++)
+      packet_buffer_destroy(audio_packet_buffers[i]);
    packet_buffer_destroy(video_packet_buffer);
 
    av_frame_free(&aud_frame);

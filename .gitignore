@@ -10,3 +10,4 @@ NOTES.md
 .codex
 *.o
 .vscode/pro-deployer.json
+alpha_player_libretro.so

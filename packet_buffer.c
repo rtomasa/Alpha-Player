@@ -120,6 +120,34 @@ void packet_buffer_get_packet(packet_buffer_t *packet_buffer, AVPacket *pkt)
    packet_buffer->size--;
 }
 
+void packet_buffer_drop_packet(packet_buffer_t *packet_buffer)
+{
+   AVPacketNode_t *new_tail = NULL;
+
+   if (!packet_buffer || !packet_buffer->tail)
+      return;
+
+   if (packet_buffer->tail->previous)
+   {
+      new_tail = packet_buffer->tail->previous;
+      new_tail->next = NULL;
+   }
+   else
+      packet_buffer->head = NULL;
+
+   av_packet_free(&packet_buffer->tail->data);
+   free(packet_buffer->tail);
+
+   packet_buffer->tail = new_tail;
+   packet_buffer->size--;
+}
+
+void packet_buffer_trim(packet_buffer_t *packet_buffer, size_t max_packets)
+{
+   while (packet_buffer && packet_buffer->size > max_packets)
+      packet_buffer_drop_packet(packet_buffer);
+}
+
 int64_t packet_buffer_peek_start_pts(packet_buffer_t *packet_buffer)
 {
    if (!packet_buffer->tail)

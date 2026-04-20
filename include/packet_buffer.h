@@ -94,6 +94,25 @@ void packet_buffer_add_packet(packet_buffer_t *packet_buffer, AVPacket *pkt);
 void packet_buffer_get_packet(packet_buffer_t *packet_buffer, AVPacket *pkt);
 
 /**
+ * packet_buffer_drop_packet:
+ * @packet_buffer      : packet buffer
+ *
+ * Drops the next packet without returning it.
+ *
+ **/
+void packet_buffer_drop_packet(packet_buffer_t *packet_buffer);
+
+/**
+ * packet_buffer_trim:
+ * @packet_buffer      : packet buffer
+ * @max_packets        : maximum packets to retain
+ *
+ * Drops oldest packets until the buffer is at or below max_packets.
+ *
+ **/
+void packet_buffer_trim(packet_buffer_t *packet_buffer, size_t max_packets);
+
+/**
  * packet_buffer_peek_start_pts:
  * @packet_buffer      : packet buffer
  *
