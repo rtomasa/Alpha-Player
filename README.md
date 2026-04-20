@@ -59,10 +59,8 @@ This core has been modified focusing on Raspberry Pi devices using a development
 * Frame Blending - Off, Low, Medium, High or Full
 * Zoom - `0.75x` to `1.35x` in `0.05x` increments
 * Deinterlace - Off, `Auto`, `Always`
-* Fixed Framerate - Off or `60 Hz`
 * `Auto` only deinterlaces frames marked as interlaced by FFmpeg and leaves progressive frames unchanged
 * `Always` forces deinterlace on every decoded frame and is mainly intended for broken/misflagged sources
-* `60 Hz` uses FFmpeg's `fps` filter to duplicate/drop video frames so decoded output is forced to 60 fps
 * Up to `1.00x`, zoom scales the image uniformly while preserving the source aspect
 * Above `1.00x`, the player progressively crops toward the current frontend display aspect when `RETRO_ENVIRONMENT_GET_DISPLAY_INFO` is available, falling back to the viewport aspect only when display data is incomplete
 
@@ -75,8 +73,6 @@ If a video has an external subtitle file with the same name and a `.srt` extensi
 # v2.5.0
 - [X] Added automatic `YADIF` deinterlacing for interlaced video
 - [X] Added video `DEINTERLACE` option with `Off`, `Auto` and `Always`
-- [X] Added video `FIXED FRAMERATE` option with `Off` and `60 Hz` modes
-    - Enabling `60 Hz` reports 60 fps to the frontend, while `Off` keeps using the frontend target refresh
 - [X] Fixed loop mode playback stalls and restart timing near the end of media
 
 # v2.4.0

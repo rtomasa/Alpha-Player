@@ -105,7 +105,6 @@ struct aplayer_video_filter_state
    AVFilterGraph *graph;
    AVFilterContext *buffer_src_ctx;
    AVFilterContext *yadif_ctx;
-   AVFilterContext *fps_ctx;
    AVFilterContext *buffer_sink_ctx;
    unsigned width;
    unsigned height;
@@ -114,12 +113,8 @@ struct aplayer_video_filter_state
    AVRational sample_aspect_ratio;
    enum aplayer_deinterlace_mode mode;
    bool use_yadif;
-   bool use_fps;
-   double target_fps;
    bool enabled_logged;
    bool unavailable_logged;
-   bool eof_sent;
-   bool eof_drained;
 };
 
 static char playlist[MAX_PLAYLIST_ENTRIES][PATH_MAX];
@@ -410,7 +405,6 @@ static bool target_refresh_retry_active = false;
 static unsigned target_refresh_retry_frames = 0;
 static char preferred_audio_language[16] = APLAYER_AUDIO_LANGUAGE_DEFAULT;
 static enum aplayer_deinterlace_mode video_deinterlace_mode = APLAYER_DEINTERLACE_AUTO;
-static bool video_force_60fps = false;
 static volatile bool video_filter_reset_pending = false;
 static volatile bool playback_restart_request = false;
 static volatile bool playback_restart_pending = false;
@@ -459,7 +453,7 @@ static GLint mix_loc;
 static void media_reset_defaults(void)
 {
    memset(&media, 0, sizeof(media));
-   media.interpolate_fps = 60.0;   // your current default
+   media.interpolate_fps = 60.0;   // fallback until target refresh is known
    media.sample_rate     = 32000.0; // safe default until audio stream is opened
    media.aspect          = 0.0f;    // force recompute
    video_fill_target_aspect = 0.0f;
@@ -486,8 +480,6 @@ static void media_reset_defaults(void)
    playback_restart_pending = false;
    video_filter.enabled_logged = false;
    video_filter.unavailable_logged = false;
-   video_filter.eof_sent = false;
-   video_filter.eof_drained = false;
 }
 
 static void aplayer_reset_playback_timing_to_start(void)
@@ -575,19 +567,9 @@ static bool video_stream_is_interlaced(void)
          vctx->field_order != AV_FIELD_UNKNOWN;
 }
 
-static bool video_filter_fps_differ(double lhs, double rhs)
+static bool playback_rates_differ(double lhs, double rhs)
 {
    return lhs < rhs - 0.001 || lhs > rhs + 0.001;
-}
-
-static double video_filter_target_fps(void)
-{
-   return 60.0;
-}
-
-static bool video_filter_should_use_fps(void)
-{
-   return video_force_60fps;
 }
 
 static bool video_filter_should_use_yadif(const AVFrame *frame)
@@ -606,39 +588,18 @@ static bool video_filter_should_use_yadif(const AVFrame *frame)
 
 static bool video_filter_should_process(const AVFrame *frame)
 {
-   return video_filter_should_use_yadif(frame) || video_filter_should_use_fps();
+   return video_filter_should_use_yadif(frame);
 }
 
-static void video_filter_build_fps_args(double target_fps,
-      char *args, size_t args_size)
+static void video_filter_build_pipeline_label(bool use_yadif,
+      char *label, size_t label_size)
 {
-   AVRational fps = av_d2q(target_fps > 0.0 ? target_fps : 60.0, 1000000);
-
-   if (!args || args_size == 0)
-      return;
-
-   if (fps.num <= 0 || fps.den <= 0)
-      fps = (AVRational){60, 1};
-
-   snprintf(args, args_size, "fps=%d/%d:round=near", fps.num, fps.den);
-}
-
-static void video_filter_build_pipeline_label(bool use_yadif, bool use_fps,
-      double target_fps, char *label, size_t label_size)
-{
-   (void)target_fps;
-
    if (!label || label_size == 0)
       return;
 
-   if (use_yadif && use_fps)
-      snprintf(label, label_size, "%s + 60 Hz CFR",
-            video_deinterlace_mode_name(video_deinterlace_mode));
-   else if (use_yadif)
+   if (use_yadif)
       snprintf(label, label_size, "%s",
             video_deinterlace_mode_name(video_deinterlace_mode));
-   else if (use_fps)
-      snprintf(label, label_size, "60 Hz CFR");
    else
       snprintf(label, label_size, "Off");
 }
@@ -653,7 +614,6 @@ static void video_filter_close(void)
 
    video_filter.buffer_src_ctx = NULL;
    video_filter.yadif_ctx = NULL;
-   video_filter.fps_ctx = NULL;
    video_filter.buffer_sink_ctx = NULL;
    video_filter.width = 0;
    video_filter.height = 0;
@@ -662,10 +622,6 @@ static void video_filter_close(void)
    video_filter.sample_aspect_ratio = (AVRational){0, 1};
    video_filter.mode = APLAYER_DEINTERLACE_DISABLED;
    video_filter.use_yadif = false;
-   video_filter.use_fps = false;
-   video_filter.target_fps = 0.0;
-   video_filter.eof_sent = false;
-   video_filter.eof_drained = false;
 }
 
 static bool avfilter_api_load(void)
@@ -766,7 +722,6 @@ static bool video_filter_drain_to_buffer(ASS_Track *ass_track_active)
       }
       if (ret == AVERROR_EOF)
       {
-         video_filter.eof_drained = true;
          video_buffer_return_open_slot(video_buffer, ctx);
          break;
       }
@@ -788,64 +743,33 @@ static bool video_filter_drain_to_buffer(ASS_Track *ass_track_active)
    return drained;
 }
 
-static void video_filter_send_eof(void)
-{
-   int ret;
-
-   if (!video_filter.graph || !video_filter.buffer_src_ctx ||
-       !video_filter.use_fps || video_filter.eof_sent)
-      return;
-
-   ret = avfilter_api.av_buffersrc_add_frame_flags(
-         video_filter.buffer_src_ctx, NULL, 0);
-   if (ret >= 0)
-   {
-      video_filter.eof_sent = true;
-      return;
-   }
-
-   if (ret == AVERROR(EAGAIN))
-      return;
-
-   log_cb(RETRO_LOG_ERROR,
-         "[APLAYER] Failed to flush the frontend CFR filter: %s\n",
-         av_err2str(ret));
-   video_filter_close();
-}
-
 static bool video_filter_ensure_graph(const AVFrame *frame)
 {
    char buffer_args[256];
-   char fps_args[64];
    char pipeline_label[128];
    int ret;
    unsigned width;
    unsigned height;
    AVRational time_base;
    AVRational sar;
-   double target_fps;
    bool use_yadif;
-   bool use_fps;
    const char *pix_fmt_name = NULL;
    AVFilterContext *current_ctx = NULL;
    const AVFilter *buffer = NULL;
    const AVFilter *yadif = NULL;
-   const AVFilter *fps = NULL;
    const AVFilter *buffersink = NULL;
 
    if (!frame)
       return false;
 
    use_yadif = video_filter_should_use_yadif(frame);
-   use_fps = video_filter_should_use_fps();
-   target_fps = use_fps ? video_filter_target_fps() : 0.0;
 
    if (!avfilter_api_load())
    {
       if (!video_filter.unavailable_logged)
       {
-         video_filter_build_pipeline_label(use_yadif, use_fps,
-               target_fps, pipeline_label, sizeof(pipeline_label));
+         video_filter_build_pipeline_label(use_yadif,
+               pipeline_label, sizeof(pipeline_label));
          log_cb(RETRO_LOG_WARN,
                "[APLAYER] %s requested but libavfilter could not be loaded; video will remain untouched.\n",
                pipeline_label);
@@ -871,9 +795,7 @@ static bool video_filter_ensure_graph(const AVFrame *frame)
          rationals_differ(video_filter.time_base, time_base) ||
          rationals_differ(video_filter.sample_aspect_ratio, sar) ||
          video_filter.mode != video_deinterlace_mode ||
-         video_filter.use_yadif != use_yadif ||
-         video_filter.use_fps != use_fps ||
-         (use_fps && video_filter_fps_differ(video_filter.target_fps, target_fps)))))
+         video_filter.use_yadif != use_yadif)))
    {
       video_filter_close();
       video_filter_reset_pending = false;
@@ -882,22 +804,19 @@ static bool video_filter_ensure_graph(const AVFrame *frame)
    if (video_filter.graph)
       return true;
 
-   if (!use_yadif && !use_fps)
+   if (!use_yadif)
       return false;
 
    buffer = avfilter_api.avfilter_get_by_name("buffer");
-   if (use_yadif)
-      yadif = avfilter_api.avfilter_get_by_name("yadif");
-   if (use_fps)
-      fps = avfilter_api.avfilter_get_by_name("fps");
+   yadif = avfilter_api.avfilter_get_by_name("yadif");
    buffersink = avfilter_api.avfilter_get_by_name("buffersink");
 
-   if (!buffer || !buffersink || (use_yadif && !yadif) || (use_fps && !fps))
+   if (!buffer || !yadif || !buffersink)
    {
       if (!video_filter.unavailable_logged)
       {
-         video_filter_build_pipeline_label(use_yadif, use_fps,
-               target_fps, pipeline_label, sizeof(pipeline_label));
+         video_filter_build_pipeline_label(use_yadif,
+               pipeline_label, sizeof(pipeline_label));
          log_cb(RETRO_LOG_WARN,
                "[APLAYER] libavfilter is present but required filters for %s are unavailable.\n",
                pipeline_label);
@@ -928,40 +847,19 @@ static bool video_filter_ensure_graph(const AVFrame *frame)
 
    current_ctx = video_filter.buffer_src_ctx;
 
-   if (use_yadif)
-   {
-      ret = avfilter_api.avfilter_graph_create_filter(
-            &video_filter.yadif_ctx,
-            yadif, "aplayer_yadif",
-            video_deinterlace_filter_args(video_deinterlace_mode), NULL,
-            video_filter.graph);
-      if (ret < 0)
-         goto error;
+   ret = avfilter_api.avfilter_graph_create_filter(
+         &video_filter.yadif_ctx,
+         yadif, "aplayer_yadif",
+         video_deinterlace_filter_args(video_deinterlace_mode), NULL,
+         video_filter.graph);
+   if (ret < 0)
+      goto error;
 
-      ret = avfilter_api.avfilter_link(current_ctx, 0, video_filter.yadif_ctx, 0);
-      if (ret < 0)
-         goto error;
+   ret = avfilter_api.avfilter_link(current_ctx, 0, video_filter.yadif_ctx, 0);
+   if (ret < 0)
+      goto error;
 
-      current_ctx = video_filter.yadif_ctx;
-   }
-
-   if (use_fps)
-   {
-      video_filter_build_fps_args(target_fps, fps_args, sizeof(fps_args));
-      ret = avfilter_api.avfilter_graph_create_filter(
-            &video_filter.fps_ctx,
-            fps, "aplayer_fps",
-            fps_args, NULL,
-            video_filter.graph);
-      if (ret < 0)
-         goto error;
-
-      ret = avfilter_api.avfilter_link(current_ctx, 0, video_filter.fps_ctx, 0);
-      if (ret < 0)
-         goto error;
-
-      current_ctx = video_filter.fps_ctx;
-   }
+   current_ctx = video_filter.yadif_ctx;
 
    ret = avfilter_api.avfilter_graph_create_filter(
          &video_filter.buffer_sink_ctx,
@@ -985,16 +883,12 @@ static bool video_filter_ensure_graph(const AVFrame *frame)
    video_filter.sample_aspect_ratio = sar;
    video_filter.mode = video_deinterlace_mode;
    video_filter.use_yadif = use_yadif;
-   video_filter.use_fps = use_fps;
-   video_filter.target_fps = target_fps;
    video_filter.unavailable_logged = false;
-   video_filter.eof_sent = false;
-   video_filter.eof_drained = false;
 
    if (!video_filter.enabled_logged)
    {
-      video_filter_build_pipeline_label(use_yadif, use_fps,
-            target_fps, pipeline_label, sizeof(pipeline_label));
+      video_filter_build_pipeline_label(use_yadif,
+            pipeline_label, sizeof(pipeline_label));
       log_cb(RETRO_LOG_INFO,
             "[APLAYER] Video filter graph enabled: %s (%ux%u %s)\n",
             pipeline_label,
@@ -1861,18 +1755,6 @@ static double aplayer_get_target_refresh_rate(bool *used_fallback)
    return valid ? refresh_rate : 60.0;
 }
 
-static double aplayer_get_effective_timing_fps(bool *used_fallback)
-{
-   if (video_force_60fps)
-   {
-      if (used_fallback)
-         *used_fallback = false;
-      return 60.0;
-   }
-
-   return aplayer_get_target_refresh_rate(used_fallback);
-}
-
 static void format_time_hhmmss(double seconds, char *out, size_t out_size)
 {
    if (!out || out_size == 0)
@@ -2388,15 +2270,6 @@ void retro_set_environment(retro_environment_t cb)
          }, "auto"
       },
       {
-         "aplayer_video_fixed_fps", "Fixed Framerate", "Uses FFmpeg's fps filter to convert content to a constant 60 Hz framerate by duplicating or dropping frames before presentation.",
-         NULL, NULL, "video",
-         {
-            {"disabled", "Off"},
-            {"60", "60 Hz"},
-            {NULL, NULL}
-         }, "60"
-      },
-      {
          "aplayer_audio_language", "Preferred Language", "Selects the default audio track language when matching streams are tagged in the media file. Falls back to the file default track, or the first audio track when no default is flagged.",
          NULL, NULL, "audio",
          {
@@ -2782,9 +2655,7 @@ static void check_variables(bool firststart)
    struct retro_variable video_blending_var = {0};
    struct retro_variable video_zoom_var = {0};
    struct retro_variable video_deinterlace_var = {0};
-   struct retro_variable video_fixed_fps_var = {0};
    enum aplayer_deinterlace_mode old_deinterlace_mode = video_deinterlace_mode;
-   bool old_force_60fps = video_force_60fps;
 
    fft_width  = 640;
    fft_height = 480;
@@ -2833,13 +2704,6 @@ static void check_variables(bool firststart)
          video_deinterlace_mode = APLAYER_DEINTERLACE_FORCED;
    }
 
-   video_force_60fps = false;
-   video_fixed_fps_var.key = "aplayer_video_fixed_fps";
-   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &video_fixed_fps_var) &&
-         video_fixed_fps_var.value &&
-         string_is_equal(video_fixed_fps_var.value, "60"))
-      video_force_60fps = true;
-
    if (!firststart && old_deinterlace_mode != video_deinterlace_mode)
    {
       if (decode_thread_lock)
@@ -2853,36 +2717,6 @@ static void check_variables(bool firststart)
             "[APLAYER] Deinterlace updated: %s -> %s\n",
             video_deinterlace_mode_name(old_deinterlace_mode),
             video_deinterlace_mode_name(video_deinterlace_mode));
-   }
-
-   if (!firststart && old_force_60fps != video_force_60fps)
-   {
-      double old_timing_fps = media.interpolate_fps;
-      double new_timing_fps = aplayer_get_effective_timing_fps(NULL);
-
-      if (decode_thread_lock)
-         slock_lock(decode_thread_lock);
-      video_filter_reset_pending = true;
-      video_filter.enabled_logged = false;
-      if (decode_thread_lock)
-         slock_unlock(decode_thread_lock);
-
-      target_refresh_retry_active = false;
-      target_refresh_retry_frames = 0;
-
-      if (video_filter_fps_differ(old_timing_fps, new_timing_fps))
-      {
-         double current_time = old_timing_fps > 0.0 ?
-               (double)frame_cnt / old_timing_fps : 0.0;
-         media.interpolate_fps = new_timing_fps;
-         frame_cnt = (uint64_t)(current_time * media.interpolate_fps + 0.5);
-      }
-
-      log_cb(RETRO_LOG_INFO,
-            "[APLAYER] Fixed framerate updated: %s -> %s (timing %.3f Hz)\n",
-            old_force_60fps ? "60 Hz" : "Off",
-            video_force_60fps ? "60 Hz" : "Off",
-            media.interpolate_fps);
    }
 
    snprintf(preferred_audio_language, sizeof(preferred_audio_language), "%s",
@@ -3327,10 +3161,9 @@ void retro_run(void)
                old_video_zoom, get_video_zoom());
    }
 
-   timing_changed = video_filter_fps_differ(old_interpolate_fps, media.interpolate_fps);
+   timing_changed = playback_rates_differ(old_interpolate_fps, media.interpolate_fps);
 
-   if (!video_force_60fps &&
-       target_refresh_retry_active && target_refresh_retry_frames > 0)
+   if (target_refresh_retry_active && target_refresh_retry_frames > 0)
    {
       if (aplayer_query_target_refresh_rate(&target_refresh_rate) &&
           (target_refresh_rate < old_interpolate_fps - 0.001 ||
@@ -3362,7 +3195,7 @@ void retro_run(void)
        aspect_values_differ(old_video_aspect, get_video_output_aspect()));
 
    timing_changed = timing_changed ||
-         video_filter_fps_differ(old_interpolate_fps, media.interpolate_fps);
+         playback_rates_differ(old_interpolate_fps, media.interpolate_fps);
 
    if (geometry_changed || refresh_updated || timing_changed)
    {
@@ -4377,14 +4210,10 @@ static bool init_media_info(void)
             "[APLAYER] Invalid audio sample rate (%d), using default %u.\n",
             actx[0]->sample_rate, media.sample_rate);
 
-   media.interpolate_fps = aplayer_get_effective_timing_fps(&used_fallback);
-   target_refresh_retry_active = !video_force_60fps;
-   target_refresh_retry_frames = target_refresh_retry_active ?
-         APLAYER_TARGET_REFRESH_RETRY_FRAMES : 0;
-   if (video_force_60fps)
-      log_cb(RETRO_LOG_INFO,
-            "[APLAYER] Fixed framerate enabled: forcing 60.000 Hz timing.\n");
-   else if (used_fallback)
+   media.interpolate_fps = aplayer_get_target_refresh_rate(&used_fallback);
+   target_refresh_retry_active = true;
+   target_refresh_retry_frames = APLAYER_TARGET_REFRESH_RETRY_FRAMES;
+   if (used_fallback)
       log_cb(RETRO_LOG_INFO,
             "[APLAYER] Target refresh rate unavailable, using fallback %.3f Hz and retrying during early playback.\n",
             media.interpolate_fps);
@@ -6242,10 +6071,7 @@ static void decode_thread(void *data)
       }
 
       if (eof && packet_buffer_empty(video_packet_buffer))
-      {
-         video_filter_send_eof();
          video_filter_drain_to_buffer(ass_track_active);
-      }
 
       bool break_out_loop = false;
 
@@ -6264,8 +6090,7 @@ static void decode_thread(void *data)
                         packet_buffer_empty(video_packet_buffer) &&
                         eof &&
                         (!audio_decode_fifo || FIFO_READ_AVAIL(audio_decode_fifo) <= 1024 * 10) &&
-                        (!video_buffer || !video_buffer_has_finished_slot(video_buffer)) &&
-                        (!video_filter.use_fps || video_filter.eof_drained);
+                        (!video_buffer || !video_buffer_has_finished_slot(video_buffer));
          break;
       }
 
