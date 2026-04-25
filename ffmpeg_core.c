@@ -1781,7 +1781,7 @@ static void show_not_supported_message(void)
    msg_obj.duration = 2000;
    msg_obj.priority = 1;
    msg_obj.level    = RETRO_LOG_WARN;
-   msg_obj.target   = RETRO_MESSAGE_TARGET_ALL;
+   msg_obj.target   = RETRO_MESSAGE_TARGET_OSD;
    msg_obj.type     = RETRO_MESSAGE_TYPE_NOTIFICATION;
    msg_obj.progress = -1;
 
@@ -1939,7 +1939,7 @@ static void aplayer_show_resume_message(double playback_time)
    msg_obj.duration = 3000;
    msg_obj.priority = 2;
    msg_obj.level    = RETRO_LOG_INFO;
-   msg_obj.target   = RETRO_MESSAGE_TARGET_ALL;
+   msg_obj.target   = RETRO_MESSAGE_TARGET_OSD;
    msg_obj.type     = RETRO_MESSAGE_TYPE_NOTIFICATION;
    msg_obj.progress = -1;
    environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
@@ -2107,7 +2107,7 @@ static void display_media_title()
    msg_obj.duration = 3000;
    msg_obj.priority = 1;
    msg_obj.level    = RETRO_LOG_INFO;
-   msg_obj.target   = RETRO_MESSAGE_TARGET_ALL;
+   msg_obj.target   = RETRO_MESSAGE_TARGET_OSD;
    msg_obj.type     = RETRO_MESSAGE_TYPE_NOTIFICATION;
    msg_obj.progress = -1;
    environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
@@ -2947,7 +2947,7 @@ static void dispaly_time(void)
    msg_obj.duration = 3000;
    msg_obj.priority = 3;
    msg_obj.level    = RETRO_LOG_INFO;
-   msg_obj.target   = RETRO_MESSAGE_TARGET_ALL;
+   msg_obj.target   = RETRO_MESSAGE_TARGET_OSD;
    msg_obj.type     = RETRO_MESSAGE_TYPE_PROGRESS;
    msg_obj.progress = progress_int;
 
@@ -3290,7 +3290,7 @@ void retro_run(void)
             msg_obj.duration = 3000;  // Duration in ms for the message display
             msg_obj.priority = 1;
             msg_obj.level    = RETRO_LOG_INFO;
-            msg_obj.target   = RETRO_MESSAGE_TARGET_ALL;
+            msg_obj.target   = RETRO_MESSAGE_TARGET_OSD;
             msg_obj.type     = RETRO_MESSAGE_TYPE_NOTIFICATION;
             msg_obj.progress = -1;
             environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
@@ -3326,6 +3326,9 @@ void retro_run(void)
                msg_obj.duration = 3000;
                msg_obj.priority = 1;
                msg_obj.level = RETRO_LOG_INFO;
+               msg_obj.target = RETRO_MESSAGE_TARGET_OSD;
+               msg_obj.type = RETRO_MESSAGE_TYPE_NOTIFICATION;
+               msg_obj.progress = -1;
                environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
             }
             slock_unlock(decode_thread_lock);
@@ -3356,6 +3359,9 @@ void retro_run(void)
                msg_obj.duration = 3000;
                msg_obj.priority = 1;
                msg_obj.level = RETRO_LOG_INFO;
+               msg_obj.target = RETRO_MESSAGE_TARGET_OSD;
+               msg_obj.type = RETRO_MESSAGE_TYPE_NOTIFICATION;
+               msg_obj.progress = -1;
                environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
             }
             slock_unlock(decode_thread_lock);
@@ -3419,7 +3425,7 @@ void retro_run(void)
          msg_obj.duration = 3000;
          msg_obj.priority = 1;
          msg_obj.level    = RETRO_LOG_INFO;
-         msg_obj.target   = RETRO_MESSAGE_TARGET_ALL;
+         msg_obj.target   = RETRO_MESSAGE_TARGET_OSD;
          msg_obj.type     = RETRO_MESSAGE_TYPE_NOTIFICATION;
          msg_obj.progress = -1;
          environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
@@ -3449,7 +3455,7 @@ void retro_run(void)
          msg_obj.duration = 3000;
          msg_obj.priority = 1;
          msg_obj.level    = RETRO_LOG_INFO;
-         msg_obj.target   = RETRO_MESSAGE_TARGET_ALL;
+         msg_obj.target   = RETRO_MESSAGE_TARGET_OSD;
          msg_obj.type     = RETRO_MESSAGE_TYPE_NOTIFICATION;
          msg_obj.progress = -1;
          environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
@@ -3501,7 +3507,12 @@ void retro_run(void)
          internal_playlist_reload_pending = false;
          struct retro_message_ext m = {
             .msg = "Playlist finished - no playable entries.",
-            .duration = 5000, .level = RETRO_LOG_ERROR
+            .duration = 5000,
+            .priority = 3,
+            .level = RETRO_LOG_ERROR,
+            .target = RETRO_MESSAGE_TARGET_ALL,
+            .type = RETRO_MESSAGE_TYPE_NOTIFICATION,
+            .progress = -1
          };
          environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &m);
          return;   /* stop running gracefully */

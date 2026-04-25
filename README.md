@@ -76,6 +76,7 @@ If a video has an external subtitle file with the same name and a `.srt` extensi
 - [X] Improved audio track switching to preserve video decode state and reduce sync jumps
 - [X] Fixed loop mode playback stalls and restart timing near the end of media
 - [X] Fixed seeking stalls and PTS resets after timeline jumps
+- [X] Fixed some OSD notifications
 
 # v2.4.0
 - [X] Added new video `ZOOM` option
