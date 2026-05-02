@@ -131,6 +131,7 @@ static bool libretro_supports_bitmasks = false;
 static unsigned input_ports = 1;
 static unsigned controller_port_devices[APLAYER_MAX_PORTS];
 static bool auto_resume_enabled = false;
+static bool suppress_auto_resume_save = false;
 static bool content_loaded = false;
 static bool playlist_source_active = false;
 static bool internal_playlist_reload_pending = false;
@@ -2181,7 +2182,7 @@ void retro_get_system_info(struct retro_system_info *info)
 {
    memset(info, 0, sizeof(*info));
    info->library_name     = "Alpha Player";
-   info->library_version  = "v2.5.0";
+   info->library_version  = "v2.6.0";
    info->need_fullpath    = true;
    info->valid_extensions = "mkv|avi|f4v|f4f|3gp|ogm|flv|mp4|mp3|flac|ogg|m4a|webm|3g2|mov|wmv|mpg|mpeg|vob|asf|divx|m2p|m2ts|ps|ts|mxf|wma|wav|m3u|s3m|it|xm|mod|ay|gbs|gym|hes|kss|nsf|nsfe|sap|spc|vgm|vgz";
 }
@@ -3112,6 +3113,55 @@ static void ensure_video_textures_allocated(unsigned width, unsigned height)
    frames_tex_height = height;
 }
 
+static bool aplayer_reload_current_from_start(void)
+{
+   char reload_path[PATH_MAX];
+   struct retro_game_info info;
+
+   reload_path[0] = '\0';
+   memset(&info, 0, sizeof(info));
+
+   if (playlist_source_active && playlist_count > 0)
+   {
+      if (playlist_index >= playlist_count)
+         playlist_index = 0;
+
+      {
+         size_t len = strnlen(playlist[playlist_index], sizeof(reload_path) - 1);
+         memcpy(reload_path, playlist[playlist_index], len);
+         reload_path[len] = '\0';
+      }
+      internal_playlist_reload_pending = true;
+   }
+   else
+   {
+      const char *path = !string_is_empty(current_media_path) ?
+            current_media_path : current_content_path;
+
+      if (string_is_empty(path))
+         return false;
+
+      {
+         size_t len = strnlen(path, sizeof(reload_path) - 1);
+         memcpy(reload_path, path, len);
+         reload_path[len] = '\0';
+      }
+   }
+
+   suppress_auto_resume_save = true;
+   retro_unload_game();
+   suppress_auto_resume_save = false;
+
+   info.path = reload_path;
+   if (!retro_load_game(&info))
+   {
+      internal_playlist_reload_pending = false;
+      return false;
+   }
+
+   return true;
+}
+
 void retro_run(void)
 {
    static bool last_left;
@@ -3527,8 +3577,21 @@ void retro_run(void)
 
    if (reset_triggered)
    {
-      seek_frames = -1;
-      seek_frame(seek_frames);
+      bool reset_handled = true;
+
+      if (decode_thread_dead)
+         reset_handled = aplayer_reload_current_from_start();
+      else
+      {
+         seek_frames = -1;
+         seek_frame(seek_frames);
+         if (decode_thread_dead)
+            reset_handled = aplayer_reload_current_from_start();
+      }
+
+      if (!reset_handled)
+         log_cb(RETRO_LOG_ERROR, "[APLAYER] Failed to reload media for reset.\n");
+
       reset_triggered = false;
    }
 
@@ -6564,7 +6627,10 @@ end:
    slock_lock(fifo_lock);
    decode_thread_dead = true;
    scond_signal(fifo_cond);
+   scond_signal(fifo_decode_cond);
    slock_unlock(fifo_lock);
+   if (video_buffer)
+      video_buffer_interrupt_waiters(video_buffer);
 }
 
 static void context_destroy(void)
@@ -6659,7 +6725,7 @@ void retro_unload_game(void)
 {
    unsigned i;
 
-   if (auto_resume_enabled)
+   if (auto_resume_enabled && !suppress_auto_resume_save)
       aplayer_bookmark_save_current();
 
    content_loaded = false;
@@ -6669,8 +6735,11 @@ void retro_unload_game(void)
       /* Stop the decode thread first */
       slock_lock(fifo_lock);
       decode_thread_dead = true;
+      scond_signal(fifo_cond);
       scond_signal(fifo_decode_cond);
       slock_unlock(fifo_lock);
+      if (video_buffer)
+         video_buffer_interrupt_waiters(video_buffer);
 
       /* Join the decode thread – no more tasks will be enqueued */
       sthread_join(decode_thread_handle);

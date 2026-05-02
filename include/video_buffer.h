@@ -172,6 +172,16 @@ bool video_buffer_wait_for_open_slot(video_buffer_t *video_buffer);
 bool video_buffer_wait_for_finished_slot(video_buffer_t *video_buffer);
 
 /**
+ * video_buffer_interrupt_waiters:
+ * @video_buffer      : video buffer.
+ *
+ * Wakes threads blocked on the buffer without changing slot ownership.
+ * This is intended for shutdown/EOF paths where worker threads may still
+ * hold in-progress slots.
+ */
+void video_buffer_interrupt_waiters(video_buffer_t *video_buffer);
+
+/**
  * bool video_buffer_has_open_slot(video_buffer_t *video_buffer)
 :
  * @video_buffer      : video buffer.

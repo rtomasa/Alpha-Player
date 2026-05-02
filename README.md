@@ -70,6 +70,10 @@ If a video has an external subtitle file with the same name and a `.srt` extensi
 
 # Changelog
 
+# v2.6.0
+- [X] Fixed EOF playback shutdown stalls that could leave the frontend UI unresponsive
+- [X] Fixed libretro reset after EOF to restart the current video from the beginning
+
 # v2.5.0
 - [X] Added automatic `YADIF` deinterlacing for interlaced video
 - [X] Added video `DEINTERLACE` option with `Off`, `Auto` and `Always`

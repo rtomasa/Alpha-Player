@@ -214,14 +214,25 @@ void video_buffer_finish_slot(
 
 bool video_buffer_wait_for_open_slot(video_buffer_t *video_buffer)
 {
+   uint64_t clear_count = 0;
+   bool ready = false;
+
    slock_lock(video_buffer->lock);
+   clear_count = video_buffer->clear_count;
 
    while (video_buffer->status[video_buffer->head] != KB_OPEN)
+   {
       scond_wait(video_buffer->open_cond, video_buffer->lock);
+      if (clear_count != video_buffer->clear_count &&
+            video_buffer->status[video_buffer->head] != KB_OPEN)
+         break;
+   }
+
+   ready = video_buffer->status[video_buffer->head] == KB_OPEN;
 
    slock_unlock(video_buffer->lock);
 
-   return true;
+   return ready;
 }
 
 bool video_buffer_wait_for_finished_slot(video_buffer_t *video_buffer)
@@ -245,6 +256,18 @@ bool video_buffer_wait_for_finished_slot(video_buffer_t *video_buffer)
    slock_unlock(video_buffer->lock);
 
    return ready;
+}
+
+void video_buffer_interrupt_waiters(video_buffer_t *video_buffer)
+{
+   if (!video_buffer)
+      return;
+
+   slock_lock(video_buffer->lock);
+   video_buffer->clear_count++;
+   scond_signal(video_buffer->open_cond);
+   scond_signal(video_buffer->finished_cond);
+   slock_unlock(video_buffer->lock);
 }
 
 bool video_buffer_has_open_slot(video_buffer_t *video_buffer)
