@@ -6437,6 +6437,7 @@ static void decode_thread(void *data)
              * libass tracks; bitmap subtitles are queued for later blending. */
             AVSubtitle sub;
             int finished = 0;
+            int subtitle_ret = 0;
             int64_t base_time_ms = 0;
             int64_t start_ms = 0;
             int64_t end_ms = 0;
@@ -6445,13 +6446,23 @@ static void decode_thread(void *data)
 
             memset(&sub, 0, sizeof(sub));
 
-            while (!finished)
+            /* Subtitle decoders consume one packet at a time; some packets
+             * validly produce no completed subtitle. Do not retry them. */
+            subtitle_ret = avcodec_decode_subtitle2(sctx_sub, &sub, &finished,
+                  pkt_local);
+            if (subtitle_ret < 0)
             {
-               if (avcodec_decode_subtitle2(sctx_sub, &sub, &finished, pkt_local) < 0)
-               {
-                  log_cb(RETRO_LOG_ERROR, "[APLAYER] Decode subtitles failed.\n");
-                  break;
-               }
+               log_cb(RETRO_LOG_ERROR, "[APLAYER] Decode subtitles failed.\n");
+               avsubtitle_free(&sub);
+               av_packet_unref(pkt_local);
+               continue;
+            }
+
+            if (!finished)
+            {
+               avsubtitle_free(&sub);
+               av_packet_unref(pkt_local);
+               continue;
             }
 
             if (pkt_local->pts != AV_NOPTS_VALUE)
