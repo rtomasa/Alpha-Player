@@ -163,11 +163,11 @@ bool video_buffer_wait_for_open_slot(video_buffer_t *video_buffer);
  * video_buffer_wait_for_finished_slot:
  * @video_buffer      : video buffer.
  *
- * Blocks until finished slot is available.
+ * Blocks until finished slot is available, interrupted, or timed out.
  *
  * Returns true if the buffer's next slot is finished and a
- * context is available. Returns false if the wait was interrupted
- * by a buffer clear/reset before any finished slot became available.
+ * context is available. Returns false if the wait was interrupted,
+ * timed out, or reset before any finished slot became available.
  */
 bool video_buffer_wait_for_finished_slot(video_buffer_t *video_buffer);
 

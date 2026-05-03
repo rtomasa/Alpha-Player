@@ -3177,6 +3177,8 @@ void retro_run(void)
    static bool last_r;
    static bool last_l2;
    static bool last_r2;
+   static bool audio_wait_timeout_logged;
+   static bool video_wait_timeout_logged;
    double min_pts;
    int16_t audio_buffer[2048];
    bool left, right, up, down, start, a, b, x, y, l, r, l2, r2;
@@ -3625,26 +3627,25 @@ void retro_run(void)
       to_read_bytes = to_read_frames * bytes_per_frame;
 
       slock_lock(fifo_lock);
-      if (video_stream_index < 0)
+      while (!decode_thread_dead && FIFO_READ_AVAIL(audio_decode_fifo) < to_read_bytes)
       {
-         if (!decode_thread_dead && FIFO_READ_AVAIL(audio_decode_fifo) < to_read_bytes)
+         main_sleeping = true;
+         scond_signal(fifo_decode_cond);
+         if (!scond_wait_timeout(fifo_cond, fifo_lock, 2000))
          {
-            main_sleeping = true;
-            scond_signal(fifo_decode_cond);
-            scond_wait_timeout(fifo_cond, fifo_lock, 2000);
             main_sleeping = false;
+            if (!audio_wait_timeout_logged)
+            {
+               log_cb(RETRO_LOG_WARN,
+                     "[APLAYER] Audio decode wait timed out, padding silence.\n");
+               audio_wait_timeout_logged = true;
+            }
+            break;
          }
+         main_sleeping = false;
       }
-      else
-      {
-         while (!decode_thread_dead && FIFO_READ_AVAIL(audio_decode_fifo) < to_read_bytes)
-         {
-            main_sleeping = true;
-            scond_signal(fifo_decode_cond);
-            scond_wait(fifo_cond, fifo_lock);
-            main_sleeping = false;
-         }
-      }
+      if (FIFO_READ_AVAIL(audio_decode_fifo) >= to_read_bytes)
+         audio_wait_timeout_logged = false;
       reading_pts  = decode_last_audio_time -
          (double)FIFO_READ_AVAIL(audio_decode_fifo) / (media.sample_rate * bytes_per_frame);
       expected_pts = (double)audio_frames / media.sample_rate;
@@ -3660,20 +3661,17 @@ void retro_run(void)
 
       if (!decode_thread_dead)
       {
-         if (video_stream_index < 0)
-         {
-            size_t avail_bytes = FIFO_READ_AVAIL(audio_decode_fifo);
-            size_t read_bytes = avail_bytes < to_read_bytes ? avail_bytes : to_read_bytes;
-            size_t read_frames = read_bytes / bytes_per_frame;
+         size_t avail_bytes = FIFO_READ_AVAIL(audio_decode_fifo);
+         size_t read_bytes = avail_bytes < to_read_bytes ? avail_bytes : to_read_bytes;
+         size_t read_frames = read_bytes / bytes_per_frame;
 
-            if (read_bytes)
-               fifo_read(audio_decode_fifo, audio_buffer, read_bytes);
-            if (read_frames < to_read_frames)
-               memset(audio_buffer + (read_frames * 2), 0,
-                     (to_read_frames - read_frames) * bytes_per_frame);
+         if (read_bytes)
+            fifo_read(audio_decode_fifo, audio_buffer, read_bytes);
+         if (read_frames < to_read_frames)
+         {
+            memset(audio_buffer + (read_frames * 2), 0,
+                  (to_read_frames - read_frames) * bytes_per_frame);
          }
-         else
-            fifo_read(audio_decode_fifo, audio_buffer, to_read_bytes);
       }
       scond_signal(fifo_decode_cond);
 
@@ -3707,14 +3705,24 @@ void retro_run(void)
             if (!video_buffer_wait_for_finished_slot(video_buffer))
             {
                if (aplayer_consume_playback_restart_pending())
+               {
                   min_pts = frame_cnt / media.interpolate_fps + pts_bias;
-               continue;
+                  continue;
+               }
+               if (!video_wait_timeout_logged)
+               {
+                  log_cb(RETRO_LOG_WARN,
+                        "[APLAYER] Video frame wait timed out, reusing last frame.\n");
+                  video_wait_timeout_logged = true;
+               }
+               break;
             }
 
             if (aplayer_consume_playback_restart_pending())
                min_pts = frame_cnt / media.interpolate_fps + pts_bias;
 
             video_buffer_get_finished_slot(video_buffer, &ctx);
+            video_wait_timeout_logged = false;
             pts                          = ctx->pts;
             pixels                       = (uint32_t*)ctx->target->data[0];
 

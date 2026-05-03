@@ -245,7 +245,9 @@ bool video_buffer_wait_for_finished_slot(video_buffer_t *video_buffer)
 
    while (video_buffer->status[video_buffer->tail] != KB_FINISHED)
    {
-      scond_wait(video_buffer->finished_cond, video_buffer->lock);
+      if (!scond_wait_timeout(video_buffer->finished_cond,
+            video_buffer->lock, 2000))
+         break;
       if (clear_count != video_buffer->clear_count &&
             video_buffer->status[video_buffer->tail] != KB_FINISHED)
          break;
