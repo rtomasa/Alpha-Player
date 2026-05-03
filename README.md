@@ -61,6 +61,7 @@ This core has been modified focusing on Raspberry Pi devices using a development
 * Deinterlace - Off, `Auto`, `Always`
 * `Auto` only deinterlaces frames marked as interlaced by FFmpeg and leaves progressive frames unchanged
 * `Always` forces deinterlace on every decoded frame and is mainly intended for broken/misflagged sources
+* Playback timing is deterministic: PAL-like video streams use `50 Hz`; all other content defaults to `60 Hz`
 * Up to `1.00x`, zoom scales the image uniformly while preserving the source aspect
 * Above `1.00x`, the player progressively crops toward the current frontend display aspect when `RETRO_ENVIRONMENT_GET_DISPLAY_INFO` is available, falling back to the viewport aspect only when display data is incomplete
 
@@ -74,6 +75,7 @@ If a video has an external subtitle file with the same name and a `.srt` extensi
 - [X] Fixed EOF playback shutdown stalls that could leave the frontend UI unresponsive
 - [X] Fixed libretro reset after EOF to restart the current video from the beginning
 - [X] Fixed DVD/VobSub subtitle packet handling that could hang playback on a black screen
+- [X] Removed frontend target refresh timing dependency; PAL-like video streams now use 50 Hz and all other content defaults to 60 Hz
 
 # v2.5.0
 - [X] Added automatic `YADIF` deinterlacing for interlaced video
@@ -93,7 +95,6 @@ If a video has an external subtitle file with the same name and a `.srt` extensi
 - [X] Added `DISABLED SUBTITLES` virtual track cycling state
 - [X] Added support for embedded VobSub/DVD subtitles
 - [X] Improved support for SSA subtitles
-- [X] Changed Alpha Player’s timing base from hardcoded 60.0 to the frontend target refresh when available
 - [X] Fixed controller port initialization so input works correctly on direct boot
 - [X] Removed video thread decoder cores option
 - [X] Removed subtitle enable/disable core option

@@ -67,7 +67,6 @@ retro_log_printf_t log_cb;
 
 #define MAX_PLAYLIST_ENTRIES 256
 #define APLAYER_MAX_PORTS 4
-#define APLAYER_TARGET_REFRESH_RETRY_FRAMES 1
 #define APLAYER_BOOKMARK_MAGIC 0x4150424dU
 #define APLAYER_BOOKMARK_VERSION 1U
 #define APLAYER_BOOKMARK_MIN_TIME 1.0
@@ -404,8 +403,6 @@ static unsigned video_crop_left = 0;
 static unsigned video_crop_top = 0;
 static unsigned video_crop_right = 0;
 static unsigned video_crop_bottom = 0;
-static bool target_refresh_retry_active = false;
-static unsigned target_refresh_retry_frames = 0;
 static char preferred_audio_language[16] = APLAYER_AUDIO_LANGUAGE_DEFAULT;
 static enum aplayer_deinterlace_mode video_deinterlace_mode = APLAYER_DEINTERLACE_AUTO;
 static volatile bool video_filter_reset_pending = false;
@@ -456,7 +453,7 @@ static GLint mix_loc;
 static void media_reset_defaults(void)
 {
    memset(&media, 0, sizeof(media));
-   media.interpolate_fps = 60.0;   // fallback until target refresh is known
+   media.interpolate_fps = 60.0;   // deterministic default until content timing is known
    media.sample_rate     = 32000.0; // safe default until audio stream is opened
    media.aspect          = 0.0f;    // force recompute
    video_fill_target_aspect = 0.0f;
@@ -476,8 +473,6 @@ static void media_reset_defaults(void)
    frames[1].pts         = 0.0;
    frames[0].valid       = false;
    frames[1].valid       = false;
-   target_refresh_retry_active = false;
-   target_refresh_retry_frames = 0;
    video_filter_reset_pending = true;
    playback_restart_request = false;
    playback_restart_pending = false;
@@ -1731,31 +1726,141 @@ static double stream_duration_seconds(int stream_index)
    return st->duration * av_q2d(st->time_base);
 }
 
-static bool aplayer_query_target_refresh_rate(double *refresh_rate_out)
+static bool aplayer_fps_matches(double fps, double target, double tolerance)
 {
-   float refresh_rate = 0.0f;
-
-   if (environ_cb &&
-       environ_cb(RETRO_ENVIRONMENT_GET_TARGET_REFRESH_RATE, &refresh_rate) &&
-       refresh_rate > 10.0f && refresh_rate < 1000.0f)
-   {
-      if (refresh_rate_out)
-         *refresh_rate_out = refresh_rate;
-      return true;
-   }
-
-   return false;
+   return fps >= target - tolerance && fps <= target + tolerance;
 }
 
-static double aplayer_get_target_refresh_rate(bool *used_fallback)
+static double aplayer_rational_fps(AVRational rate)
 {
-   double refresh_rate = 60.0;
-   bool valid = aplayer_query_target_refresh_rate(&refresh_rate);
+   double fps;
 
-   if (used_fallback)
-      *used_fallback = !valid;
+   if (rate.num <= 0 || rate.den <= 0)
+      return 0.0;
 
-   return valid ? refresh_rate : 60.0;
+   fps = av_q2d(rate);
+   if (fps <= 1.0 || fps > 240.0)
+      return 0.0;
+
+   return fps;
+}
+
+static double aplayer_get_video_stream_fps(void)
+{
+   AVStream *stream;
+   double fps;
+   AVRational rate;
+
+   if (!fctx || video_stream_index < 0 ||
+       video_stream_index >= (int)fctx->nb_streams)
+      return 0.0;
+
+   stream = fctx->streams[video_stream_index];
+   if (!stream)
+      return 0.0;
+
+   rate = av_guess_frame_rate(fctx, stream, NULL);
+   fps = aplayer_rational_fps(rate);
+   if (fps > 0.0)
+      return fps;
+
+   fps = aplayer_rational_fps(stream->avg_frame_rate);
+   if (fps > 0.0)
+      return fps;
+
+   return aplayer_rational_fps(stream->r_frame_rate);
+}
+
+static bool aplayer_frame_rate_is_pal(double fps)
+{
+   return aplayer_fps_matches(fps, 25.0, 0.25) ||
+      aplayer_fps_matches(fps, 50.0, 0.50);
+}
+
+static bool aplayer_frame_rate_is_ntsc(double fps)
+{
+   return aplayer_fps_matches(fps, 24000.0 / 1001.0, 0.25) ||
+      aplayer_fps_matches(fps, 24.0, 0.25) ||
+      aplayer_fps_matches(fps, 30000.0 / 1001.0, 0.35) ||
+      aplayer_fps_matches(fps, 30.0, 0.35) ||
+      aplayer_fps_matches(fps, 60000.0 / 1001.0, 0.50) ||
+      aplayer_fps_matches(fps, 60.0, 0.50);
+}
+
+static bool aplayer_height_is_pal(unsigned height)
+{
+   return height == 576 || height == 288;
+}
+
+static bool aplayer_height_is_ntsc(unsigned height)
+{
+   return height == 480 || height == 486 || height == 240;
+}
+
+static double aplayer_get_content_refresh_rate(void)
+{
+   double source_fps = aplayer_get_video_stream_fps();
+   unsigned height = vctx && vctx->height > 0 ? (unsigned)vctx->height : media.height;
+
+   if (video_stream_index >= 0)
+   {
+      if (aplayer_frame_rate_is_pal(source_fps))
+      {
+         log_cb(RETRO_LOG_INFO,
+               "[APLAYER] PAL-like video timing detected from source FPS %.3f; using 50.000 Hz.\n",
+               source_fps);
+         return 50.0;
+      }
+
+      if (aplayer_frame_rate_is_ntsc(source_fps))
+      {
+         log_cb(RETRO_LOG_INFO,
+               "[APLAYER] NTSC/default video timing detected from source FPS %.3f; using 60.000 Hz.\n",
+               source_fps);
+         return 60.0;
+      }
+
+      if (aplayer_height_is_pal(height))
+      {
+         log_cb(RETRO_LOG_INFO,
+               "[APLAYER] PAL-like video timing inferred from height %u; using 50.000 Hz.\n",
+               height);
+         return 50.0;
+      }
+
+      if (aplayer_height_is_ntsc(height))
+      {
+         log_cb(RETRO_LOG_INFO,
+               "[APLAYER] NTSC-like video timing inferred from height %u; using 60.000 Hz.\n",
+               height);
+         return 60.0;
+      }
+
+      if (source_fps > 0.0)
+      {
+         log_cb(RETRO_LOG_INFO,
+               "[APLAYER] Source FPS %.3f is not PAL-like; using default 60.000 Hz.\n",
+               source_fps);
+         return 60.0;
+      }
+   }
+
+   log_cb(RETRO_LOG_INFO,
+         "[APLAYER] Using default playback timing: 60.000 Hz.\n");
+   return 60.0;
+}
+
+static bool aplayer_uses_pal_timing(void)
+{
+   return aplayer_fps_matches(media.interpolate_fps, 50.0, 0.50);
+}
+
+static unsigned aplayer_get_content_region(void)
+{
+   if (aplayer_uses_pal_timing())
+      return RETRO_REGION_PAL;
+
+   return RETRO_REGION_NTSC;
 }
 
 static void format_time_hhmmss(double seconds, char *out, size_t out_size)
@@ -3194,8 +3299,6 @@ void retro_run(void)
    double old_interpolate_fps   = media.interpolate_fps;
    uint64_t old_frame_cnt       = frame_cnt;
    bool timing_changed          = false;
-   bool refresh_updated         = false;
-   double target_refresh_rate   = 0.0;
 
    refresh_video_fill_target_aspect();
 
@@ -3217,41 +3320,12 @@ void retro_run(void)
 
    timing_changed = playback_rates_differ(old_interpolate_fps, media.interpolate_fps);
 
-   if (target_refresh_retry_active && target_refresh_retry_frames > 0)
-   {
-      if (aplayer_query_target_refresh_rate(&target_refresh_rate) &&
-          (target_refresh_rate < old_interpolate_fps - 0.001 ||
-           target_refresh_rate > old_interpolate_fps + 0.001))
-      {
-         double current_time = old_interpolate_fps > 0.0 ?
-               (double)frame_cnt / old_interpolate_fps : 0.0;
-         media.interpolate_fps = target_refresh_rate;
-         frame_cnt = (uint64_t)(current_time * media.interpolate_fps + 0.5);
-         refresh_updated = true;
-         log_cb(RETRO_LOG_INFO,
-               "[APLAYER] Target refresh update detected during playback: %.3f -> %.3f Hz\n",
-               old_interpolate_fps, media.interpolate_fps);
-      }
-
-      target_refresh_retry_frames--;
-      if (!refresh_updated && target_refresh_retry_frames == 0)
-      {
-         target_refresh_retry_active = false;
-         log_cb(RETRO_LOG_INFO,
-               "[APLAYER] Target refresh monitoring finished at %.3f Hz\n",
-               media.interpolate_fps);
-      }
-   }
-
    geometry_changed = fft_width != old_fft_width ||
       fft_height != old_fft_height ||
       (video_stream_index >= 0 &&
        aspect_values_differ(old_video_aspect, get_video_output_aspect()));
 
-   timing_changed = timing_changed ||
-         playback_rates_differ(old_interpolate_fps, media.interpolate_fps);
-
-   if (geometry_changed || refresh_updated || timing_changed)
+   if (geometry_changed || timing_changed)
    {
       struct retro_system_av_info info;
       retro_get_system_av_info(&info);
@@ -3272,15 +3346,6 @@ void retro_run(void)
          media.interpolate_fps = old_interpolate_fps;
          frame_cnt = old_frame_cnt;
          timing_changed = false;
-         refresh_updated = false;
-      }
-      else if (refresh_updated)
-      {
-         target_refresh_retry_active = false;
-         target_refresh_retry_frames = 0;
-         log_cb(RETRO_LOG_INFO,
-               "[APLAYER] Applied updated target refresh rate during playback: %.3f -> %.3f Hz\n",
-               old_interpolate_fps, media.interpolate_fps);
       }
       else if (timing_changed)
       {
@@ -4310,8 +4375,6 @@ static bool open_codecs(void)
 
 static bool init_media_info(void)
 {
-   bool used_fallback = false;
-
    if (actx[0] && actx[0]->sample_rate > 0)
       media.sample_rate = actx[0]->sample_rate;
    else if (actx[0])
@@ -4319,24 +4382,14 @@ static bool init_media_info(void)
             "[APLAYER] Invalid audio sample rate (%d), using default %u.\n",
             actx[0]->sample_rate, media.sample_rate);
 
-   media.interpolate_fps = aplayer_get_target_refresh_rate(&used_fallback);
-   target_refresh_retry_active = true;
-   target_refresh_retry_frames = APLAYER_TARGET_REFRESH_RETRY_FRAMES;
-   if (used_fallback)
-      log_cb(RETRO_LOG_INFO,
-            "[APLAYER] Target refresh rate unavailable, using fallback %.3f Hz and retrying during early playback.\n",
-            media.interpolate_fps);
-   else
-      log_cb(RETRO_LOG_INFO,
-            "[APLAYER] Using target refresh rate: %.3f Hz and monitoring for early updates.\n",
-            media.interpolate_fps);
-
    if (vctx)
    {
       media.width  = vctx->width;
       media.height = vctx->height;
       init_aspect_ratio();
    }
+
+   media.interpolate_fps = aplayer_get_content_refresh_rate();
 
    if (fctx)
    {
@@ -7082,7 +7135,7 @@ error:
 
 unsigned retro_get_region(void)
 {
-   return RETRO_REGION_NTSC;
+   return aplayer_get_content_region();
 }
 
 bool retro_load_game_special(unsigned type, const struct retro_game_info *info, size_t num)
