@@ -12,8 +12,10 @@ struct attachment
 
 struct frame
 {
-   GLuint tex;
+   GLuint tex[3];
    double pts;
+   int colorspace;
+   int color_range;
    bool valid;
 };
 

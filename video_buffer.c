@@ -30,8 +30,6 @@ video_buffer_t *video_buffer_create(
 {
    unsigned i;
    video_buffer_t *b = (video_buffer_t*)malloc(sizeof(video_buffer_t));
-   (void)frame_size;
-
    if (!b)
       return NULL;
 
@@ -70,15 +68,27 @@ video_buffer_t *video_buffer_create(
       b->buffer[i].source    = av_frame_alloc();
       b->buffer[i].filtered  = av_frame_alloc();
       b->buffer[i].target    = av_frame_alloc();
+      b->buffer[i].frame_buf = NULL;
 
       AVFrame* frame = b->buffer[i].target;
-      av_image_alloc(frame->data, frame->linesize,
-            width, height, AV_PIX_FMT_RGB32, 1);
 
       if (!b->buffer[i].source    ||
           !b->buffer[i].filtered  ||
           !b->buffer[i].target)
          goto fail;
+
+      b->buffer[i].frame_buf = (uint8_t*)av_malloc(frame_size);
+      if (!b->buffer[i].frame_buf)
+         goto fail;
+
+      if (av_image_fill_arrays(frame->data, frame->linesize,
+            b->buffer[i].frame_buf, AV_PIX_FMT_YUV420P,
+            width, height, 1) < 0)
+         goto fail;
+
+      frame->width  = width;
+      frame->height = height;
+      frame->format = AV_PIX_FMT_YUV420P;
    }
    return b;
 
@@ -103,7 +113,7 @@ void video_buffer_destroy(video_buffer_t *video_buffer)
       {
          av_frame_free(&video_buffer->buffer[i].source);
          av_frame_free(&video_buffer->buffer[i].filtered);
-         av_freep((AVFrame*)video_buffer->buffer[i].target);
+         av_freep(&video_buffer->buffer[i].frame_buf);
          av_frame_free(&video_buffer->buffer[i].target);
          sws_freeContext(video_buffer->buffer[i].sws);
       }
@@ -130,6 +140,7 @@ void video_buffer_clear(video_buffer_t *video_buffer)
    {
       av_frame_unref(video_buffer->buffer[i].source);
       av_frame_unref(video_buffer->buffer[i].filtered);
+      av_frame_unref(video_buffer->buffer[i].target);
       video_buffer->status[i] = KB_OPEN;
    }
 
@@ -176,6 +187,7 @@ void video_buffer_open_slot(
 
    if (video_buffer->status[context->index] == KB_FINISHED)
    {
+      av_frame_unref(context->target);
       video_buffer->status[context->index] = KB_OPEN;
       video_buffer->tail++;
       video_buffer->tail %= (video_buffer->capacity);

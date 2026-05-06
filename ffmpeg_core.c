@@ -41,6 +41,13 @@
 #include <dlfcn.h>
 #endif
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#define APLAYER_ARM64_NEON 1
+#else
+#define APLAYER_ARM64_NEON 0
+#endif
+
 typedef struct AVFilter AVFilter;
 typedef struct AVFilterContext AVFilterContext;
 typedef struct AVFilterGraph AVFilterGraph;
@@ -304,6 +311,8 @@ static slock_t *time_lock    = NULL; // Protects g_current_time
 
 static unsigned sw_decoder_threads;
 static unsigned sw_sws_threads;
+static bool yuv_direct_path_logged;
+static bool yuv_sws_path_logged;
 static video_buffer_t *video_buffer;
 static tpool_t *tpool;
 
@@ -442,6 +451,29 @@ static const char *const cantonese_language_tags[] =
 static struct frame frames[2];
 static unsigned frames_tex_width;
 static unsigned frames_tex_height;
+static unsigned subtitle_overlay_width;
+static unsigned subtitle_overlay_height;
+static GLuint subtitle_overlay_tex;
+static uint32_t *subtitle_overlay_buffer;
+static bool subtitle_overlay_cache_valid;
+static bool subtitle_overlay_cache_bitmap;
+static bool subtitle_overlay_cache_has_bitmap_event;
+static int subtitle_overlay_cache_stream = SUBTITLE_STREAM_DISABLED;
+static int64_t subtitle_overlay_cache_start_ms;
+static int64_t subtitle_overlay_cache_end_ms;
+static bool subtitle_overlay_cache_end_known;
+static unsigned subtitle_overlay_cache_rect_count;
+
+struct aplayer_rect
+{
+   int x0;
+   int y0;
+   int x1;
+   int y1;
+};
+
+static struct aplayer_rect subtitle_overlay_dirty;
+static void subtitle_overlay_cache_reset(void);
 
 static struct retro_hw_render_callback hw_render;
 static GLuint prog;
@@ -449,6 +481,9 @@ static GLuint vbo;
 static GLint vertex_loc;
 static GLint tex_loc;
 static GLint mix_loc;
+static GLint yuv_params_loc[2];
+static GLint yuv_green_loc[2];
+static GLint subtitle_enabled_loc;
 
 static void media_reset_defaults(void)
 {
@@ -471,8 +506,15 @@ static void media_reset_defaults(void)
    g_current_time        = 0.0;
    frames[0].pts         = 0.0;
    frames[1].pts         = 0.0;
+   frames[0].colorspace  = AVCOL_SPC_UNSPECIFIED;
+   frames[1].colorspace  = AVCOL_SPC_UNSPECIFIED;
+   frames[0].color_range = AVCOL_RANGE_UNSPECIFIED;
+   frames[1].color_range = AVCOL_RANGE_UNSPECIFIED;
    frames[0].valid       = false;
    frames[1].valid       = false;
+   yuv_direct_path_logged = false;
+   yuv_sws_path_logged    = false;
+   subtitle_overlay_cache_reset();
    video_filter_reset_pending = true;
    playback_restart_request = false;
    playback_restart_pending = false;
@@ -487,8 +529,13 @@ static void aplayer_reset_playback_timing_to_start(void)
    pts_bias = 0.0;
    frames[0].pts = 0.0;
    frames[1].pts = 0.0;
+   frames[0].colorspace = AVCOL_SPC_UNSPECIFIED;
+   frames[1].colorspace = AVCOL_SPC_UNSPECIFIED;
+   frames[0].color_range = AVCOL_RANGE_UNSPECIFIED;
+   frames[1].color_range = AVCOL_RANGE_UNSPECIFIED;
    frames[0].valid = false;
    frames[1].valid = false;
+   subtitle_overlay_cache_reset();
 
    if (time_lock)
       slock_lock(time_lock);
@@ -3185,37 +3232,286 @@ static long long subtitle_adjust_render_time_ms(ASS_Track *track,
    return now_ms;
 }
 
-static void render_subtitles_on_buffer(uint32_t *buffer, unsigned width,
-      unsigned height, double time_sec);
+static void render_subtitles_to_overlay(unsigned width, unsigned height,
+      double time_sec);
+
+static void rect_reset(struct aplayer_rect *rect)
+{
+   if (!rect)
+      return;
+
+   rect->x0 = rect->y0 = rect->x1 = rect->y1 = 0;
+}
+
+static bool rect_valid(const struct aplayer_rect *rect)
+{
+   return rect && rect->x1 > rect->x0 && rect->y1 > rect->y0;
+}
+
+static void subtitle_overlay_cache_reset(void)
+{
+   subtitle_overlay_cache_valid = false;
+   subtitle_overlay_cache_bitmap = false;
+   subtitle_overlay_cache_has_bitmap_event = false;
+   subtitle_overlay_cache_stream = SUBTITLE_STREAM_DISABLED;
+   subtitle_overlay_cache_start_ms = 0;
+   subtitle_overlay_cache_end_ms = 0;
+   subtitle_overlay_cache_end_known = false;
+   subtitle_overlay_cache_rect_count = 0;
+}
+
+static bool subtitle_overlay_cache_matches_ass(int stream)
+{
+   return subtitle_overlay_cache_valid &&
+      !subtitle_overlay_cache_bitmap &&
+      subtitle_overlay_cache_stream == stream;
+}
+
+static void subtitle_overlay_cache_set_ass(int stream)
+{
+   subtitle_overlay_cache_valid = true;
+   subtitle_overlay_cache_bitmap = false;
+   subtitle_overlay_cache_has_bitmap_event = false;
+   subtitle_overlay_cache_stream = stream;
+   subtitle_overlay_cache_rect_count = 0;
+}
+
+static bool subtitle_overlay_cache_matches_bitmap(int stream,
+      const struct bitmap_subtitle_event *event)
+{
+   if (!subtitle_overlay_cache_valid ||
+         !subtitle_overlay_cache_bitmap ||
+         subtitle_overlay_cache_stream != stream)
+      return false;
+
+   if (!event)
+      return !subtitle_overlay_cache_has_bitmap_event;
+
+   return subtitle_overlay_cache_has_bitmap_event &&
+      subtitle_overlay_cache_start_ms == event->start_ms &&
+      subtitle_overlay_cache_end_ms == event->end_ms &&
+      subtitle_overlay_cache_end_known == event->end_known &&
+      subtitle_overlay_cache_rect_count == event->rect_count;
+}
+
+static void subtitle_overlay_cache_set_bitmap(int stream,
+      const struct bitmap_subtitle_event *event)
+{
+   subtitle_overlay_cache_valid = true;
+   subtitle_overlay_cache_bitmap = true;
+   subtitle_overlay_cache_stream = stream;
+   subtitle_overlay_cache_has_bitmap_event = event != NULL;
+
+   if (event)
+   {
+      subtitle_overlay_cache_start_ms = event->start_ms;
+      subtitle_overlay_cache_end_ms = event->end_ms;
+      subtitle_overlay_cache_end_known = event->end_known;
+      subtitle_overlay_cache_rect_count = event->rect_count;
+   }
+   else
+   {
+      subtitle_overlay_cache_start_ms = 0;
+      subtitle_overlay_cache_end_ms = 0;
+      subtitle_overlay_cache_end_known = false;
+      subtitle_overlay_cache_rect_count = 0;
+   }
+}
+
+static void rect_add(struct aplayer_rect *rect, int x0, int y0, int x1, int y1)
+{
+   if (!rect || x1 <= x0 || y1 <= y0)
+      return;
+
+   if (!rect_valid(rect))
+   {
+      rect->x0 = x0;
+      rect->y0 = y0;
+      rect->x1 = x1;
+      rect->y1 = y1;
+      return;
+   }
+
+   if (x0 < rect->x0)
+      rect->x0 = x0;
+   if (y0 < rect->y0)
+      rect->y0 = y0;
+   if (x1 > rect->x1)
+      rect->x1 = x1;
+   if (y1 > rect->y1)
+      rect->y1 = y1;
+}
+
+static void init_linear_clamp_texture(GLuint tex)
+{
+   glBindTexture(GL_TEXTURE_2D, tex);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+}
 
 static void ensure_video_textures_allocated(unsigned width, unsigned height)
 {
    unsigned i;
+   unsigned chroma_width;
+   unsigned chroma_height;
 
    if (video_stream_index < 0 || width == 0 || height == 0)
       return;
 
-   if (!frames[0].tex || !frames[1].tex)
+   if (!frames[0].tex[0] || !frames[0].tex[1] || !frames[0].tex[2] ||
+       !frames[1].tex[0] || !frames[1].tex[1] || !frames[1].tex[2])
       return;
 
    if (frames_tex_width == width && frames_tex_height == height)
       return;
 
+   chroma_width = (width + 1) / 2;
+   chroma_height = (height + 1) / 2;
+
    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
    for (i = 0; i < 2; i++)
    {
-      if (!frames[i].tex)
-         continue;
-
-      glBindTexture(GL_TEXTURE_2D, frames[i].tex);
-      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
+      glBindTexture(GL_TEXTURE_2D, frames[i].tex[0]);
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_R8,
             (GLsizei)width, (GLsizei)height, 0,
-            GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+            GL_RED, GL_UNSIGNED_BYTE, NULL);
+
+      glBindTexture(GL_TEXTURE_2D, frames[i].tex[1]);
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_R8,
+            (GLsizei)chroma_width, (GLsizei)chroma_height, 0,
+            GL_RED, GL_UNSIGNED_BYTE, NULL);
+
+      glBindTexture(GL_TEXTURE_2D, frames[i].tex[2]);
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_R8,
+            (GLsizei)chroma_width, (GLsizei)chroma_height, 0,
+            GL_RED, GL_UNSIGNED_BYTE, NULL);
    }
    glBindTexture(GL_TEXTURE_2D, 0);
 
    frames_tex_width  = width;
    frames_tex_height = height;
+   frames[0].valid = false;
+   frames[1].valid = false;
+}
+
+static enum AVColorSpace video_colorspace_or_default(int colorspace,
+      unsigned width, unsigned height)
+{
+   if (colorspace != AVCOL_SPC_UNSPECIFIED)
+      return (enum AVColorSpace)colorspace;
+
+   if (width >= 1280 || height > 576)
+      return AVCOL_SPC_BT709;
+
+   return AVCOL_SPC_BT470BG;
+}
+
+static bool video_color_range_is_full(int color_range)
+{
+   return color_range == AVCOL_RANGE_JPEG;
+}
+
+static void set_yuv_shader_params(unsigned index, const struct frame *frame)
+{
+   enum AVColorSpace colorspace;
+   bool full_range;
+   float params[4];
+   float green[2];
+   float r_cr;
+   float b_cb;
+   float g_cb;
+   float g_cr;
+
+   if (index > 1 || !frame)
+      return;
+
+   colorspace = video_colorspace_or_default(frame->colorspace,
+         media.width, media.height);
+   full_range = video_color_range_is_full(frame->color_range);
+
+   switch (colorspace)
+   {
+      case AVCOL_SPC_BT709:
+         r_cr = 1.5748f;
+         g_cb = -0.1873f;
+         g_cr = -0.4681f;
+         b_cb = 1.8556f;
+         break;
+
+      case AVCOL_SPC_BT2020_NCL:
+      case AVCOL_SPC_BT2020_CL:
+         r_cr = 1.4746f;
+         g_cb = -0.16455f;
+         g_cr = -0.57135f;
+         b_cb = 1.8814f;
+         break;
+
+      case AVCOL_SPC_SMPTE170M:
+      case AVCOL_SPC_BT470BG:
+      default:
+         r_cr = 1.4020f;
+         g_cb = -0.344136f;
+         g_cr = -0.714136f;
+         b_cb = 1.7720f;
+         break;
+   }
+
+   params[0] = full_range ? 0.0f : (16.0f / 255.0f);
+   params[1] = full_range ? 1.0f : (255.0f / 219.0f);
+   params[2] = r_cr;
+   params[3] = b_cb;
+   green[0] = g_cb;
+   green[1] = g_cr;
+
+   glUniform4fv(yuv_params_loc[index], 1, params);
+   glUniform2fv(yuv_green_loc[index], 1, green);
+}
+
+static void upload_plane(GLuint tex, GLsizei width, GLsizei height,
+      const uint8_t *data, int linesize)
+{
+   if (!tex || !data || width <= 0 || height <= 0 || linesize <= 0)
+      return;
+
+   glBindTexture(GL_TEXTURE_2D, tex);
+   glPixelStorei(GL_UNPACK_ROW_LENGTH, linesize);
+   glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
+         width, height, GL_RED, GL_UNSIGNED_BYTE, data);
+   glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+}
+
+static void upload_yuv420_frame(struct frame *dst, const AVFrame *src)
+{
+   unsigned width;
+   unsigned height;
+   unsigned chroma_width;
+   unsigned chroma_height;
+
+   if (!dst || !src || !src->data[0] || !src->data[1] || !src->data[2])
+      return;
+
+   width = src->width > 0 ? (unsigned)src->width : media.width;
+   height = src->height > 0 ? (unsigned)src->height : media.height;
+   if (width == 0 || height == 0)
+      return;
+
+   ensure_video_textures_allocated(width, height);
+   chroma_width = (width + 1) / 2;
+   chroma_height = (height + 1) / 2;
+
+   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+   upload_plane(dst->tex[0], (GLsizei)width, (GLsizei)height,
+         src->data[0], src->linesize[0]);
+   upload_plane(dst->tex[1], (GLsizei)chroma_width, (GLsizei)chroma_height,
+         src->data[1], src->linesize[1]);
+   upload_plane(dst->tex[2], (GLsizei)chroma_width, (GLsizei)chroma_height,
+         src->data[2], src->linesize[2]);
+   glBindTexture(GL_TEXTURE_2D, 0);
+
+   dst->colorspace = src->colorspace;
+   dst->color_range = src->color_range;
 }
 
 static bool aplayer_reload_current_from_start(void)
@@ -3765,7 +4061,6 @@ void retro_run(void)
          if (!decode_thread_dead)
          {
             video_decoder_context_t *ctx = NULL;
-            uint32_t               *pixels = NULL;
 
             if (!video_buffer_wait_for_finished_slot(video_buffer))
             {
@@ -3789,20 +4084,13 @@ void retro_run(void)
             video_buffer_get_finished_slot(video_buffer, &ctx);
             video_wait_timeout_logged = false;
             pts                          = ctx->pts;
-            pixels                       = (uint32_t*)ctx->target->data[0];
 
             double render_time = min_pts;
             if (pts != AV_NOPTS_VALUE)
                render_time = av_q2d(fctx->streams[video_stream_index]->time_base) * pts;
-            render_subtitles_on_buffer(pixels, media.width,
-                  media.height, render_time);
 
-            ensure_video_textures_allocated(media.width, media.height);
-            glBindTexture(GL_TEXTURE_2D, frames[1].tex);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
-                  (GLsizei)media.width, (GLsizei)media.height,
-                  GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-            glBindTexture(GL_TEXTURE_2D, 0);
+            upload_yuv420_frame(&frames[1], ctx->target);
+            render_subtitles_to_overlay(media.width, media.height, render_time);
             video_buffer_open_slot(video_buffer, ctx);
          }
 
@@ -3835,10 +4123,29 @@ void retro_run(void)
       glUseProgram(prog);
 
       glUniform1f(mix_loc, mix_factor);
-      glActiveTexture(GL_TEXTURE1);
-      glBindTexture(GL_TEXTURE_2D, frames[1].tex);
-      glActiveTexture(GL_TEXTURE0);
-      glBindTexture(GL_TEXTURE_2D, frames[0].tex);
+      {
+         struct frame *prev_frame = frames[0].valid ? &frames[0] : &frames[1];
+         struct frame *next_frame = &frames[1];
+
+         glActiveTexture(GL_TEXTURE0);
+         glBindTexture(GL_TEXTURE_2D, prev_frame->tex[0]);
+         glActiveTexture(GL_TEXTURE1);
+         glBindTexture(GL_TEXTURE_2D, prev_frame->tex[1]);
+         glActiveTexture(GL_TEXTURE2);
+         glBindTexture(GL_TEXTURE_2D, prev_frame->tex[2]);
+         glActiveTexture(GL_TEXTURE3);
+         glBindTexture(GL_TEXTURE_2D, next_frame->tex[0]);
+         glActiveTexture(GL_TEXTURE4);
+         glBindTexture(GL_TEXTURE_2D, next_frame->tex[1]);
+         glActiveTexture(GL_TEXTURE5);
+         glBindTexture(GL_TEXTURE_2D, next_frame->tex[2]);
+         glActiveTexture(GL_TEXTURE6);
+         glBindTexture(GL_TEXTURE_2D, subtitle_overlay_tex);
+         set_yuv_shader_params(0, prev_frame);
+         set_yuv_shader_params(1, next_frame);
+         glUniform1f(subtitle_enabled_loc,
+               rect_valid(&subtitle_overlay_dirty) ? 1.0f : 0.0f);
+      }
 
       update_video_quad();
       glBindBuffer(GL_ARRAY_BUFFER, vbo);
@@ -3855,10 +4162,12 @@ void retro_run(void)
       glDisableVertexAttribArray(tex_loc);
 
       glUseProgram(0);
-      glActiveTexture(GL_TEXTURE1);
-      glBindTexture(GL_TEXTURE_2D, 0);
+      for (unsigned tex_unit = 0; tex_unit < 7; tex_unit++)
+      {
+         glActiveTexture(GL_TEXTURE0 + tex_unit);
+         glBindTexture(GL_TEXTURE_2D, 0);
+      }
       glActiveTexture(GL_TEXTURE0);
-      glBindTexture(GL_TEXTURE_2D, 0);
 
       /* Draw video using OGL*/
       video_cb(RETRO_HW_FRAME_BUFFER_VALID,
@@ -4551,52 +4860,325 @@ static void set_colorspace(struct SwsContext *sws,
    }
 }
 
-/* Straight CPU alpha blending.
- * Should probably do in GL. */
-static void render_ass_img(AVFrame *conv_frame, ASS_Image *img)
+static uint32_t rgba_pack(unsigned r, unsigned g, unsigned b, unsigned a)
 {
-   uint32_t *frame = (uint32_t*)conv_frame->data[0];
-   int      stride = conv_frame->linesize[0] / sizeof(uint32_t);
+   return (a << 24) | (b << 16) | (g << 8) | r;
+}
 
+static void rgba_unpack(uint32_t pixel, unsigned *r, unsigned *g,
+      unsigned *b, unsigned *a)
+{
+   if (r)
+      *r = pixel & 0xff;
+   if (g)
+      *g = (pixel >> 8) & 0xff;
+   if (b)
+      *b = (pixel >> 16) & 0xff;
+   if (a)
+      *a = (pixel >> 24) & 0xff;
+}
+
+static void blend_premul_overlay_pixel(uint32_t *dst,
+      unsigned src_r, unsigned src_g, unsigned src_b, unsigned src_a)
+{
+   unsigned dst_r;
+   unsigned dst_g;
+   unsigned dst_b;
+   unsigned dst_a;
+   unsigned inv_a;
+
+   if (!dst || src_a == 0)
+      return;
+
+   if (src_a > 255)
+      src_a = 255;
+   if (src_r > 255)
+      src_r = 255;
+   if (src_g > 255)
+      src_g = 255;
+   if (src_b > 255)
+      src_b = 255;
+
+   rgba_unpack(*dst, &dst_r, &dst_g, &dst_b, &dst_a);
+   inv_a = 255 - src_a;
+
+   dst_r = src_r + ((dst_r * inv_a + 127) / 255);
+   dst_g = src_g + ((dst_g * inv_a + 127) / 255);
+   dst_b = src_b + ((dst_b * inv_a + 127) / 255);
+   dst_a = src_a + ((dst_a * inv_a + 127) / 255);
+
+   if (dst_r > 255)
+      dst_r = 255;
+   if (dst_g > 255)
+      dst_g = 255;
+   if (dst_b > 255)
+      dst_b = 255;
+   if (dst_a > 255)
+      dst_a = 255;
+
+   *dst = rgba_pack(dst_r, dst_g, dst_b, dst_a);
+}
+
+#if APLAYER_ARM64_NEON
+static inline uint16x8_t div255_u16(uint16x8_t value)
+{
+   value = vaddq_u16(value, vdupq_n_u16(128));
+   return vshrq_n_u16(vaddq_u16(value, vshrq_n_u16(value, 8)), 8);
+}
+
+static unsigned blend_ass_overlay_row_neon(uint32_t *dst, const uint8_t *src,
+      unsigned count, unsigned r, unsigned g, unsigned b, unsigned a)
+{
+   unsigned x = 0;
+   uint16x8_t scale = vdupq_n_u16((uint16_t)(a + 1));
+   uint16x8_t const_r = vdupq_n_u16((uint16_t)r);
+   uint16x8_t const_g = vdupq_n_u16((uint16_t)g);
+   uint16x8_t const_b = vdupq_n_u16((uint16_t)b);
+   uint16x8_t max_alpha = vdupq_n_u16(255);
+
+   if (!dst || !src || count < 8 || a == 0)
+      return 0;
+
+   for (; x + 8 <= count; x += 8)
+   {
+      uint16x8_t src_a = vmulq_u16(vmovl_u8(vld1_u8(src + x)), scale);
+      uint16x8_t inv_a;
+      uint16x8_t src_r;
+      uint16x8_t src_g;
+      uint16x8_t src_b;
+      uint8x8x4_t dst_px;
+      uint8x8x4_t out_px;
+
+      src_a = vshrq_n_u16(src_a, 8);
+      inv_a = vsubq_u16(max_alpha, src_a);
+      src_r = div255_u16(vmulq_u16(const_r, src_a));
+      src_g = div255_u16(vmulq_u16(const_g, src_a));
+      src_b = div255_u16(vmulq_u16(const_b, src_a));
+
+      dst_px = vld4_u8((const uint8_t*)(dst + x));
+      out_px.val[0] = vqmovn_u16(vaddq_u16(src_r,
+            div255_u16(vmulq_u16(vmovl_u8(dst_px.val[0]), inv_a))));
+      out_px.val[1] = vqmovn_u16(vaddq_u16(src_g,
+            div255_u16(vmulq_u16(vmovl_u8(dst_px.val[1]), inv_a))));
+      out_px.val[2] = vqmovn_u16(vaddq_u16(src_b,
+            div255_u16(vmulq_u16(vmovl_u8(dst_px.val[2]), inv_a))));
+      out_px.val[3] = vqmovn_u16(vaddq_u16(src_a,
+            div255_u16(vmulq_u16(vmovl_u8(dst_px.val[3]), inv_a))));
+
+      vst4_u8((uint8_t*)(dst + x), out_px);
+   }
+
+   return x;
+}
+
+static unsigned blend_bitmap_overlay_row_neon(uint32_t *dst,
+      const uint32_t *src, unsigned count)
+{
+   unsigned x = 0;
+   uint16x8_t max_alpha = vdupq_n_u16(255);
+
+   if (!dst || !src || count < 8)
+      return 0;
+
+   for (; x + 8 <= count; x += 8)
+   {
+      uint8x8x4_t src_px = vld4_u8((const uint8_t*)(src + x));
+      uint8x8x4_t dst_px = vld4_u8((const uint8_t*)(dst + x));
+      uint8x8x4_t out_px;
+      uint16x8_t src_a = vmovl_u8(src_px.val[3]);
+      uint16x8_t inv_a = vsubq_u16(max_alpha, src_a);
+
+      out_px.val[0] = vqmovn_u16(vaddq_u16(vmovl_u8(src_px.val[2]),
+            div255_u16(vmulq_u16(vmovl_u8(dst_px.val[0]), inv_a))));
+      out_px.val[1] = vqmovn_u16(vaddq_u16(vmovl_u8(src_px.val[1]),
+            div255_u16(vmulq_u16(vmovl_u8(dst_px.val[1]), inv_a))));
+      out_px.val[2] = vqmovn_u16(vaddq_u16(vmovl_u8(src_px.val[0]),
+            div255_u16(vmulq_u16(vmovl_u8(dst_px.val[2]), inv_a))));
+      out_px.val[3] = vqmovn_u16(vaddq_u16(src_a,
+            div255_u16(vmulq_u16(vmovl_u8(dst_px.val[3]), inv_a))));
+
+      vst4_u8((uint8_t*)(dst + x), out_px);
+   }
+
+   return x;
+}
+#endif
+
+static bool ensure_subtitle_overlay_texture(unsigned width, unsigned height)
+{
+   if (width == 0 || height == 0)
+      return false;
+
+   if (!subtitle_overlay_tex)
+   {
+      glGenTextures(1, &subtitle_overlay_tex);
+      init_linear_clamp_texture(subtitle_overlay_tex);
+   }
+
+   if (subtitle_overlay_width == width &&
+       subtitle_overlay_height == height &&
+       subtitle_overlay_buffer)
+      return true;
+
+   free(subtitle_overlay_buffer);
+   subtitle_overlay_buffer = (uint32_t*)calloc((size_t)width * height,
+         sizeof(*subtitle_overlay_buffer));
+   if (!subtitle_overlay_buffer)
+   {
+      subtitle_overlay_width = 0;
+      subtitle_overlay_height = 0;
+      rect_reset(&subtitle_overlay_dirty);
+      return false;
+   }
+
+   subtitle_overlay_width = width;
+   subtitle_overlay_height = height;
+   rect_reset(&subtitle_overlay_dirty);
+   subtitle_overlay_cache_reset();
+
+   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+   glBindTexture(GL_TEXTURE_2D, subtitle_overlay_tex);
+   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
+         (GLsizei)width, (GLsizei)height, 0,
+         GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+   glBindTexture(GL_TEXTURE_2D, 0);
+
+   return true;
+}
+
+static void upload_subtitle_overlay_rect(const struct aplayer_rect *rect)
+{
+   const uint32_t *data = NULL;
+
+   if (!subtitle_overlay_tex || !subtitle_overlay_buffer ||
+       !rect_valid(rect) || subtitle_overlay_width == 0)
+      return;
+
+   data = subtitle_overlay_buffer +
+      (size_t)rect->y0 * subtitle_overlay_width + rect->x0;
+
+   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+   glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)subtitle_overlay_width);
+   glBindTexture(GL_TEXTURE_2D, subtitle_overlay_tex);
+   glTexSubImage2D(GL_TEXTURE_2D, 0, rect->x0, rect->y0,
+         rect->x1 - rect->x0, rect->y1 - rect->y0,
+         GL_RGBA, GL_UNSIGNED_BYTE, data);
+   glBindTexture(GL_TEXTURE_2D, 0);
+   glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+}
+
+static void clear_subtitle_overlay_dirty_region(struct aplayer_rect *cleared)
+{
+   int y;
+
+   if (!subtitle_overlay_buffer || !rect_valid(&subtitle_overlay_dirty))
+      return;
+
+   if (cleared)
+      rect_add(cleared, subtitle_overlay_dirty.x0, subtitle_overlay_dirty.y0,
+            subtitle_overlay_dirty.x1, subtitle_overlay_dirty.y1);
+
+   for (y = subtitle_overlay_dirty.y0; y < subtitle_overlay_dirty.y1; y++)
+   {
+      uint32_t *row = subtitle_overlay_buffer +
+         (size_t)y * subtitle_overlay_width + subtitle_overlay_dirty.x0;
+      memset(row, 0, (size_t)(subtitle_overlay_dirty.x1 -
+            subtitle_overlay_dirty.x0) * sizeof(*row));
+   }
+
+   rect_reset(&subtitle_overlay_dirty);
+}
+
+static void clear_subtitle_overlay_dirty(void)
+{
+   struct aplayer_rect cleared;
+
+   rect_reset(&cleared);
+   clear_subtitle_overlay_dirty_region(&cleared);
+   upload_subtitle_overlay_rect(&cleared);
+}
+
+static void render_ass_img_on_overlay(uint32_t *buffer, unsigned width,
+      unsigned height, ASS_Image *img, struct aplayer_rect *dirty)
+{
    for (; img; img = img->next)
    {
-      int x, y;
-      unsigned r, g, b, a;
-      uint32_t *dst         = NULL;
-      const uint8_t *bitmap = NULL;
+      int x0;
+      int y0;
+      int x1;
+      int y1;
+      int sx0 = 0;
+      int sy0 = 0;
+      unsigned r;
+      unsigned g;
+      unsigned b;
+      unsigned a;
 
-      if (img->w == 0 && img->h == 0)
+      if (!img->bitmap || img->w <= 0 || img->h <= 0)
          continue;
 
-      bitmap = img->bitmap;
-      dst    = frame + img->dst_x + img->dst_y * stride;
+      x0 = img->dst_x;
+      y0 = img->dst_y;
+      x1 = img->dst_x + img->w;
+      y1 = img->dst_y + img->h;
 
-      r      = (img->color >> 24) & 0xff;
-      g      = (img->color >> 16) & 0xff;
-      b      = (img->color >>  8) & 0xff;
-      a      = 255 - (img->color & 0xff);
-
-      for (y = 0; y < img->h; y++,
-            bitmap += img->stride, dst += stride)
+      if (x0 < 0)
       {
-         for (x = 0; x < img->w; x++)
+         sx0 = -x0;
+         x0 = 0;
+      }
+      if (y0 < 0)
+      {
+         sy0 = -y0;
+         y0 = 0;
+      }
+      if (x1 > (int)width)
+         x1 = (int)width;
+      if (y1 > (int)height)
+         y1 = (int)height;
+      if (x1 <= x0 || y1 <= y0)
+         continue;
+
+      r = (img->color >> 24) & 0xff;
+      g = (img->color >> 16) & 0xff;
+      b = (img->color >>  8) & 0xff;
+      a = 255 - (img->color & 0xff);
+
+      for (int y = y0; y < y1; y++)
+      {
+         const uint8_t *src = img->bitmap + (size_t)(sy0 + y - y0) *
+            img->stride + sx0;
+         uint32_t *dst = buffer + (size_t)y * width + x0;
+         int x = x0;
+
+#if APLAYER_ARM64_NEON
          {
-            unsigned src_alpha = ((bitmap[x] * (a + 1)) >> 8) + 1;
-            unsigned dst_alpha = 256 - src_alpha;
+            unsigned done = blend_ass_overlay_row_neon(dst, src,
+                  (unsigned)(x1 - x0), r, g, b, a);
+            src += done;
+            dst += done;
+            x += (int)done;
+         }
+#endif
 
-            uint32_t dst_color = dst[x];
-            unsigned dst_r     = (dst_color >> 16) & 0xff;
-            unsigned dst_g     = (dst_color >>  8) & 0xff;
-            unsigned dst_b     = (dst_color >>  0) & 0xff;
+         for (; x < x1; x++, src++, dst++)
+         {
+            unsigned src_a = ((unsigned)*src * (a + 1)) >> 8;
+            unsigned src_r;
+            unsigned src_g;
+            unsigned src_b;
 
-            dst_r = (r * src_alpha + dst_r * dst_alpha) >> 8;
-            dst_g = (g * src_alpha + dst_g * dst_alpha) >> 8;
-            dst_b = (b * src_alpha + dst_b * dst_alpha) >> 8;
+            if (src_a == 0)
+               continue;
 
-            dst[x] = (0xffu << 24) | (dst_r << 16) |
-               (dst_g << 8) | (dst_b << 0);
+            src_r = (r * src_a + 127) / 255;
+            src_g = (g * src_a + 127) / 255;
+            src_b = (b * src_a + 127) / 255;
+            blend_premul_overlay_pixel(dst, src_r, src_g, src_b, src_a);
          }
       }
+
+      rect_add(dirty, x0, y0, x1, y1);
    }
 }
 
@@ -4608,36 +5190,22 @@ static int bitmap_subtitle_scale_coord(int value, int src_size, int dst_size)
    return (int)(((int64_t)value * dst_size + src_size / 2) / src_size);
 }
 
-static void blend_bitmap_subtitle_pixel(uint32_t *dst, uint32_t src)
+static void blend_bitmap_subtitle_pixel_on_overlay(uint32_t *dst, uint32_t src)
 {
    unsigned src_a = (src >> 24) & 0xff;
    unsigned src_r = (src >> 16) & 0xff;
    unsigned src_g = (src >>  8) & 0xff;
    unsigned src_b = (src >>  0) & 0xff;
-   unsigned inv_a = 255 - src_a;
-   uint32_t dst_color = *dst;
-   unsigned dst_r = (dst_color >> 16) & 0xff;
-   unsigned dst_g = (dst_color >>  8) & 0xff;
-   unsigned dst_b = (dst_color >>  0) & 0xff;
 
    if (src_a == 0)
       return;
 
-   if (src_a == 255)
-   {
-      *dst = src;
-      return;
-   }
-
-   dst_r = src_r + ((dst_r * inv_a + 127) / 255);
-   dst_g = src_g + ((dst_g * inv_a + 127) / 255);
-   dst_b = src_b + ((dst_b * inv_a + 127) / 255);
-
-   *dst = (0xffu << 24) | (dst_r << 16) | (dst_g << 8) | dst_b;
+   blend_premul_overlay_pixel(dst, src_r, src_g, src_b, src_a);
 }
 
-static void render_bitmap_subtitle_event(uint32_t *buffer, unsigned width,
-      unsigned height, const struct bitmap_subtitle_event *event)
+static void render_bitmap_subtitle_event_on_overlay(uint32_t *buffer,
+      unsigned width, unsigned height, const struct bitmap_subtitle_event *event,
+      struct aplayer_rect *dirty)
 {
    unsigned rect_index = 0;
    int canvas_w = 0;
@@ -4712,13 +5280,31 @@ static void render_bitmap_subtitle_event(uint32_t *buffer, unsigned width,
       {
          uint32_t *dst_row = buffer + (dst_y0 + dy) * width + dst_x0;
          int full_dy = (dst_y0 - full_y0) + dy;
+         int dx = 0;
          src_y = ((int64_t)full_dy * rect->h) / full_h;
          if (src_y >= rect->h)
             src_y = rect->h - 1;
          if (src_y < 0)
             src_y = 0;
 
-         for (int dx = 0; dx < dst_w; dx++)
+         if (dst_w == rect->w && full_w == rect->w && dst_x0 == full_x0)
+         {
+            const uint32_t *src_row = rect->pixels + (size_t)src_y * rect->w;
+
+#if APLAYER_ARM64_NEON
+            {
+               unsigned done = blend_bitmap_overlay_row_neon(dst_row,
+                     src_row, (unsigned)dst_w);
+               dx += (int)done;
+            }
+#endif
+
+            for (; dx < dst_w; dx++)
+               blend_bitmap_subtitle_pixel_on_overlay(&dst_row[dx], src_row[dx]);
+            continue;
+         }
+
+         for (; dx < dst_w; dx++)
          {
             int full_dx = (dst_x0 - full_x0) + dx;
             int src_x = ((int64_t)full_dx * rect->w) / full_w;
@@ -4730,25 +5316,38 @@ static void render_bitmap_subtitle_event(uint32_t *buffer, unsigned width,
                src_x = 0;
 
             src = rect->pixels[src_y * rect->w + src_x];
-            blend_bitmap_subtitle_pixel(&dst_row[dx], src);
+            blend_bitmap_subtitle_pixel_on_overlay(&dst_row[dx], src);
          }
       }
+
+      rect_add(dirty, dst_x0, dst_y0, dst_x1, dst_y1);
    }
 }
 
-static void render_subtitles_on_buffer(uint32_t *buffer, unsigned width,
-      unsigned height, double time_sec)
+static void render_subtitles_to_overlay(unsigned width, unsigned height,
+      double time_sec)
 {
    ASS_Track *render_track = NULL;
    struct bitmap_subtitle_event *bitmap_event = NULL;
+   struct aplayer_rect new_dirty;
+   struct aplayer_rect upload_dirty;
    int subtitle_ptr = -1;
    int64_t track_start_ms = -1;
+   bool redrew_overlay = false;
 
-   if (!buffer || width == 0 || height == 0)
+   rect_reset(&new_dirty);
+   rect_reset(&upload_dirty);
+
+   if (width == 0 || height == 0)
       return;
 
    if (subtitle_streams_num <= 0)
+   {
+      if (subtitle_overlay_buffer)
+         clear_subtitle_overlay_dirty();
+      subtitle_overlay_cache_reset();
       return;
+   }
 
    if (decode_thread_lock)
    {
@@ -4762,25 +5361,38 @@ static void render_subtitles_on_buffer(uint32_t *buffer, unsigned width,
    }
 
    if (subtitle_ptr < 0 || subtitle_ptr >= MAX_STREAMS)
+   {
+      if (subtitle_overlay_buffer)
+         clear_subtitle_overlay_dirty();
+      subtitle_overlay_cache_reset();
+      return;
+   }
+
+   if (!ensure_subtitle_overlay_texture(width, height))
       return;
 
    if (subtitle_ptr >= 0 && subtitle_ptr < MAX_STREAMS)
       track_start_ms = first_subtitle_start_ms[subtitle_ptr];
 
-   AVFrame tmp_frame;
-   memset(&tmp_frame, 0, sizeof(tmp_frame));
-   tmp_frame.data[0] = (uint8_t*)buffer;
-   tmp_frame.linesize[0] = (int)width * (int)sizeof(uint32_t);
-
-   slock_lock(ass_lock);
+   if (ass_lock)
+      slock_lock(ass_lock);
    if (subtitle_track_is_bitmap((unsigned)subtitle_ptr))
    {
       long long now_ms = subtitle_adjust_render_time_ms(render_track,
             subtitle_ptr, (long long)(time_sec * 1000.0));
       bitmap_subtitle_prune_locked((unsigned)subtitle_ptr, now_ms);
       bitmap_event = bitmap_subtitle_current_locked((unsigned)subtitle_ptr, now_ms);
+
+      if (subtitle_overlay_cache_matches_bitmap(subtitle_ptr, bitmap_event))
+         goto subtitles_done;
+
+      clear_subtitle_overlay_dirty_region(&upload_dirty);
       if (bitmap_event)
-         render_bitmap_subtitle_event(buffer, width, height, bitmap_event);
+         render_bitmap_subtitle_event_on_overlay(subtitle_overlay_buffer,
+               width, height, bitmap_event, &new_dirty);
+
+      subtitle_overlay_cache_set_bitmap(subtitle_ptr, bitmap_event);
+      redrew_overlay = true;
    }
    else if (render_track && ass_render)
    {
@@ -4817,9 +5429,47 @@ static void render_subtitles_on_buffer(uint32_t *buffer, unsigned width,
       }
 
       if (img)
-         render_ass_img(&tmp_frame, img);
+      {
+         if (change == 0 && subtitle_overlay_cache_matches_ass(subtitle_ptr))
+            goto subtitles_done;
+
+         clear_subtitle_overlay_dirty_region(&upload_dirty);
+         render_ass_img_on_overlay(subtitle_overlay_buffer,
+               width, height, img, &new_dirty);
+      }
+      else
+      {
+         if (change == 0 && subtitle_overlay_cache_matches_ass(subtitle_ptr))
+            goto subtitles_done;
+
+         clear_subtitle_overlay_dirty_region(&upload_dirty);
+      }
+
+      subtitle_overlay_cache_set_ass(subtitle_ptr);
+      redrew_overlay = true;
    }
-   slock_unlock(ass_lock);
+   else
+   {
+      clear_subtitle_overlay_dirty_region(&upload_dirty);
+      subtitle_overlay_cache_reset();
+      redrew_overlay = true;
+   }
+
+subtitles_done:
+   if (ass_lock)
+      slock_unlock(ass_lock);
+
+   if (!redrew_overlay)
+      return;
+
+   if (rect_valid(&new_dirty))
+   {
+      subtitle_overlay_dirty = new_dirty;
+      rect_add(&upload_dirty, new_dirty.x0, new_dirty.y0,
+            new_dirty.x1, new_dirty.y1);
+   }
+
+   upload_subtitle_overlay_rect(&upload_dirty);
 }
 
 static void bitmap_subtitle_convert_palette(uint32_t *colors, size_t count)
@@ -5687,11 +6337,16 @@ static void sws_worker_thread(void *arg)
    unsigned src_width;
    unsigned src_height;
    enum AVPixelFormat src_fmt;
+   enum AVPixelFormat out_fmt = AV_PIX_FMT_YUV420P;
+   bool direct_yuv420;
    AVFrame *tmp_frame = NULL;
    video_decoder_context_t *ctx = (video_decoder_context_t*) arg;
 
-   if (ctx)
-      ctx->pts = AV_NOPTS_VALUE;
+   if (!ctx)
+      return;
+
+   ctx->pts = AV_NOPTS_VALUE;
+   av_frame_unref(ctx->target);
 
    tmp_frame = ctx->filtered && ctx->filtered->data[0] ?
          ctx->filtered : ctx->source;
@@ -5702,6 +6357,10 @@ static void sws_worker_thread(void *arg)
    src_width = tmp_frame->width > 0 ? (unsigned)tmp_frame->width : media.width;
    src_height = tmp_frame->height > 0 ? (unsigned)tmp_frame->height : media.height;
    src_fmt = (enum AVPixelFormat)tmp_frame->format;
+   direct_yuv420 =
+      src_width == media.width &&
+      src_height == media.height &&
+      (src_fmt == AV_PIX_FMT_YUV420P || src_fmt == AV_PIX_FMT_YUVJ420P);
 
    if (src_width == 0 || src_height == 0 || src_fmt == AV_PIX_FMT_NONE || src_fmt < 0)
    {
@@ -5711,34 +6370,72 @@ static void sws_worker_thread(void *arg)
       goto done;
    }
 
-   ctx->sws = sws_getCachedContext(ctx->sws,
-         (int)src_width,
-         (int)src_height,
-         src_fmt,
-         media.width, media.height, AV_PIX_FMT_RGB32,
-         SWS_FAST_BILINEAR, NULL, NULL, NULL);
-   if (!ctx->sws)
-   {
-      log_cb(RETRO_LOG_ERROR, "[APLAYER] Failed to acquire swscale context.\n");
-      goto done;
-   }
-
-   set_colorspace(ctx->sws,
-         src_width,
-         src_height,
-         tmp_frame->colorspace,
-         tmp_frame->color_range);
-
-   if ((ret = sws_scale(ctx->sws, (const uint8_t *const*)tmp_frame->data,
-         tmp_frame->linesize, 0,
-         (int)src_height,
-         (uint8_t * const*)ctx->target->data, ctx->target->linesize)) < 0)
-   {
-      log_cb(RETRO_LOG_ERROR, "[APLAYER] Error while scaling image: %s\n", av_err2str(ret));
-   }
-
    ctx->pts = tmp_frame->best_effort_timestamp != AV_NOPTS_VALUE ?
          tmp_frame->best_effort_timestamp : tmp_frame->pts;
+
+   if (direct_yuv420)
+   {
+      if (!yuv_direct_path_logged)
+      {
+         log_cb(RETRO_LOG_INFO,
+               "[APLAYER] Video upload path: zero-copy YUV420 planes + shader conversion.\n");
+         yuv_direct_path_logged = true;
+      }
+
+      av_frame_move_ref(ctx->target, tmp_frame);
+      ctx->target->format = AV_PIX_FMT_YUV420P;
+      if (src_fmt == AV_PIX_FMT_YUVJ420P)
+         ctx->target->color_range = AVCOL_RANGE_JPEG;
+      else if (ctx->target->color_range == AVCOL_RANGE_UNSPECIFIED)
+         ctx->target->color_range = AVCOL_RANGE_MPEG;
+   }
+   else
+   {
+      if (!yuv_sws_path_logged)
+      {
+         log_cb(RETRO_LOG_INFO,
+               "[APLAYER] Video upload path: swscale to YUV420 planes + shader conversion.\n");
+         yuv_sws_path_logged = true;
+      }
+
+      if (av_image_fill_arrays(ctx->target->data, ctx->target->linesize,
+            ctx->frame_buf, out_fmt, media.width, media.height, 1) < 0)
+         goto done;
+
+      ctx->target->width = media.width;
+      ctx->target->height = media.height;
+      ctx->target->format = out_fmt;
+      ctx->target->colorspace = tmp_frame->colorspace;
+      ctx->target->color_range = tmp_frame->color_range;
+
+      ctx->sws = sws_getCachedContext(ctx->sws,
+            (int)src_width,
+            (int)src_height,
+            src_fmt,
+            media.width, media.height, out_fmt,
+            SWS_FAST_BILINEAR, NULL, NULL, NULL);
+      if (!ctx->sws)
+      {
+         log_cb(RETRO_LOG_ERROR, "[APLAYER] Failed to acquire swscale context.\n");
+         goto done;
+      }
+
+      set_colorspace(ctx->sws,
+            src_width,
+            src_height,
+            tmp_frame->colorspace,
+            tmp_frame->color_range);
+
+      if ((ret = sws_scale(ctx->sws, (const uint8_t *const*)tmp_frame->data,
+            tmp_frame->linesize, 0,
+            (int)src_height,
+            (uint8_t * const*)ctx->target->data, ctx->target->linesize)) < 0)
+      {
+         log_cb(RETRO_LOG_ERROR, "[APLAYER] Error while scaling image: %s\n", av_err2str(ret));
+      }
+
+      ctx->target->color_range = AVCOL_RANGE_MPEG;
+   }
 
 done:
    av_frame_unref(ctx->source);
@@ -6107,7 +6804,8 @@ static void decode_thread(void *data)
 
    if (video_stream_index >= 0)
    {
-      frame_size = av_image_get_buffer_size(AV_PIX_FMT_RGB32, media.width, media.height, 1);
+      frame_size = av_image_get_buffer_size(AV_PIX_FMT_YUV420P,
+            media.width, media.height, 1);
       video_buffer = video_buffer_create(4, frame_size, media.width, media.height);
       tpool = tpool_create(sw_sws_threads);
       log_cb(RETRO_LOG_INFO, "[APLAYER] Configured worker threads: %d\n", sw_sws_threads);
@@ -6707,11 +7405,53 @@ end:
 
 static void context_destroy(void)
 {
+   unsigned i;
+   unsigned plane;
+
    if (fft)
    {
       fft_free(fft);
       fft = NULL;
    }
+
+   for (i = 0; i < 2; i++)
+   {
+      for (plane = 0; plane < 3; plane++)
+      {
+         if (frames[i].tex[plane])
+         {
+            glDeleteTextures(1, &frames[i].tex[plane]);
+            frames[i].tex[plane] = 0;
+         }
+      }
+   }
+
+   if (subtitle_overlay_tex)
+   {
+      glDeleteTextures(1, &subtitle_overlay_tex);
+      subtitle_overlay_tex = 0;
+   }
+
+   if (vbo)
+   {
+      glDeleteBuffers(1, &vbo);
+      vbo = 0;
+   }
+
+   if (prog)
+   {
+      glDeleteProgram(prog);
+      prog = 0;
+   }
+
+   frames_tex_width = 0;
+   frames_tex_height = 0;
+   free(subtitle_overlay_buffer);
+   subtitle_overlay_buffer = NULL;
+   subtitle_overlay_width = 0;
+   subtitle_overlay_height = 0;
+   rect_reset(&subtitle_overlay_dirty);
+   subtitle_overlay_cache_reset();
 }
 
 #include "gl_shaders/ffmpeg.glsl.vert.h"
@@ -6736,8 +7476,14 @@ static void context_reset(void)
    frames_tex_height = 0;
    frames[0].pts     = 0.0;
    frames[1].pts     = 0.0;
+   frames[0].colorspace = AVCOL_SPC_UNSPECIFIED;
+   frames[1].colorspace = AVCOL_SPC_UNSPECIFIED;
+   frames[0].color_range = AVCOL_RANGE_UNSPECIFIED;
+   frames[1].color_range = AVCOL_RANGE_UNSPECIFIED;
    frames[0].valid   = false;
    frames[1].valid   = false;
+   rect_reset(&subtitle_overlay_dirty);
+   subtitle_overlay_cache_reset();
 
    if (audio_streams_num > 0 && video_stream_index < 0)
    {
@@ -6749,6 +7495,11 @@ static void context_reset(void)
    /* Already inits symbols. */
    if (!fft)
       rglgen_resolve_symbols(hw_render.get_proc_address);
+
+#if APLAYER_ARM64_NEON
+   log_cb(RETRO_LOG_INFO,
+         "[APLAYER] ARM64 NEON subtitle overlay compositing enabled.\n");
+#endif
 
    prog = glCreateProgram();
    vert = glCreateShader(GL_VERTEX_SHADER);
@@ -6764,23 +7515,32 @@ static void context_reset(void)
 
    glUseProgram(prog);
 
-   glUniform1i(glGetUniformLocation(prog, "sTex0"), 0);
-   glUniform1i(glGetUniformLocation(prog, "sTex1"), 1);
+   glUniform1i(glGetUniformLocation(prog, "sFrame0Y"), 0);
+   glUniform1i(glGetUniformLocation(prog, "sFrame0U"), 1);
+   glUniform1i(glGetUniformLocation(prog, "sFrame0V"), 2);
+   glUniform1i(glGetUniformLocation(prog, "sFrame1Y"), 3);
+   glUniform1i(glGetUniformLocation(prog, "sFrame1U"), 4);
+   glUniform1i(glGetUniformLocation(prog, "sFrame1V"), 5);
+   glUniform1i(glGetUniformLocation(prog, "sSubtitle"), 6);
    vertex_loc = glGetAttribLocation(prog, "aVertex");
    tex_loc    = glGetAttribLocation(prog, "aTexCoord");
    mix_loc    = glGetUniformLocation(prog, "uMix");
+   subtitle_enabled_loc = glGetUniformLocation(prog, "uSubtitleEnabled");
+   yuv_params_loc[0] = glGetUniformLocation(prog, "uYuvParams0");
+   yuv_params_loc[1] = glGetUniformLocation(prog, "uYuvParams1");
+   yuv_green_loc[0] = glGetUniformLocation(prog, "uYuvGreen0");
+   yuv_green_loc[1] = glGetUniformLocation(prog, "uYuvGreen1");
 
    glUseProgram(0);
 
    for (i = 0; i < 2; i++)
    {
-      glGenTextures(1, &frames[i].tex);
-
-      glBindTexture(GL_TEXTURE_2D, frames[i].tex);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+      unsigned plane;
+      for (plane = 0; plane < 3; plane++)
+      {
+         glGenTextures(1, &frames[i].tex[plane]);
+         init_linear_clamp_texture(frames[i].tex[plane]);
+      }
    }
 
    glGenBuffers(1, &vbo);
@@ -6863,6 +7623,12 @@ void retro_unload_game(void)
 
    frames[0].pts = frames[1].pts = 0.0;
    frames[0].valid = frames[1].valid = false;
+   free(subtitle_overlay_buffer);
+   subtitle_overlay_buffer = NULL;
+   subtitle_overlay_width = 0;
+   subtitle_overlay_height = 0;
+   rect_reset(&subtitle_overlay_dirty);
+   subtitle_overlay_cache_reset();
    pts_bias = 0.0;
    frame_cnt = 0;
    audio_frames = 0;

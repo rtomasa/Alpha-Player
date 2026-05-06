@@ -72,6 +72,10 @@ If a video has an external subtitle file with the same name and a `.srt` extensi
 # Changelog
 
 # v2.6.0
+- [X] Added perfromance improvements:
+    - Moved RGB conversion to GL shader
+    - Subtitles now render into a separate RGBA overlay texture
+    - Added ARM64 NEON compositing for the CPU subtitle overlay
 - [X] Fixed EOF playback shutdown stalls that could leave the frontend UI unresponsive
 - [X] Fixed libretro reset after EOF to restart the current video from the beginning
 - [X] Fixed DVD/VobSub subtitle packet handling that could hang playback on a black screen
