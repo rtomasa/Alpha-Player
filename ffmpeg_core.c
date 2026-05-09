@@ -6455,10 +6455,9 @@ static void decode_video(AVCodecContext *ctx, AVPacket *pkt, ASS_Track *ass_trac
    {
       if (main_sleeping)
       {
-         if (!do_seek)
-            log_cb(RETRO_LOG_ERROR, "[APLAYER] Thread: Video deadlock detected.\n");
-         tpool_wait(tpool);
-         video_buffer_clear(video_buffer);
+         /* The main thread is waiting for audio. Do not drop finished
+          * video frames here; return to the decode loop so it can feed
+          * audio and let the main thread consume the queued frames. */
          return;
       }
    }
@@ -6730,6 +6729,28 @@ static bool earlier_or_close_enough(double p1, double p2)
    return (p1 <= p2 || (p1-p2) < (1.0 / media.interpolate_fps) );
 }
 
+static int64_t packet_start_timestamp(const AVPacket *pkt)
+{
+   if (!pkt)
+      return AV_NOPTS_VALUE;
+   if (pkt->pts != AV_NOPTS_VALUE)
+      return pkt->pts;
+   if (pkt->dts != AV_NOPTS_VALUE)
+      return pkt->dts;
+   return AV_NOPTS_VALUE;
+}
+
+static int64_t packet_end_timestamp(const AVPacket *pkt)
+{
+   int64_t start_ts = packet_start_timestamp(pkt);
+
+   if (start_ts == AV_NOPTS_VALUE)
+      return AV_NOPTS_VALUE;
+   if (pkt->duration > 0 && start_ts <= INT64_MAX - pkt->duration)
+      return start_ts + pkt->duration;
+   return start_ts;
+}
+
 static void decode_thread(void *data)
 {
    unsigned i;
@@ -6935,11 +6956,34 @@ static void decode_thread(void *data)
 
       video_filter_drain_to_buffer(ass_track_active);
 
+      bool need_audio_now = false;
+      bool have_next_audio_start = false;
+      bool have_next_video_end = false;
+      slock_lock(fifo_lock);
+      need_audio_now = main_sleeping;   /* main thread is waiting for us */
+      slock_unlock(fifo_lock);
+
       if (!packet_buffer_empty(audio_packet_buffer))
-         next_audio_start = audio_timebase * packet_buffer_peek_start_pts(audio_packet_buffer);
+      {
+         int64_t next_audio_start_pts =
+            packet_buffer_peek_start_pts(audio_packet_buffer);
+         if (next_audio_start_pts != AV_NOPTS_VALUE)
+         {
+            next_audio_start = audio_timebase * next_audio_start_pts;
+            have_next_audio_start = true;
+         }
+      }
 
       if (!packet_buffer_empty(video_packet_buffer))
-         next_video_end = video_timebase * packet_buffer_peek_end_pts(video_packet_buffer);
+      {
+         int64_t next_video_end_pts =
+            packet_buffer_peek_end_pts(video_packet_buffer);
+         if (next_video_end_pts != AV_NOPTS_VALUE)
+         {
+            next_video_end = video_timebase * next_video_end_pts;
+            have_next_video_end = true;
+         }
+      }
 
       /* Decide whether to pull one audio packet from audio_packet_buffer.
        *
@@ -6949,6 +6993,7 @@ static void decode_thread(void *data)
        *      (<= 500 ms tolerance),                              ahead < 0.5
        *   3. The decoder already hit EOF,                        eof == true
        *   4. The main thread is blocked waiting for audio data,  need_audio_now
+       *   5. Either packet has no timestamp, so packet order is our best guide
        *
        * Together these rules guarantee:
        *   – Audio never outruns video by more than half a second during normal
@@ -6958,19 +7003,22 @@ static void decode_thread(void *data)
        *     PTS gap is large.
        */
 
-      bool need_audio_now = false;
-      slock_lock(fifo_lock);
-      need_audio_now = main_sleeping;   /* main thread is waiting for us */
-      slock_unlock(fifo_lock);
-
-      double ahead = next_audio_start - next_video_end;   /* may be < 0 */
+      double ahead = (have_next_audio_start && have_next_video_end) ?
+         next_audio_start - next_video_end : 0.0;   /* may be < 0 */
       bool   okay  = (video_stream_index < 0) ||
-                     (ahead < 0.5 /*s*/) || need_audio_now || eof;
+                     (ahead < 0.5 /*s*/) ||
+                     !have_next_audio_start ||
+                     !have_next_video_end ||
+                     need_audio_now ||
+                     eof;
 
       if (okay && !packet_buffer_empty(audio_packet_buffer))
       {
+         int64_t audio_end_ts;
          packet_buffer_get_packet(audio_packet_buffer, pkt_local);
-         last_audio_end = audio_timebase * (pkt_local->pts + pkt_local->duration);
+         audio_end_ts = packet_end_timestamp(pkt_local);
+         if (audio_end_ts != AV_NOPTS_VALUE)
+            last_audio_end = audio_timebase * audio_end_ts;
          audio_buffer = decode_audio(actx_active, pkt_local, aud_frame,
                                     audio_buffer, &audio_buffer_cap,
                                     swr[audio_stream_ptr],
@@ -6987,10 +7035,15 @@ static void decode_thread(void *data)
        *  2. there is no audio stream to play
        *  3. EOF
        **/
-      if (!audio_clock_rebase_pending &&
+      bool waiting_for_audio = need_audio_now && actx_active && !eof;
+      bool video_due = !have_next_video_end ||
+            earlier_or_close_enough(next_video_end, last_audio_end);
+
+      if (!waiting_for_audio &&
+            !audio_clock_rebase_pending &&
             !packet_buffer_empty(video_packet_buffer) &&
             (
-               (!eof && earlier_or_close_enough(next_video_end, last_audio_end)) ||
+               (!eof && video_due) ||
                !actx_active ||
                eof
             )

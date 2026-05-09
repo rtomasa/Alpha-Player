@@ -16,6 +16,28 @@ struct packet_buffer
    size_t size;
 };
 
+static int64_t packet_buffer_packet_start_pts(const AVPacket *pkt)
+{
+   if (!pkt)
+      return AV_NOPTS_VALUE;
+   if (pkt->pts != AV_NOPTS_VALUE)
+      return pkt->pts;
+   if (pkt->dts != AV_NOPTS_VALUE)
+      return pkt->dts;
+   return AV_NOPTS_VALUE;
+}
+
+static int64_t packet_buffer_packet_end_pts(const AVPacket *pkt)
+{
+   int64_t start_pts = packet_buffer_packet_start_pts(pkt);
+
+   if (start_pts == AV_NOPTS_VALUE)
+      return AV_NOPTS_VALUE;
+   if (pkt->duration > 0 && start_pts <= INT64_MAX - pkt->duration)
+      return start_pts + pkt->duration;
+   return start_pts;
+}
+
 packet_buffer_t *packet_buffer_create(void)
 {
    packet_buffer_t *b = (packet_buffer_t*)malloc(sizeof(packet_buffer_t));
@@ -151,15 +173,15 @@ void packet_buffer_trim(packet_buffer_t *packet_buffer, size_t max_packets)
 int64_t packet_buffer_peek_start_pts(packet_buffer_t *packet_buffer)
 {
    if (!packet_buffer->tail)
-      return 0;
+      return AV_NOPTS_VALUE;
 
-   return packet_buffer->tail->data->pts;
+   return packet_buffer_packet_start_pts(packet_buffer->tail->data);
 }
 
 int64_t packet_buffer_peek_end_pts(packet_buffer_t *packet_buffer)
 {
    if (!packet_buffer->tail)
-      return 0;
+      return AV_NOPTS_VALUE;
 
-   return packet_buffer->tail->data->pts + packet_buffer->tail->data->duration;
+   return packet_buffer_packet_end_pts(packet_buffer->tail->data);
 }
