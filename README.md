@@ -33,7 +33,7 @@ This core has been modified focusing on Raspberry Pi devices using a development
 * JOYPAD_START - play/pause
 * JOYPAD_A - display progress
 * JOYPAD_B - display media title
-* JOYPAD_X - enable/disable video subtitles
+* JOYPAD_X - cycle video subtitle tracks/off
 * JOYPAD_Y - change video lang audio track
 * JOYPAD_L - previous track (m3u)
 * JOYPAD_R - next track (m3u)
@@ -54,6 +54,16 @@ This core has been modified focusing on Raspberry Pi devices using a development
 * `Default` uses the file default audio track when flagged, otherwise the first audio track
 * If the selected language is not available, playback falls back to the `Default` behavior
 
+# Subtitle Options
+
+* Subtitle Mode - `Off`, `Forced only`, `Preferred language`, `Always show preferred language`
+* `Off` starts playback with subtitles disabled; manual subtitle cycling is still available
+* `Forced only` selects a forced subtitle track, preferring the configured language when available
+* `Preferred language` shows the preferred subtitle language unless the active audio track already matches it, in which case it shows forced subtitles only
+* `Always show preferred language` shows the preferred subtitle language regardless of the active audio track
+* Preferred Language - `Default`, `English`, `Spanish`, `Japanese`, `Spanish (Latin America)`, `French`, `German`, `Italian`, `Portuguese`, `Portuguese (Brazil)`, `Dutch`, `Russian`, `Ukrainian`, `Polish`, `Czech`, `Hungarian`, `Romanian`, `Turkish`, `Arabic`, `Hebrew`, `Hindi`, `Korean`, `Chinese (Simplified)`, `Chinese (Traditional)`, `Cantonese`, `Thai`, `Vietnamese`
+* `Default` uses the file default subtitle track, a same-name external subtitle, or the first subtitle track
+
 # Video Options
 
 * Frame Blending - Off, Low, Medium, High or Full
@@ -70,6 +80,9 @@ This core has been modified focusing on Raspberry Pi devices using a development
 If a video has an external subtitle file with the same name and a `.srt` extension, it will be loaded automatically.
 
 # Changelog
+
+# v2.7.0
+- [X] Added `SUBTITLE MODE` and subtitle `PREFERRED LANGUAGE` options
 
 # v2.6.0
 - [X] Added perfromance improvements:

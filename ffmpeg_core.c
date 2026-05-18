@@ -89,6 +89,14 @@ enum aplayer_deinterlace_mode
    APLAYER_DEINTERLACE_FORCED
 };
 
+enum aplayer_subtitle_mode
+{
+   APLAYER_SUBTITLE_MODE_OFF = 0,
+   APLAYER_SUBTITLE_MODE_FORCED_ONLY,
+   APLAYER_SUBTITLE_MODE_PREFERRED,
+   APLAYER_SUBTITLE_MODE_ALWAYS_PREFERRED
+};
+
 struct aplayer_avfilter_api
 {
    bool load_attempted;
@@ -323,6 +331,7 @@ static tpool_t *tpool;
 #define BITMAP_SUBTITLE_MAX_EVENTS 64
 #define BITMAP_SUBTITLE_TRAILING_LIMIT_MS (60 * 1000)
 #define APLAYER_AUDIO_LANGUAGE_DEFAULT "default"
+#define APLAYER_SUBTITLE_LANGUAGE_DEFAULT "default"
 static AVCodecContext *actx[MAX_STREAMS];
 static AVCodecContext *sctx[MAX_STREAMS];
 static int audio_streams[MAX_STREAMS];
@@ -413,7 +422,9 @@ static unsigned video_crop_top = 0;
 static unsigned video_crop_right = 0;
 static unsigned video_crop_bottom = 0;
 static char preferred_audio_language[16] = APLAYER_AUDIO_LANGUAGE_DEFAULT;
+static char preferred_subtitle_language[16] = APLAYER_SUBTITLE_LANGUAGE_DEFAULT;
 static enum aplayer_deinterlace_mode video_deinterlace_mode = APLAYER_DEINTERLACE_AUTO;
+static enum aplayer_subtitle_mode subtitle_mode = APLAYER_SUBTITLE_MODE_OFF;
 static volatile bool video_filter_reset_pending = false;
 static volatile bool playback_restart_request = false;
 static volatile bool playback_restart_pending = false;
@@ -555,6 +566,7 @@ static bool aplayer_consume_playback_restart_pending(void)
 }
 
 static void sws_worker_thread(void *arg);
+static void subtitle_apply_auto_selection(bool log_selection);
 
 static const char *video_deinterlace_mode_name(enum aplayer_deinterlace_mode mode)
 {
@@ -576,6 +588,34 @@ static const char *video_deinterlace_filter_args(enum aplayer_deinterlace_mode m
       return "mode=send_frame:parity=auto:deint=all";
 
    return "mode=send_frame:parity=auto:deint=interlaced";
+}
+
+static enum aplayer_subtitle_mode subtitle_mode_from_value(const char *value)
+{
+   if (string_is_equal(value, "forced"))
+      return APLAYER_SUBTITLE_MODE_FORCED_ONLY;
+   if (string_is_equal(value, "preferred"))
+      return APLAYER_SUBTITLE_MODE_PREFERRED;
+   if (string_is_equal(value, "always_preferred"))
+      return APLAYER_SUBTITLE_MODE_ALWAYS_PREFERRED;
+
+   return APLAYER_SUBTITLE_MODE_OFF;
+}
+
+static const char *subtitle_mode_name(enum aplayer_subtitle_mode mode)
+{
+   switch (mode)
+   {
+      case APLAYER_SUBTITLE_MODE_FORCED_ONLY:
+         return "Forced only";
+      case APLAYER_SUBTITLE_MODE_PREFERRED:
+         return "Preferred language";
+      case APLAYER_SUBTITLE_MODE_ALWAYS_PREFERRED:
+         return "Always show preferred language";
+      case APLAYER_SUBTITLE_MODE_OFF:
+      default:
+         return "Off";
+   }
 }
 
 static bool rationals_differ(AVRational lhs, AVRational rhs)
@@ -2334,7 +2374,7 @@ void retro_get_system_info(struct retro_system_info *info)
 {
    memset(info, 0, sizeof(*info));
    info->library_name     = "Alpha Player";
-   info->library_version  = "v2.6.0";
+   info->library_version  = "v2.7.0";
    info->need_fullpath    = true;
    info->valid_extensions = "mkv|avi|f4v|f4f|3gp|ogm|flv|mp4|mp3|flac|ogg|m4a|webm|3g2|mov|wmv|mpg|mpeg|vob|asf|divx|m2p|m2ts|ps|ts|mxf|wma|wav|m3u|s3m|it|xm|mod|ay|gbs|gym|hes|kss|nsf|nsfe|sap|spc|vgm|vgz";
 }
@@ -2376,6 +2416,7 @@ void retro_set_environment(retro_environment_t cb)
    {
       {"video", "Video", "Video settings"},
       {"audio", "Audio", "Audio settings"},
+      {"subtitles", "Subtitles", "Subtitle settings"},
       {"music", "Music", "Music Settings"},
       {NULL, NULL, NULL}
    };
@@ -2432,6 +2473,51 @@ void retro_set_environment(retro_environment_t cb)
             {"en", "English"},
             {"ja", "Japanese"},
             {"es", "Spanish"},
+            {"es-419", "Spanish (Latin America)"},
+            {"fr", "French"},
+            {"de", "German"},
+            {"it", "Italian"},
+            {"pt", "Portuguese"},
+            {"pt-br", "Portuguese (Brazil)"},
+            {"nl", "Dutch"},
+            {"ru", "Russian"},
+            {"uk", "Ukrainian"},
+            {"pl", "Polish"},
+            {"cs", "Czech"},
+            {"hu", "Hungarian"},
+            {"ro", "Romanian"},
+            {"tr", "Turkish"},
+            {"ar", "Arabic"},
+            {"he", "Hebrew"},
+            {"hi", "Hindi"},
+            {"ko", "Korean"},
+            {"zh-hans", "Chinese (Simplified)"},
+            {"zh-hant", "Chinese (Traditional)"},
+            {"yue", "Cantonese"},
+            {"th", "Thai"},
+            {"vi", "Vietnamese"},
+            {NULL, NULL}
+         }, "default"
+      },
+      {
+         "aplayer_subtitle_mode", "Subtitle Mode", "Controls automatic subtitle track selection when a video is loaded. Manual subtitle cycling remains available with the subtitle toggle button.",
+         NULL, NULL, "subtitles",
+         {
+            {"off", "Off"},
+            {"forced", "Forced only"},
+            {"preferred", "Preferred language"},
+            {"always_preferred", "Always show preferred language"},
+            {NULL, NULL}
+         }, "off"
+      },
+      {
+         "aplayer_subtitle_language", "Preferred Language", "Selects the subtitle language used by Preferred language subtitle modes. Default uses the file default subtitle track, same-name external subtitle, or first subtitle track.",
+         NULL, NULL, "subtitles",
+         {
+            {"default", "Default"},
+            {"en", "English"},
+            {"es", "Spanish"},
+            {"ja", "Japanese"},
             {"es-419", "Spanish (Latin America)"},
             {"fr", "French"},
             {"de", "German"},
@@ -2805,12 +2891,20 @@ static void check_variables(bool firststart)
    struct retro_variable loop_content = {0};
    struct retro_variable auto_resume_var = {0};
    struct retro_variable audio_language_var = {0};
+   struct retro_variable subtitle_mode_var = {0};
+   struct retro_variable subtitle_language_var = {0};
    struct retro_variable replay_is_crt = {0};
    struct retro_variable fft_toggle_var = {0};
    struct retro_variable video_blending_var = {0};
    struct retro_variable video_zoom_var = {0};
    struct retro_variable video_deinterlace_var = {0};
    enum aplayer_deinterlace_mode old_deinterlace_mode = video_deinterlace_mode;
+   enum aplayer_subtitle_mode old_subtitle_mode = subtitle_mode;
+   char old_preferred_subtitle_language[sizeof(preferred_subtitle_language)];
+
+   snprintf(old_preferred_subtitle_language,
+         sizeof(old_preferred_subtitle_language), "%s",
+         preferred_subtitle_language);
 
    fft_width  = 640;
    fft_height = 480;
@@ -2881,6 +2975,28 @@ static void check_variables(bool firststart)
          !string_is_empty(audio_language_var.value))
       audio_language_normalize_tag(audio_language_var.value,
             preferred_audio_language, sizeof(preferred_audio_language));
+
+   subtitle_mode = APLAYER_SUBTITLE_MODE_OFF;
+   subtitle_mode_var.key = "aplayer_subtitle_mode";
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &subtitle_mode_var) &&
+         subtitle_mode_var.value)
+      subtitle_mode = subtitle_mode_from_value(subtitle_mode_var.value);
+
+   snprintf(preferred_subtitle_language, sizeof(preferred_subtitle_language), "%s",
+         APLAYER_SUBTITLE_LANGUAGE_DEFAULT);
+   subtitle_language_var.key = "aplayer_subtitle_language";
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &subtitle_language_var) &&
+         !string_is_empty(subtitle_language_var.value))
+      audio_language_normalize_tag(subtitle_language_var.value,
+            preferred_subtitle_language, sizeof(preferred_subtitle_language));
+
+   if (!firststart &&
+       (old_subtitle_mode != subtitle_mode ||
+        !string_is_equal(old_preferred_subtitle_language,
+           preferred_subtitle_language)))
+   {
+      subtitle_apply_auto_selection(true);
+   }
 
    update_subtitle_font_settings();
    auto_resume_enabled = false;
@@ -3156,6 +3272,302 @@ static void subtitle_selection_label(int subtitle_ptr, char *label, size_t label
       snprintf(label, label_size, "External Subtitle #%d", subtitle_ptr);
    else
       snprintf(label, label_size, "Subtitle Track #%d", subtitle_ptr);
+}
+
+static bool aplayer_contains_token_case_insensitive(const char *text,
+      const char *token)
+{
+   size_t token_len;
+
+   if (string_is_empty(text) || string_is_empty(token))
+      return false;
+
+   token_len = strlen(token);
+   for (const char *p = text; *p; p++)
+   {
+      size_t i;
+
+      if (p != text && isalnum((unsigned char)p[-1]))
+         continue;
+
+      for (i = 0; i < token_len; i++)
+      {
+         if (!p[i] ||
+             tolower((unsigned char)p[i]) !=
+                tolower((unsigned char)token[i]))
+            break;
+      }
+
+      if (i == token_len && !isalnum((unsigned char)p[i]))
+         return true;
+   }
+
+   return false;
+}
+
+static const char *subtitle_stream_metadata_value(int subtitle_ptr,
+      const char *key)
+{
+   int stream_index;
+
+   if (!fctx || !subtitle_selection_is_valid(subtitle_ptr))
+      return NULL;
+
+   stream_index = subtitle_streams[subtitle_ptr];
+   if (stream_index < 0 || stream_index >= (int)fctx->nb_streams)
+      return NULL;
+
+   return stream_metadata_value(fctx->streams[stream_index], key);
+}
+
+static bool subtitle_language_is_default(const char *language)
+{
+   return string_is_empty(language) ||
+      string_is_equal(language, APLAYER_SUBTITLE_LANGUAGE_DEFAULT);
+}
+
+static const char *subtitle_stream_language_tag(int subtitle_ptr)
+{
+   return subtitle_stream_metadata_value(subtitle_ptr, "language");
+}
+
+static bool subtitle_stream_has_disposition(int subtitle_ptr, int disposition)
+{
+   int stream_index;
+
+   if (!fctx || !subtitle_selection_is_valid(subtitle_ptr))
+      return false;
+
+   stream_index = subtitle_streams[subtitle_ptr];
+   if (stream_index < 0 || stream_index >= (int)fctx->nb_streams)
+      return false;
+
+   return (fctx->streams[stream_index]->disposition & disposition) != 0;
+}
+
+static bool subtitle_stream_is_default_track(int subtitle_ptr)
+{
+   return subtitle_stream_has_disposition(subtitle_ptr, AV_DISPOSITION_DEFAULT);
+}
+
+static bool subtitle_stream_is_forced(int subtitle_ptr)
+{
+   const char *title = subtitle_stream_metadata_value(subtitle_ptr, "title");
+
+#ifdef AV_DISPOSITION_FORCED
+   if (subtitle_stream_has_disposition(subtitle_ptr, AV_DISPOSITION_FORCED))
+      return true;
+#endif
+
+   return aplayer_contains_token_case_insensitive(title, "forced");
+}
+
+static bool subtitle_stream_is_hearing_impaired(int subtitle_ptr)
+{
+   const char *title = subtitle_stream_metadata_value(subtitle_ptr, "title");
+
+#ifdef AV_DISPOSITION_HEARING_IMPAIRED
+   if (subtitle_stream_has_disposition(subtitle_ptr,
+            AV_DISPOSITION_HEARING_IMPAIRED))
+      return true;
+#endif
+
+   return aplayer_contains_token_case_insensitive(title, "sdh") ||
+      aplayer_contains_token_case_insensitive(title, "hearing");
+}
+
+static int subtitle_quality_score(int subtitle_ptr)
+{
+   int score = 0;
+
+   if (subtitle_stream_is_default_track(subtitle_ptr))
+      score += 25;
+   if (subtitle_is_external[subtitle_ptr])
+      score += 15;
+   if (subtitle_stream_is_hearing_impaired(subtitle_ptr))
+      score -= 10;
+
+   return score;
+}
+
+static int subtitle_select_default_stream_ptr(void)
+{
+   int best_ptr = SUBTITLE_STREAM_DISABLED;
+   int best_score = INT_MIN;
+   int i;
+
+   for (i = 0; i < subtitle_streams_num; i++)
+   {
+      int score = 100 + subtitle_quality_score(i);
+
+      if (subtitle_stream_is_default_track(i))
+         score += 1000;
+      else if (subtitle_is_external[i])
+         score += 800;
+
+      if (!subtitle_stream_is_forced(i))
+         score += 50;
+
+      if (score > best_score)
+      {
+         best_score = score;
+         best_ptr = i;
+      }
+   }
+
+   return best_ptr;
+}
+
+static int subtitle_select_forced_stream_ptr(const char *language)
+{
+   int best_match_ptr = SUBTITLE_STREAM_DISABLED;
+   int best_match_score = INT_MIN;
+   int best_fallback_ptr = SUBTITLE_STREAM_DISABLED;
+   int best_fallback_score = INT_MIN;
+   bool want_language = !subtitle_language_is_default(language);
+   int i;
+
+   for (i = 0; i < subtitle_streams_num; i++)
+   {
+      int score;
+      int language_score = 0;
+
+      if (!subtitle_stream_is_forced(i))
+         continue;
+
+      score = 100 + subtitle_quality_score(i);
+      if (want_language)
+      {
+         language_score = audio_language_match_score(language,
+               subtitle_stream_language_tag(i));
+         if (language_score > 0)
+         {
+            int match_score = score + 1000 + language_score;
+            if (match_score > best_match_score)
+            {
+               best_match_score = match_score;
+               best_match_ptr = i;
+            }
+         }
+      }
+
+      if (score > best_fallback_score)
+      {
+         best_fallback_score = score;
+         best_fallback_ptr = i;
+      }
+   }
+
+   return best_match_ptr != SUBTITLE_STREAM_DISABLED ?
+      best_match_ptr : best_fallback_ptr;
+}
+
+static int subtitle_select_language_stream_ptr(const char *language)
+{
+   int best_ptr = SUBTITLE_STREAM_DISABLED;
+   int best_score = INT_MIN;
+   int i;
+
+   if (subtitle_language_is_default(language))
+      return subtitle_select_default_stream_ptr();
+
+   for (i = 0; i < subtitle_streams_num; i++)
+   {
+      int language_score = audio_language_match_score(language,
+            subtitle_stream_language_tag(i));
+      int score;
+
+      if (language_score <= 0)
+         continue;
+
+      score = language_score + subtitle_quality_score(i);
+      if (!subtitle_stream_is_forced(i))
+         score += 1000;
+      else
+         score += 100;
+
+      if (score > best_score)
+      {
+         best_score = score;
+         best_ptr = i;
+      }
+   }
+
+   return best_ptr;
+}
+
+static bool subtitle_current_audio_matches_language(const char *language)
+{
+   if (subtitle_language_is_default(language))
+      return false;
+
+   if (!audio_selection_is_valid(audio_streams_ptr))
+      return false;
+
+   return audio_language_match_score(language,
+         audio_stream_language_tag(audio_streams_ptr)) > 0;
+}
+
+static int subtitle_select_preferred_stream_ptr(bool always_show)
+{
+   int selected;
+
+   if (!always_show &&
+       subtitle_current_audio_matches_language(preferred_subtitle_language))
+      return subtitle_select_forced_stream_ptr(preferred_subtitle_language);
+
+   selected = subtitle_select_language_stream_ptr(preferred_subtitle_language);
+   if (selected != SUBTITLE_STREAM_DISABLED)
+      return selected;
+
+   return subtitle_select_forced_stream_ptr(preferred_subtitle_language);
+}
+
+static int subtitle_select_initial_stream_ptr(void)
+{
+   if (subtitle_streams_num <= 0)
+      return SUBTITLE_STREAM_DISABLED;
+
+   switch (subtitle_mode)
+   {
+      case APLAYER_SUBTITLE_MODE_FORCED_ONLY:
+         return subtitle_select_forced_stream_ptr(preferred_subtitle_language);
+      case APLAYER_SUBTITLE_MODE_PREFERRED:
+         return subtitle_select_preferred_stream_ptr(false);
+      case APLAYER_SUBTITLE_MODE_ALWAYS_PREFERRED:
+         return subtitle_select_preferred_stream_ptr(true);
+      case APLAYER_SUBTITLE_MODE_OFF:
+      default:
+         return SUBTITLE_STREAM_DISABLED;
+   }
+}
+
+static void subtitle_apply_auto_selection(bool log_selection)
+{
+   int old_selection = subtitle_streams_ptr;
+   int new_selection = subtitle_select_initial_stream_ptr();
+
+   if (decode_thread_lock)
+      slock_lock(decode_thread_lock);
+   old_selection = subtitle_streams_ptr;
+   subtitle_streams_ptr = new_selection;
+   if (decode_thread_lock)
+      slock_unlock(decode_thread_lock);
+
+   if (old_selection != new_selection)
+      subtitle_overlay_cache_reset();
+
+   if (log_selection)
+   {
+      char label[256];
+
+      subtitle_selection_label(new_selection, label, sizeof(label));
+      log_cb(RETRO_LOG_INFO,
+            "[APLAYER] Subtitle mode updated: %s, language=%s, selection=%s\n",
+            subtitle_mode_name(subtitle_mode),
+            preferred_subtitle_language,
+            label);
+   }
 }
 
 static bool ass_event_has_layout_overrides(const char *text)
@@ -3830,6 +4242,9 @@ void retro_run(void)
             scond_signal(fifo_decode_cond);
             slock_unlock(fifo_lock);
             audio_selection_label(next_audio_stream_ptr, msg, sizeof(msg));
+
+            if (subtitle_mode == APLAYER_SUBTITLE_MODE_PREFERRED)
+               subtitle_apply_auto_selection(false);
          }
          else
             snprintf(msg, sizeof(msg), "No alternate audio tracks");
@@ -5037,10 +5452,11 @@ static bool ensure_subtitle_overlay_texture(unsigned width, unsigned height)
    subtitle_overlay_cache_reset();
 
    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+   glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
    glBindTexture(GL_TEXTURE_2D, subtitle_overlay_tex);
    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
          (GLsizei)width, (GLsizei)height, 0,
-         GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+         GL_RGBA, GL_UNSIGNED_BYTE, subtitle_overlay_buffer);
    glBindTexture(GL_TEXTURE_2D, 0);
 
    return true;
@@ -7878,6 +8294,8 @@ bool retro_load_game(const struct retro_game_info *info)
    seek_supported = time_supported && !gme_seek_disabled;
 
    maybe_load_external_subtitles(local_info.path);
+   if (!have_bookmark)
+      subtitle_apply_auto_selection(false);
    if (have_bookmark)
       aplayer_bookmark_apply_stream_selection(&bookmark);
 
