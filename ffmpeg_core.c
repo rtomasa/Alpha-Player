@@ -3934,6 +3934,94 @@ static void upload_yuv420_frame(struct frame *dst, const AVFrame *src)
    dst->color_range = src->color_range;
 }
 
+static bool aplayer_render_cached_video_frame(double min_pts)
+{
+   float mix_factor = 1.0f;
+   struct frame *prev_frame = NULL;
+   struct frame *next_frame = NULL;
+   unsigned tex_unit;
+
+   if (video_stream_index < 0 ||
+       media.width == 0 ||
+       media.height == 0 ||
+       !frames[1].valid ||
+       !prog ||
+       !vbo)
+      return false;
+
+   prev_frame = frames[0].valid ? &frames[0] : &frames[1];
+   next_frame = &frames[1];
+
+   if (!prev_frame->tex[0] || !prev_frame->tex[1] || !prev_frame->tex[2] ||
+       !next_frame->tex[0] || !next_frame->tex[1] || !next_frame->tex[2])
+      return false;
+
+   if (frames[0].valid && frames[1].valid && frames[1].pts > frames[0].pts)
+   {
+      double mix = (min_pts - frames[0].pts) / (frames[1].pts - frames[0].pts);
+      if (mix < 0.0)
+         mix = 0.0;
+      else if (mix > 1.0)
+         mix = 1.0;
+      mix_factor = 1.0f - (video_blend_strength * (1.0f - (float)mix));
+   }
+
+   glBindFramebuffer(GL_FRAMEBUFFER, hw_render.get_current_framebuffer());
+
+   glClearColor(0, 0, 0, 1);
+   glClear(GL_COLOR_BUFFER_BIT);
+   glViewport(0, 0, media.width, media.height);
+
+   glUseProgram(prog);
+
+   glUniform1f(mix_loc, mix_factor);
+
+   glActiveTexture(GL_TEXTURE0);
+   glBindTexture(GL_TEXTURE_2D, prev_frame->tex[0]);
+   glActiveTexture(GL_TEXTURE1);
+   glBindTexture(GL_TEXTURE_2D, prev_frame->tex[1]);
+   glActiveTexture(GL_TEXTURE2);
+   glBindTexture(GL_TEXTURE_2D, prev_frame->tex[2]);
+   glActiveTexture(GL_TEXTURE3);
+   glBindTexture(GL_TEXTURE_2D, next_frame->tex[0]);
+   glActiveTexture(GL_TEXTURE4);
+   glBindTexture(GL_TEXTURE_2D, next_frame->tex[1]);
+   glActiveTexture(GL_TEXTURE5);
+   glBindTexture(GL_TEXTURE_2D, next_frame->tex[2]);
+   glActiveTexture(GL_TEXTURE6);
+   glBindTexture(GL_TEXTURE_2D, subtitle_overlay_tex);
+   set_yuv_shader_params(0, prev_frame);
+   set_yuv_shader_params(1, next_frame);
+   glUniform1f(subtitle_enabled_loc,
+         rect_valid(&subtitle_overlay_dirty) ? 1.0f : 0.0f);
+
+   update_video_quad();
+   glBindBuffer(GL_ARRAY_BUFFER, vbo);
+   glVertexAttribPointer(vertex_loc, 2, GL_FLOAT, GL_FALSE,
+         4 * sizeof(GLfloat), (const GLvoid*)(0 * sizeof(GLfloat)));
+   glVertexAttribPointer(tex_loc, 2, GL_FLOAT, GL_FALSE,
+         4 * sizeof(GLfloat), (const GLvoid*)(2 * sizeof(GLfloat)));
+   glEnableVertexAttribArray(vertex_loc);
+   glEnableVertexAttribArray(tex_loc);
+   glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+   glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+   glDisableVertexAttribArray(vertex_loc);
+   glDisableVertexAttribArray(tex_loc);
+
+   glUseProgram(0);
+   for (tex_unit = 0; tex_unit < 7; tex_unit++)
+   {
+      glActiveTexture(GL_TEXTURE0 + tex_unit);
+      glBindTexture(GL_TEXTURE_2D, 0);
+   }
+   glActiveTexture(GL_TEXTURE0);
+
+   video_cb(RETRO_HW_FRAME_BUFFER_VALID,
+         media.width, media.height, media.width * sizeof(uint32_t));
+   return true;
+}
+
 static bool aplayer_reload_current_from_start(void)
 {
    char reload_path[PATH_MAX];
@@ -4366,7 +4454,15 @@ void retro_run(void)
 
    // If paused, simply display the last rendered video frame and skip further processing.
    if (paused) {
-      video_cb(RETRO_HW_FRAME_BUFFER_VALID, media.width, media.height, media.width * sizeof(uint32_t));
+      double paused_min_pts = media.interpolate_fps > 0.0 ?
+            (double)frame_cnt / media.interpolate_fps + pts_bias : pts_bias;
+
+      if (video_stream_index < 0 ||
+          !aplayer_render_cached_video_frame(paused_min_pts))
+      {
+         video_cb(RETRO_HW_FRAME_BUFFER_VALID,
+               media.width, media.height, media.width * sizeof(uint32_t));
+      }
       // Do not process audio or advance frames.
       return;
    }
@@ -4525,7 +4621,6 @@ void retro_run(void)
    if (video_stream_index >= 0)
    {
       /* Video */
-      float mix_factor;
 
       while (!decode_thread_dead && (!frames[1].valid || min_pts > frames[1].pts))
       {
@@ -4583,75 +4678,9 @@ void retro_run(void)
          frames[1].valid = true;
       }
 
-      mix_factor = 1.0f;
-      if (frames[0].valid && frames[1].valid && frames[1].pts > frames[0].pts)
-      {
-         double mix = (min_pts - frames[0].pts) / (frames[1].pts - frames[0].pts);
-         if (mix < 0.0)
-            mix = 0.0;
-         else if (mix > 1.0)
-            mix = 1.0;
-         mix_factor = 1.0f - (video_blend_strength * (1.0f - (float)mix));
-      }
-
-      glBindFramebuffer(GL_FRAMEBUFFER, hw_render.get_current_framebuffer());
-
-      glClearColor(0, 0, 0, 1);
-      glClear(GL_COLOR_BUFFER_BIT);
-      glViewport(0, 0, media.width, media.height);
-
-      glUseProgram(prog);
-
-      glUniform1f(mix_loc, mix_factor);
-      {
-         struct frame *prev_frame = frames[0].valid ? &frames[0] : &frames[1];
-         struct frame *next_frame = &frames[1];
-
-         glActiveTexture(GL_TEXTURE0);
-         glBindTexture(GL_TEXTURE_2D, prev_frame->tex[0]);
-         glActiveTexture(GL_TEXTURE1);
-         glBindTexture(GL_TEXTURE_2D, prev_frame->tex[1]);
-         glActiveTexture(GL_TEXTURE2);
-         glBindTexture(GL_TEXTURE_2D, prev_frame->tex[2]);
-         glActiveTexture(GL_TEXTURE3);
-         glBindTexture(GL_TEXTURE_2D, next_frame->tex[0]);
-         glActiveTexture(GL_TEXTURE4);
-         glBindTexture(GL_TEXTURE_2D, next_frame->tex[1]);
-         glActiveTexture(GL_TEXTURE5);
-         glBindTexture(GL_TEXTURE_2D, next_frame->tex[2]);
-         glActiveTexture(GL_TEXTURE6);
-         glBindTexture(GL_TEXTURE_2D, subtitle_overlay_tex);
-         set_yuv_shader_params(0, prev_frame);
-         set_yuv_shader_params(1, next_frame);
-         glUniform1f(subtitle_enabled_loc,
-               rect_valid(&subtitle_overlay_dirty) ? 1.0f : 0.0f);
-      }
-
-      update_video_quad();
-      glBindBuffer(GL_ARRAY_BUFFER, vbo);
-      glVertexAttribPointer(vertex_loc, 2, GL_FLOAT, GL_FALSE,
-            4 * sizeof(GLfloat), (const GLvoid*)(0 * sizeof(GLfloat)));
-      glVertexAttribPointer(tex_loc, 2, GL_FLOAT, GL_FALSE,
-            4 * sizeof(GLfloat), (const GLvoid*)(2 * sizeof(GLfloat)));
-      glEnableVertexAttribArray(vertex_loc);
-      glEnableVertexAttribArray(tex_loc);
-      glBindBuffer(GL_ARRAY_BUFFER, 0);
-
-      glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-      glDisableVertexAttribArray(vertex_loc);
-      glDisableVertexAttribArray(tex_loc);
-
-      glUseProgram(0);
-      for (unsigned tex_unit = 0; tex_unit < 7; tex_unit++)
-      {
-         glActiveTexture(GL_TEXTURE0 + tex_unit);
-         glBindTexture(GL_TEXTURE_2D, 0);
-      }
-      glActiveTexture(GL_TEXTURE0);
-
       /* Draw video using OGL*/
-      video_cb(RETRO_HW_FRAME_BUFFER_VALID,
-            media.width, media.height, media.width * sizeof(uint32_t));
+      if (!aplayer_render_cached_video_frame(min_pts))
+         video_cb(NULL, 1, 1, sizeof(uint32_t));
    }
    else if (fft)
    {

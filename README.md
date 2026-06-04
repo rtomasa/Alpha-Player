@@ -85,6 +85,7 @@ If a video has an external subtitle file with the same name and a `.srt` extensi
 - [X] Added EOF controls so media title and playback progress remain available after playback ends
 - [X] Added rewind support from the ended state by reloading the current media and seeking back from the end
 - [X] Fixed ended-state progress display to report the full duration and `100%`
+- [X] Fixed video pause rendering so the cached frame remains visible instead of a black screen
 
 # v2.7.0
 - [X] Added `SUBTITLE MODE` and subtitle `PREFERRED LANGUAGE` options
