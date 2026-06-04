@@ -565,6 +565,11 @@ static bool aplayer_consume_playback_restart_pending(void)
    return true;
 }
 
+static bool aplayer_playback_has_ended(void)
+{
+   return content_loaded && fctx && decode_thread_dead;
+}
+
 static void sws_worker_thread(void *arg);
 static void subtitle_apply_auto_selection(bool log_selection);
 
@@ -2280,7 +2285,7 @@ static void display_media_title()
 {
    const char *filename = NULL;
 
-   if (!fctx || decode_thread_dead)
+   if (!content_loaded || !fctx)
       return;
 
    char msg[256];
@@ -2374,7 +2379,7 @@ void retro_get_system_info(struct retro_system_info *info)
 {
    memset(info, 0, sizeof(*info));
    info->library_name     = "Alpha Player";
-   info->library_version  = "v2.7.0";
+   info->library_version  = "v2.8.0";
    info->need_fullpath    = true;
    info->valid_extensions = "mkv|avi|f4v|f4f|3gp|ogm|flv|mp4|mp3|flac|ogg|m4a|webm|3g2|mov|wmv|mpg|mpeg|vob|asf|divx|m2p|m2ts|ps|ts|mxf|wma|wav|m3u|s3m|it|xm|mod|ay|gbs|gym|hes|kss|nsf|nsfe|sap|spc|vgm|vgz";
 }
@@ -3174,8 +3179,8 @@ static void seek_frame(int seek_frames)
 
 static void dispaly_time(void)
 {
-   // Early-out checks to avoid doing anything if we are shut down or done
-   if (!fctx || decode_thread_dead)
+   // Early-out checks to avoid doing anything if we are shut down
+   if (!content_loaded || !fctx)
       return;
 
    // Local buffer for the message, plus the RetroArch message object
@@ -3188,6 +3193,9 @@ static void dispaly_time(void)
    double total_duration = media.duration.time;
    bool total_valid = duration_is_valid(total_duration);
    double current_time = aplayer_get_current_playback_time();
+
+   if (aplayer_playback_has_ended() && total_valid)
+      current_time = total_duration;
 
    format_time_hhmmss(current_time, current_str, sizeof(current_str));
    if (total_valid)
@@ -3961,6 +3969,7 @@ static bool aplayer_reload_current_from_start(void)
       }
    }
 
+   internal_playlist_reload_pending = true;
    suppress_auto_resume_save = true;
    retro_unload_game();
    suppress_auto_resume_save = false;
@@ -3972,6 +3981,57 @@ static bool aplayer_reload_current_from_start(void)
       return false;
    }
 
+   return true;
+}
+
+static bool aplayer_seek_after_playback_end(int seek_frames)
+{
+   double total_duration = media.duration.time;
+   double target_time = 0.0;
+   int target_frames = 0;
+
+   if (seek_frames >= 0)
+   {
+      dispaly_time();
+      return true;
+   }
+
+   if (!seek_supported ||
+       !duration_is_valid(total_duration) ||
+       media.interpolate_fps <= 0.0)
+   {
+      show_not_supported_message();
+      return true;
+   }
+
+   target_time = total_duration + ((double)seek_frames / media.interpolate_fps);
+   if (target_time < 0.0)
+      target_time = 0.0;
+   else
+   {
+      double seek_time_max = total_duration - 1.0;
+      seek_time_max = seek_time_max > 0.0 ? seek_time_max : 0.0;
+      if (target_time > seek_time_max)
+         target_time = seek_time_max;
+   }
+
+   if (!aplayer_reload_current_from_start())
+   {
+      log_cb(RETRO_LOG_ERROR, "[APLAYER] Failed to reload media for rewind.\n");
+      return false;
+   }
+
+   if (target_time <= 0.0)
+   {
+      seek_frame(-1);
+      return true;
+   }
+
+   if (target_time > ((double)INT_MAX / media.interpolate_fps))
+      target_time = (double)INT_MAX / media.interpolate_fps;
+
+   target_frames = (int)(target_time * media.interpolate_fps + 0.5);
+   seek_frame(target_frames > 0 ? target_frames : -1);
    return true;
 }
 
@@ -4193,29 +4253,6 @@ void retro_run(void)
          }
       }
 
-      /* Display info */
-
-      if (b && !last_b)
-         display_media_title();
-      if (a && !last_a)
-         dispaly_time();
-
-      /* Seek and subtitles */
-
-      if (left && !last_left)
-         seek_frames -= 15 * media.interpolate_fps;
-      if (right && !last_right)
-         seek_frames += 15 * media.interpolate_fps;
-      if (up && !last_up)
-         seek_frames += 180 * media.interpolate_fps;
-      if (down && !last_down)
-         seek_frames -= 180 * media.interpolate_fps;
-      if (l2 && !last_l2)
-         seek_frames -= 300 * media.interpolate_fps;
-      if (r2 && !last_r2)
-         seek_frames += 300 * media.interpolate_fps;
-
-
       int media_type = get_media_type();
 
       if (media_type == MEDIA_TYPE_VIDEO && y && !last_y)
@@ -4288,6 +4325,29 @@ void retro_run(void)
          msg_obj.progress = -1;
          environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
       }
+   }
+
+   /* Display info */
+   if (b && !last_b)
+      display_media_title();
+   if (a && !last_a)
+      dispaly_time();
+
+   /* Seek */
+   if (!decode_thread_dead || aplayer_playback_has_ended())
+   {
+      if (left && !last_left)
+         seek_frames -= 15 * media.interpolate_fps;
+      if (right && !last_right)
+         seek_frames += 15 * media.interpolate_fps;
+      if (up && !last_up)
+         seek_frames += 180 * media.interpolate_fps;
+      if (down && !last_down)
+         seek_frames -= 180 * media.interpolate_fps;
+      if (l2 && !last_l2)
+         seek_frames -= 300 * media.interpolate_fps;
+      if (r2 && !last_r2)
+         seek_frames += 300 * media.interpolate_fps;
    }
 
    last_left  = left;
@@ -4376,7 +4436,12 @@ void retro_run(void)
    /* Push seek request to thread,
     * wait for seek to complete. */
    if (seek_frames)
-      seek_frame(seek_frames);
+   {
+      if (aplayer_playback_has_ended())
+         aplayer_seek_after_playback_end(seek_frames);
+      else
+         seek_frame(seek_frames);
+   }
 
    if (decode_thread_dead)
    {
