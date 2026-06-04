@@ -3112,6 +3112,8 @@ static void seek_frame(int seek_frames)
    do_seek = true;
    slock_lock(fifo_lock);
    seek_time      = frame_cnt / media.interpolate_fps;
+   pts_bias       = 0.0;
+   decode_last_audio_time = seek_time;
 
    /* Convert seek time to a printable format */
    format_time_hhmmss(seek_time, seek_time_str, sizeof(seek_time_str));
@@ -7383,6 +7385,24 @@ static void decode_thread(void *data)
          bool restart_request = playback_restart_request;
 
          decode_thread_seek(seek_time_thread);
+         if (aud_frame)
+            av_frame_unref(aud_frame);
+         for (i = 0; (int)i < audio_streams_num; i++)
+         {
+            if (actx[i])
+               avcodec_flush_buffers(actx[i]);
+            if (swr[i])
+            {
+               int ret;
+               swr_close(swr[i]);
+               ret = swr_init(swr[i]);
+               if (ret < 0)
+                  log_cb(RETRO_LOG_ERROR,
+                        "[APLAYER] Failed to reset audio resampler after seek: %s\n",
+                        av_err2str(ret));
+            }
+         }
+         audio_clock_rebase_pending = false;
 
          slock_lock(fifo_lock);
          do_seek          = false;
