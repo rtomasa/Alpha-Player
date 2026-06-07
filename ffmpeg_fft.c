@@ -602,10 +602,15 @@ void fft_step_fft(fft_t *fft, const GLshort *audio_buffer, unsigned frames)
    GL_CHECK_ERROR();
 }
 
-void fft_render(fft_t *fft, GLuint backbuffer, unsigned width, unsigned height)
+static void fft_render_internal(fft_t *fft, GLuint backbuffer,
+      unsigned width, unsigned height, bool advance)
 {
    unsigned row = (fft->output_ptr + fft->depth - 1) & (fft->depth - 1);
-   float time = (float)fft->frame++;
+   float time = (float)(advance || fft->frame == 0 ?
+         fft->frame : fft->frame - 1);
+
+   if (advance)
+      fft->frame++;
 
    /* Render scene. */
    glBindFramebuffer(GL_FRAMEBUFFER, fft->ms_fbo ? fft->ms_fbo : backbuffer);
@@ -648,4 +653,15 @@ void fft_render(fft_t *fft, GLuint backbuffer, unsigned width, unsigned height)
 
    glBindFramebuffer(GL_FRAMEBUFFER, 0);
    GL_CHECK_ERROR();
+}
+
+void fft_render(fft_t *fft, GLuint backbuffer, unsigned width, unsigned height)
+{
+   fft_render_internal(fft, backbuffer, width, height, true);
+}
+
+void fft_render_paused(fft_t *fft, GLuint backbuffer,
+      unsigned width, unsigned height)
+{
+   fft_render_internal(fft, backbuffer, width, height, false);
 }

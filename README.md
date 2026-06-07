@@ -97,7 +97,9 @@ If a video has an external subtitle file with the same name and a `.srt` extensi
 # v2.9.0
 - [X] Added Standard MIDI file playback through dynamically loaded FluidSynth with an embedded fallback renderer
 - [X] Added selectable RePlay SoundFonts and frontend raw MIDI output
+- [X] Added automatic default SoundFont fallback when the selected SoundFont is unavailable
 - [X] Added MIDI play/pause, loop modes, M3U playlist advancement, EOF handling and FFT visualization
+- [X] Fixed music FFT visualization disappearing while playback is paused
 
 # v2.8.0
 - [X] Added EOF controls so media title and playback progress remain available after playback ends

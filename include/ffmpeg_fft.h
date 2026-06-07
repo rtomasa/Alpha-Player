@@ -18,6 +18,7 @@ void fft_init_multisample(fft_t *fft);
 void fft_step_fft(fft_t *fft, const GLshort *buffer, unsigned frames);
 
 void fft_render(fft_t *fft, GLuint backbuffer, unsigned width, unsigned height);
+void fft_render_paused(fft_t *fft, GLuint backbuffer, unsigned width, unsigned height);
 
 RETRO_END_DECLS
 

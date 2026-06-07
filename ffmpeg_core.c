@@ -4666,20 +4666,36 @@ void retro_run(void)
    last_l2    = l2;
    last_r2    = r2;
 
-   // If paused, simply display the last rendered video frame and skip further processing.
+   // If paused, redraw the last video or FFT state without advancing playback.
    if (paused) {
       double paused_min_pts = media.interpolate_fps > 0.0 ?
             (double)frame_cnt / media.interpolate_fps + pts_bias : pts_bias;
-      unsigned paused_width = video_stream_index >= 0 ? media.width : fft_width;
-      unsigned paused_height = video_stream_index >= 0 ? media.height : fft_height;
 
-      if (video_stream_index < 0 ||
-          !aplayer_render_cached_video_frame(paused_min_pts))
+      if (video_stream_index >= 0)
       {
-         video_cb(RETRO_HW_FRAME_BUFFER_VALID,
-               paused_width, paused_height, paused_width * sizeof(uint32_t));
+         if (!aplayer_render_cached_video_frame(paused_min_pts))
+            video_cb(RETRO_HW_FRAME_BUFFER_VALID,
+                  media.width, media.height, media.width * sizeof(uint32_t));
       }
-      // Do not process audio or advance frames.
+      else if (fft)
+      {
+         if (fft_enabled)
+            fft_render_paused(fft, hw_render.get_current_framebuffer(),
+                  fft_width, fft_height);
+         else
+         {
+            glBindFramebuffer(GL_FRAMEBUFFER, hw_render.get_current_framebuffer());
+            glViewport(0, 0, fft_width, fft_height);
+            glClearColor(0, 0, 0, 1);
+            glClear(GL_COLOR_BUFFER_BIT);
+         }
+
+         video_cb(RETRO_HW_FRAME_BUFFER_VALID,
+               fft_width, fft_height, fft_width * sizeof(uint32_t));
+      }
+      else
+         video_cb(NULL, 1, 1, sizeof(uint32_t));
+
       return;
    }
 
