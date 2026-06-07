@@ -54,6 +54,19 @@ This core has been modified focusing on Raspberry Pi devices using a development
 * `Default` uses the file default audio track when flagged, otherwise the first audio track
 * If the selected language is not available, playback falls back to the `Default` behavior
 
+# MIDI Playback
+
+Standard MIDI files (`.mid`, `.midi` and `.kar`) can be played through FluidSynth, the embedded fallback renderer or the frontend MIDI output.
+
+* MIDI Output - `Default SoundFont`, `Roland SC-55`, `GM Roland`, `FluidR3 GM`, `UHD3` or `Frontend MIDI (Raw)`
+* SoundFonts are searched below the frontend system directory in `scummvm/soundfonts`, `scummvm/extra` and the system directory root
+* Missing selected SoundFonts automatically fall back to `Default SoundFont`
+* FluidSynth is loaded dynamically when available; an embedded SF2 renderer is used as a fallback
+* Raw mode forwards scheduled MIDI channel messages to `RETRO_ENVIRONMENT_GET_MIDI_INTERFACE`
+* Raw mode does not require FluidSynth and uses the default SoundFont, when available, only to drive the FFT visualizer; synthesized PCM is muted
+* MIDI supports play/pause, loop modes, M3U playlists, EOF handling and the FFT visualizer
+* MIDI duration, seeking, auto-resume, arbitrary SoundFont file selection and time-based tempo-map operations are not supported
+
 # Subtitle Options
 
 * Subtitle Mode - `Off`, `Forced only`, `Preferred language`, `Always show preferred language`
@@ -80,6 +93,11 @@ This core has been modified focusing on Raspberry Pi devices using a development
 If a video has an external subtitle file with the same name and a `.srt` extension, it will be loaded automatically.
 
 # Changelog
+
+# v2.9.0
+- [X] Added Standard MIDI file playback through dynamically loaded FluidSynth with an embedded fallback renderer
+- [X] Added selectable RePlay SoundFonts and frontend raw MIDI output
+- [X] Added MIDI play/pause, loop modes, M3U playlist advancement, EOF handling and FFT visualization
 
 # v2.8.0
 - [X] Added EOF controls so media title and playback progress remain available after playback ends

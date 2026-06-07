@@ -19,6 +19,7 @@
 #include <ass/ass.h>
 #include "include/ffmpeg_core.h"
 #include "include/ffmpeg_fft.h"
+#include "include/midi_backend.h"
 
 #include <glsym/glsym.h>
 #include <features/features_cpu.h>
@@ -389,6 +390,8 @@ static fft_t *fft;
 unsigned fft_width;
 unsigned fft_height;
 static bool fft_enabled;
+static bool midi_content;
+static char midi_output[32] = "default";
 
 /* A/V timing. */
 static uint64_t frame_cnt;
@@ -567,7 +570,7 @@ static bool aplayer_consume_playback_restart_pending(void)
 
 static bool aplayer_playback_has_ended(void)
 {
-   return content_loaded && fctx && decode_thread_dead;
+   return content_loaded && (fctx || midi_backend_active()) && decode_thread_dead;
 }
 
 static void sws_worker_thread(void *arg);
@@ -1764,7 +1767,7 @@ static int get_media_type()
 {
    int type;
 
-   if (audio_streams_num > 0 && video_stream_index < 0)
+   if (midi_content || (audio_streams_num > 0 && video_stream_index < 0))
       type = MEDIA_TYPE_AUDIO;
    else if (video_stream_index >= 0)
       type = MEDIA_TYPE_VIDEO;
@@ -1982,6 +1985,21 @@ static void show_not_supported_message(void)
    msg_obj.target   = RETRO_MESSAGE_TARGET_OSD;
    msg_obj.type     = RETRO_MESSAGE_TYPE_NOTIFICATION;
    msg_obj.progress = -1;
+
+   environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
+}
+
+static void show_midi_limitations_message(void)
+{
+   struct retro_message_ext msg_obj = {
+      .msg = "MIDI duration, seeking and auto-resume are not supported",
+      .duration = 4000,
+      .priority = 1,
+      .level = RETRO_LOG_INFO,
+      .target = RETRO_MESSAGE_TARGET_OSD,
+      .type = RETRO_MESSAGE_TYPE_NOTIFICATION,
+      .progress = -1
+   };
 
    environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
 }
@@ -2285,7 +2303,7 @@ static void display_media_title()
 {
    const char *filename = NULL;
 
-   if (!content_loaded || !fctx)
+   if (!content_loaded || (!fctx && !midi_backend_active()))
       return;
 
    char msg[256];
@@ -2341,6 +2359,8 @@ void retro_init(void)
 void retro_deinit(void)
 {
    libretro_supports_bitmasks = false;
+   midi_backend_unload();
+   midi_content = false;
    video_filter_close();
    video_filter_reset_pending = false;
    playback_restart_request = false;
@@ -2379,9 +2399,9 @@ void retro_get_system_info(struct retro_system_info *info)
 {
    memset(info, 0, sizeof(*info));
    info->library_name     = "Alpha Player";
-   info->library_version  = "v2.8.0";
+   info->library_version  = "v2.9.0";
    info->need_fullpath    = true;
-   info->valid_extensions = "mkv|avi|f4v|f4f|3gp|ogm|flv|mp4|mp3|flac|ogg|m4a|webm|3g2|mov|wmv|mpg|mpeg|vob|asf|divx|m2p|m2ts|ps|ts|mxf|wma|wav|m3u|s3m|it|xm|mod|ay|gbs|gym|hes|kss|nsf|nsfe|sap|spc|vgm|vgz";
+   info->valid_extensions = "mkv|avi|f4v|f4f|3gp|ogm|flv|mp4|mp3|flac|ogg|m4a|webm|3g2|mov|wmv|mpg|mpeg|vob|asf|divx|m2p|m2ts|ps|ts|mxf|wma|wav|m3u|s3m|it|xm|mod|ay|gbs|gym|hes|kss|nsf|nsfe|sap|spc|vgm|vgz|mid|midi|kar";
 }
 
 void retro_get_system_av_info(struct retro_system_av_info *info)
@@ -2393,7 +2413,7 @@ void retro_get_system_av_info(struct retro_system_av_info *info)
    unsigned height = vctx ? media.height : 240;
    float aspect    = vctx ? get_video_output_aspect() : (float)width / (float)height;
 
-   if (audio_streams_num > 0 && video_stream_index < 0)
+   if (midi_content || (audio_streams_num > 0 && video_stream_index < 0))
    {
       width = fft_width;
       height = fft_height;
@@ -2401,7 +2421,7 @@ void retro_get_system_av_info(struct retro_system_av_info *info)
    }
 
    info->timing.fps = media.interpolate_fps;
-   if (actx[0] && media.sample_rate > 0)
+   if ((actx[0] || midi_content) && media.sample_rate > 0)
       info->timing.sample_rate = media.sample_rate;
    else
       info->timing.sample_rate = 32000.0;
@@ -2556,6 +2576,19 @@ void retro_set_environment(retro_environment_t cb)
             {"disabled", "Disabled"},
             {NULL, NULL}
          }, "enabled"
+      },
+      {
+         "aplayer_midi_output", "MIDI Output", "Selects a RePlay SoundFont for FluidSynth playback or forwards MIDI messages to the frontend MIDI device. Missing SoundFonts fall back to Default SoundFont. Changes apply when the next MIDI file is loaded.",
+         NULL, NULL, "music",
+         {
+            {"default", "Default SoundFont"},
+            {"roland_sc55", "Roland SC-55"},
+            {"gm_roland", "GM Roland"},
+            {"fluidr3_gm", "FluidR3 GM"},
+            {"uhd3", "UHD3"},
+            {"raw", "Frontend MIDI (Raw)"},
+            {NULL, NULL}
+         }, "default"
       },
       {
          "aplayer_auto_resume", "Auto Resume", NULL, NULL, NULL, NULL,
@@ -2900,16 +2933,19 @@ static void check_variables(bool firststart)
    struct retro_variable subtitle_language_var = {0};
    struct retro_variable replay_is_crt = {0};
    struct retro_variable fft_toggle_var = {0};
+   struct retro_variable midi_output_var = {0};
    struct retro_variable video_blending_var = {0};
    struct retro_variable video_zoom_var = {0};
    struct retro_variable video_deinterlace_var = {0};
    enum aplayer_deinterlace_mode old_deinterlace_mode = video_deinterlace_mode;
    enum aplayer_subtitle_mode old_subtitle_mode = subtitle_mode;
    char old_preferred_subtitle_language[sizeof(preferred_subtitle_language)];
+   char old_midi_output[sizeof(midi_output)];
 
    snprintf(old_preferred_subtitle_language,
          sizeof(old_preferred_subtitle_language), "%s",
          preferred_subtitle_language);
+   snprintf(old_midi_output, sizeof(old_midi_output), "%s", midi_output);
 
    fft_width  = 640;
    fft_height = 480;
@@ -2920,6 +2956,26 @@ static void check_variables(bool firststart)
    {
       if (string_is_equal(fft_toggle_var.value, "disabled"))
          fft_enabled = false;
+   }
+
+   snprintf(midi_output, sizeof(midi_output), "%s", "default");
+   midi_output_var.key = "aplayer_midi_output";
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &midi_output_var) &&
+         !string_is_empty(midi_output_var.value))
+      snprintf(midi_output, sizeof(midi_output), "%s", midi_output_var.value);
+
+   if (!firststart && midi_content && !string_is_equal(old_midi_output, midi_output))
+   {
+      struct retro_message_ext msg_obj = {
+         .msg = "MIDI output change applies on reload",
+         .duration = 3000,
+         .priority = 1,
+         .level = RETRO_LOG_INFO,
+         .target = RETRO_MESSAGE_TARGET_OSD,
+         .type = RETRO_MESSAGE_TYPE_NOTIFICATION,
+         .progress = -1
+      };
+      environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &msg_obj);
    }
 
    subtitle_font_name = "sans-serif";
@@ -3182,8 +3238,14 @@ static void seek_frame(int seek_frames)
 static void dispaly_time(void)
 {
    // Early-out checks to avoid doing anything if we are shut down
-   if (!content_loaded || !fctx)
+   if (!content_loaded || (!fctx && !midi_backend_active()))
       return;
+
+   if (midi_content)
+   {
+      show_not_supported_message();
+      return;
+   }
 
    // Local buffer for the message, plus the RetroArch message object
    char msg[256];
@@ -4125,6 +4187,154 @@ static bool aplayer_seek_after_playback_end(int seek_frames)
    return true;
 }
 
+static void aplayer_reset_midi_timing(void)
+{
+   frame_cnt = 0;
+   audio_frames = 0;
+   pts_bias = 0.0;
+   g_current_time = 0.0;
+}
+
+static bool aplayer_restart_midi(void)
+{
+   if (!midi_backend_restart())
+   {
+      log_cb(RETRO_LOG_ERROR, "[APLAYER] Failed to restart MIDI playback.\n");
+      decode_thread_dead = true;
+      return false;
+   }
+
+   aplayer_reset_midi_timing();
+   decode_thread_dead = false;
+   return true;
+}
+
+static void aplayer_handle_midi_eof(void)
+{
+   unsigned old_index;
+
+   if (!midi_content || decode_thread_dead || !midi_backend_done())
+      return;
+
+   midi_backend_pause(true);
+
+   switch (loopcontent)
+   {
+      case PLAY_TRACK:
+         if (playlist_count > 0 && playlist_index + 1 < playlist_count)
+         {
+            playlist_index++;
+            do_seek = true;
+            seek_time = 0.0;
+            log_cb(RETRO_LOG_INFO,
+                  "[APLAYER] Advancing to playlist item #%u/%u: %s\n",
+                  playlist_index + 1, playlist_count, playlist[playlist_index]);
+         }
+         decode_thread_dead = true;
+         break;
+
+      case LOOP_TRACK:
+         aplayer_restart_midi();
+         break;
+
+      case LOOP_ALL:
+         if (playlist_count > 0)
+         {
+            playlist_index = (playlist_index + 1) % playlist_count;
+            do_seek = true;
+            seek_time = 0.0;
+            decode_thread_dead = true;
+         }
+         else
+            aplayer_restart_midi();
+         break;
+
+      case SHUFFLE_ALL:
+         if (playlist_count > 0)
+         {
+            old_index = playlist_index;
+            do
+            {
+               playlist_index = rand() % playlist_count;
+            } while (playlist_count > 1 && playlist_index == old_index);
+            do_seek = true;
+            seek_time = 0.0;
+            decode_thread_dead = true;
+         }
+         else
+            aplayer_restart_midi();
+         break;
+
+      default:
+         decode_thread_dead = true;
+         break;
+   }
+}
+
+static void aplayer_run_midi(int16_t *audio_buffer)
+{
+   size_t to_read_frames = 0;
+
+   if (!midi_content)
+      return;
+
+   if (!decode_thread_dead)
+   {
+      uint64_t expected_audio_frames;
+
+      frame_cnt++;
+      expected_audio_frames =
+         frame_cnt * media.sample_rate / media.interpolate_fps;
+      to_read_frames = (size_t)(expected_audio_frames - audio_frames);
+
+      if (to_read_frames > 1024)
+         to_read_frames = 1024;
+
+      to_read_frames = midi_backend_render(audio_buffer, to_read_frames);
+      audio_frames += to_read_frames;
+      g_current_time = (double)audio_frames / media.sample_rate;
+   }
+
+   if (fft)
+   {
+      if (fft_enabled)
+      {
+         size_t frames = to_read_frames;
+         const int16_t *buffer = audio_buffer;
+
+         while (frames)
+         {
+            unsigned step = frames > (1 << 11) ? (1 << 11) : (unsigned)frames;
+            fft_step_fft(fft, buffer, step);
+            buffer += step * 2;
+            frames -= step;
+         }
+         fft_render(fft, hw_render.get_current_framebuffer(), fft_width, fft_height);
+      }
+      else
+      {
+         glBindFramebuffer(GL_FRAMEBUFFER, hw_render.get_current_framebuffer());
+         glViewport(0, 0, fft_width, fft_height);
+         glClearColor(0, 0, 0, 1);
+         glClear(GL_COLOR_BUFFER_BIT);
+      }
+
+      video_cb(RETRO_HW_FRAME_BUFFER_VALID,
+            fft_width, fft_height, fft_width * sizeof(uint32_t));
+   }
+   else
+      video_cb(NULL, 1, 1, sizeof(uint32_t));
+
+   if (to_read_frames)
+   {
+      if (midi_backend_is_raw())
+         memset(audio_buffer, 0, to_read_frames * sizeof(int16_t) * 2);
+      audio_batch_cb(audio_buffer, to_read_frames);
+   }
+
+   aplayer_handle_midi_eof();
+}
+
 void retro_run(void)
 {
    static bool last_left;
@@ -4250,6 +4460,8 @@ void retro_run(void)
       if (start && !last_start) {
          // Toggle the pause state.
          paused = !paused;
+         if (midi_content)
+            midi_backend_pause(paused);
          {
             // Send an on-screen message informing the user.
             char msg[32];
@@ -4458,12 +4670,14 @@ void retro_run(void)
    if (paused) {
       double paused_min_pts = media.interpolate_fps > 0.0 ?
             (double)frame_cnt / media.interpolate_fps + pts_bias : pts_bias;
+      unsigned paused_width = video_stream_index >= 0 ? media.width : fft_width;
+      unsigned paused_height = video_stream_index >= 0 ? media.height : fft_height;
 
       if (video_stream_index < 0 ||
           !aplayer_render_cached_video_frame(paused_min_pts))
       {
          video_cb(RETRO_HW_FRAME_BUFFER_VALID,
-               media.width, media.height, media.width * sizeof(uint32_t));
+               paused_width, paused_height, paused_width * sizeof(uint32_t));
       }
       // Do not process audio or advance frames.
       return;
@@ -4515,7 +4729,9 @@ void retro_run(void)
    {
       bool reset_handled = true;
 
-      if (decode_thread_dead)
+      if (midi_content)
+         reset_handled = aplayer_reload_current_from_start();
+      else if (decode_thread_dead)
          reset_handled = aplayer_reload_current_from_start();
       else
       {
@@ -4539,6 +4755,12 @@ void retro_run(void)
          aplayer_seek_after_playback_end(seek_frames);
       else
          seek_frame(seek_frames);
+   }
+
+   if (midi_content)
+   {
+      aplayer_run_midi(audio_buffer);
+      return;
    }
 
    if (decode_thread_dead)
@@ -8068,7 +8290,7 @@ static void context_reset(void)
    rect_reset(&subtitle_overlay_dirty);
    subtitle_overlay_cache_reset();
 
-   if (audio_streams_num > 0 && video_stream_index < 0)
+   if (midi_content || (audio_streams_num > 0 && video_stream_index < 0))
    {
       fft = fft_new(11, hw_render.get_proc_address);
       if (fft)
@@ -8144,6 +8366,7 @@ void retro_unload_game(void)
       aplayer_bookmark_save_current();
 
    content_loaded = false;
+   midi_backend_unload();
 
    if (decode_thread_handle)
    {
@@ -8243,6 +8466,11 @@ void retro_unload_game(void)
    av_freep(&attachments); // Free the array itself
    attachments_size = 0;
 
+   midi_content = false;
+   audio_streams_num = 0;
+   subtitle_streams_num = 0;
+   video_stream_index = -1;
+
    for (i = 0; i < MAX_STREAMS; i++)
    {
       if (ass_track[i])
@@ -8277,6 +8505,9 @@ bool retro_load_game(const struct retro_game_info *info)
 {
    struct retro_game_info local_info;
    struct aplayer_bookmark bookmark;
+   struct retro_midi_interface midi_interface = {0};
+   const struct retro_midi_interface *midi_interface_ptr = NULL;
+   const char *system_dir = NULL;
    bool have_bookmark = false;
    bool internal_playlist_reload = internal_playlist_reload_pending;
    bool requested_playlist = false;
@@ -8291,6 +8522,7 @@ bool retro_load_game(const struct retro_game_info *info)
    memset(&bookmark, 0, sizeof(bookmark));
 
    media_reset_defaults();
+   midi_content = false;
    aplayer_reset_controller_ports();
    aplayer_register_input_layout();
    current_media_path[0] = '\0';
@@ -8375,6 +8607,54 @@ bool retro_load_game(const struct retro_game_info *info)
       goto error;
    }
 
+   if (midi_backend_is_path(local_info.path))
+   {
+      midi_content = true;
+      media.sample_rate = 44100;
+      media.interpolate_fps = 60.0;
+      media.width = fft_width;
+      media.height = fft_height;
+      video_stream_index = -1;
+      audio_streams_num = 1;
+      audio_streams_ptr = 0;
+      subtitle_streams_num = 0;
+      subtitle_streams_ptr = SUBTITLE_STREAM_DISABLED;
+      decode_thread_lock = slock_new();
+
+      environ_cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &system_dir);
+      if (string_is_equal(midi_output, "raw"))
+      {
+         if (!environ_cb(RETRO_ENVIRONMENT_GET_MIDI_INTERFACE, &midi_interface))
+         {
+            log_cb(RETRO_LOG_ERROR,
+                  "[APLAYER] Frontend MIDI interface is not available.\n");
+            goto error;
+         }
+         midi_interface_ptr = &midi_interface;
+      }
+
+      if (!midi_backend_load(local_info.path, midi_output, system_dir,
+               media.sample_rate, midi_interface_ptr))
+      {
+         if (string_is_equal(midi_output, "raw"))
+            log_cb(RETRO_LOG_ERROR,
+                  "[APLAYER] Failed to initialize raw MIDI output. "
+                  "Configure and enable a frontend MIDI output device.\n");
+         else
+            log_cb(RETRO_LOG_ERROR,
+                  "[APLAYER] Failed to initialize MIDI output '%s'. "
+                  "Check that the selected SoundFont is readable and valid.\n",
+                  midi_output);
+         goto error;
+      }
+
+      time_supported = false;
+      seek_supported = false;
+      log_cb(RETRO_LOG_INFO, "[APLAYER] MIDI output: %s\n",
+            midi_backend_output_name());
+      goto media_ready;
+   }
+
    if ((ret = avformat_open_input(&fctx, local_info.path, NULL, NULL)) < 0)
    {
       log_cb(RETRO_LOG_ERROR, "[APLAYER] Failed to open input: %s. %s\n", av_err2str(ret));
@@ -8407,6 +8687,7 @@ bool retro_load_game(const struct retro_game_info *info)
    time_supported = duration_is_valid(media.duration.time);
    seek_supported = time_supported && !gme_seek_disabled;
 
+media_ready:
    maybe_load_external_subtitles(local_info.path);
    if (!have_bookmark)
       subtitle_apply_auto_selection(false);
@@ -8437,7 +8718,7 @@ bool retro_load_game(const struct retro_game_info *info)
          log_cb(RETRO_LOG_WARN, "[APLAYER] Frontend did not accept SYSTEM_AV_INFO.\n");
    }
 
-   if (audio_streams_num > 0)
+   if (audio_streams_num > 0 && !midi_content)
    {
       /* audio fifo is 2 seconds deep */
       audio_decode_fifo = fifo_new(
@@ -8445,22 +8726,34 @@ bool retro_load_game(const struct retro_game_info *info)
       );
    }
 
-   fifo_cond        = scond_new();
-   fifo_decode_cond = scond_new();
-   fifo_lock        = slock_new();
-   ass_lock         = slock_new();
-   time_lock        = slock_new();
+   if (!midi_content)
+   {
+      fifo_cond        = scond_new();
+      fifo_decode_cond = scond_new();
+      fifo_lock        = slock_new();
+      ass_lock         = slock_new();
+      time_lock        = slock_new();
 
-   slock_lock(fifo_lock);
-   decode_thread_dead = false;
-   slock_unlock(fifo_lock);
+      slock_lock(fifo_lock);
+      decode_thread_dead = false;
+      slock_unlock(fifo_lock);
 
-   decode_thread_handle = sthread_create(decode_thread, NULL);
+      decode_thread_handle = sthread_create(decode_thread, NULL);
+   }
+   else
+      decode_thread_dead = false;
 
    pts_bias = 0.0;
    frames[0].valid = false;
    frames[1].valid = false;
    content_loaded = true;
+
+   if (midi_content)
+   {
+      display_media_title();
+      if (!internal_playlist_reload)
+         show_midi_limitations_message();
+   }
 
    if (!internal_playlist_reload &&
        have_bookmark &&
