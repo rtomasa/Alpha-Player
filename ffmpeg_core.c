@@ -426,6 +426,7 @@ static unsigned video_crop_top = 0;
 static unsigned video_crop_right = 0;
 static unsigned video_crop_bottom = 0;
 static char preferred_audio_language[16] = APLAYER_AUDIO_LANGUAGE_DEFAULT;
+static char preferred_audio_language_2[16] = APLAYER_AUDIO_LANGUAGE_DEFAULT;
 static char preferred_subtitle_language[16] = APLAYER_SUBTITLE_LANGUAGE_DEFAULT;
 static enum aplayer_deinterlace_mode video_deinterlace_mode = APLAYER_DEINTERLACE_AUTO;
 static enum aplayer_subtitle_mode subtitle_mode = APLAYER_SUBTITLE_MODE_OFF;
@@ -1274,22 +1275,19 @@ static int audio_default_stream_ptr(void)
    return 0;
 }
 
-static int audio_select_initial_stream_ptr(void)
+static int audio_find_best_language_stream_ptr(const char *preferred_language)
 {
    int best_ptr = -1;
    int best_score = 0;
-   int default_ptr = audio_default_stream_ptr();
    int i;
 
-   if (audio_streams_num <= 0)
+   if (string_is_empty(preferred_language) ||
+       string_is_equal(preferred_language, APLAYER_AUDIO_LANGUAGE_DEFAULT))
       return -1;
-
-   if (string_is_equal(preferred_audio_language, APLAYER_AUDIO_LANGUAGE_DEFAULT))
-      return default_ptr;
 
    for (i = 0; i < audio_streams_num; i++)
    {
-      int score = audio_language_match_score(preferred_audio_language,
+      int score = audio_language_match_score(preferred_language,
             audio_stream_language_tag(i));
 
       if (score <= 0)
@@ -1307,6 +1305,28 @@ static int audio_select_initial_stream_ptr(void)
 
    if (best_ptr >= 0)
       return best_ptr;
+
+   return -1;
+}
+
+static int audio_select_initial_stream_ptr(void)
+{
+   int language_ptr;
+   int default_ptr = audio_default_stream_ptr();
+
+   if (audio_streams_num <= 0)
+      return -1;
+
+   if (string_is_equal(preferred_audio_language, APLAYER_AUDIO_LANGUAGE_DEFAULT))
+      return default_ptr;
+
+   language_ptr = audio_find_best_language_stream_ptr(preferred_audio_language);
+   if (language_ptr >= 0)
+      return language_ptr;
+
+   language_ptr = audio_find_best_language_stream_ptr(preferred_audio_language_2);
+   if (language_ptr >= 0)
+      return language_ptr;
 
    return default_ptr;
 }
@@ -2506,7 +2526,41 @@ void retro_set_environment(retro_environment_t cb)
          }, "auto"
       },
       {
-         "aplayer_audio_language", "Preferred Language", "Selects the default audio track language when matching streams are tagged in the media file. Falls back to the file default track, or the first audio track when no default is flagged.",
+         "aplayer_audio_language", "Preferred Language #1", "Selects the first preferred audio track language when matching streams are tagged in the media file. Default uses the file default audio track or first audio track and ignores Preferred Language #2. If unavailable, Preferred Language #2 is tried.",
+         NULL, NULL, "audio",
+         {
+            {"default", "Default"},
+            {"en", "English"},
+            {"ja", "Japanese"},
+            {"es", "Spanish"},
+            {"es-419", "Spanish (Latin America)"},
+            {"fr", "French"},
+            {"de", "German"},
+            {"it", "Italian"},
+            {"pt", "Portuguese"},
+            {"pt-br", "Portuguese (Brazil)"},
+            {"nl", "Dutch"},
+            {"ru", "Russian"},
+            {"uk", "Ukrainian"},
+            {"pl", "Polish"},
+            {"cs", "Czech"},
+            {"hu", "Hungarian"},
+            {"ro", "Romanian"},
+            {"tr", "Turkish"},
+            {"ar", "Arabic"},
+            {"he", "Hebrew"},
+            {"hi", "Hindi"},
+            {"ko", "Korean"},
+            {"zh-hans", "Chinese (Simplified)"},
+            {"zh-hant", "Chinese (Traditional)"},
+            {"yue", "Cantonese"},
+            {"th", "Thai"},
+            {"vi", "Vietnamese"},
+            {NULL, NULL}
+         }, "default"
+      },
+      {
+         "aplayer_audio_language_2", "Preferred Language #2", "Selects the fallback preferred audio track language when Preferred Language #1 is set to a language but unavailable. Default skips this fallback.",
          NULL, NULL, "audio",
          {
             {"default", "Default"},
@@ -2943,6 +2997,7 @@ static void check_variables(bool firststart)
    struct retro_variable loop_content = {0};
    struct retro_variable auto_resume_var = {0};
    struct retro_variable audio_language_var = {0};
+   struct retro_variable audio_language_2_var = {0};
    struct retro_variable subtitle_mode_var = {0};
    struct retro_variable subtitle_language_var = {0};
    struct retro_variable replay_is_crt = {0};
@@ -3050,6 +3105,14 @@ static void check_variables(bool firststart)
          !string_is_empty(audio_language_var.value))
       audio_language_normalize_tag(audio_language_var.value,
             preferred_audio_language, sizeof(preferred_audio_language));
+
+   snprintf(preferred_audio_language_2, sizeof(preferred_audio_language_2), "%s",
+         APLAYER_AUDIO_LANGUAGE_DEFAULT);
+   audio_language_2_var.key = "aplayer_audio_language_2";
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &audio_language_2_var) &&
+         !string_is_empty(audio_language_2_var.value))
+      audio_language_normalize_tag(audio_language_2_var.value,
+            preferred_audio_language_2, sizeof(preferred_audio_language_2));
 
    subtitle_mode = APLAYER_SUBTITLE_MODE_OFF;
    subtitle_mode_var.key = "aplayer_subtitle_mode";

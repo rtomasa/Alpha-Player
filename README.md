@@ -50,9 +50,11 @@ This core has been modified focusing on Raspberry Pi devices using a development
 
 # Audio Options
 
-* Preferred Language - `Default`, `English`, `Japanese`, `Spanish`, `Spanish (Latin America)`, `French`, `German`, `Italian`, `Portuguese`, `Portuguese (Brazil)`, `Dutch`, `Russian`, `Ukrainian`, `Polish`, `Czech`, `Hungarian`, `Romanian`, `Turkish`, `Arabic`, `Hebrew`, `Hindi`, `Korean`, `Chinese (Simplified)`, `Chinese (Traditional)`, `Cantonese`, `Thai`, `Vietnamese`
-* `Default` uses the file default audio track when flagged, otherwise the first audio track
-* If the selected language is not available, playback falls back to the `Default` behavior
+* Preferred Language #1 - `Default`, `English`, `Japanese`, `Spanish`, `Spanish (Latin America)`, `French`, `German`, `Italian`, `Portuguese`, `Portuguese (Brazil)`, `Dutch`, `Russian`, `Ukrainian`, `Polish`, `Czech`, `Hungarian`, `Romanian`, `Turkish`, `Arabic`, `Hebrew`, `Hindi`, `Korean`, `Chinese (Simplified)`, `Chinese (Traditional)`, `Cantonese`, `Thai`, `Vietnamese`
+* Preferred Language #2 - same values as Preferred Language #1
+* If Preferred Language #1 is `Default`, playback uses the `Default` behavior and ignores Preferred Language #2
+* Otherwise playback tries Preferred Language #1 first, then Preferred Language #2, then the `Default` behavior
+* `Default` in Preferred Language #2 skips the fallback slot; `Default` behavior uses the file default audio track when flagged, otherwise the first audio track
 
 # MIDI Playback
 
@@ -100,6 +102,7 @@ If a video has an external subtitle file with the same name and a `.srt` extensi
 - [X] Fixed audio-only seek timeouts causing MP3 playback to rush toward EOF
 - [X] Fixed forward seeks past the end of media stopping at the ended state and reporting `100%`
 - [X] Changed media title OSD to display the file name instead of embedded metadata title
+- [X] Added audio `PREFERRED LANGUAGE #2` fallback option
 
 # v2.9.0
 - [X] Added Standard MIDI file playback through dynamically loaded FluidSynth with an embedded fallback renderer
