@@ -452,6 +452,12 @@ static bool midi_tiny_create(const char *soundfont_path)
    return true;
 }
 
+static bool midi_raw_available(const struct retro_midi_interface *midi_interface)
+{
+   return midi_interface && midi_interface->write &&
+         (!midi_interface->output_enabled || midi_interface->output_enabled());
+}
+
 bool midi_backend_load(const char *midi_path, const char *output,
       const char *system_dir, unsigned sample_rate,
       const struct retro_midi_interface *midi_interface)
@@ -468,11 +474,8 @@ bool midi_backend_load(const char *midi_path, const char *output,
    midi.sample_rate = sample_rate;
    snprintf(midi.midi_path, sizeof(midi.midi_path), "%s", midi_path);
 
-   if (midi.raw)
+   if (midi.raw && midi_raw_available(midi_interface))
    {
-      if (!midi_interface || !midi_interface->write ||
-          (midi_interface->output_enabled && !midi_interface->output_enabled()))
-         goto error;
       midi.midi_interface = *midi_interface;
       midi_find_soundfont(soundfont_path, sizeof(soundfont_path),
             system_dir, "default");
@@ -480,8 +483,11 @@ bool midi_backend_load(const char *midi_path, const char *output,
    }
    else
    {
+      const char *soundfont_output = midi.raw ? "default" : output;
+      midi.raw = false;
+
       if (!midi_find_soundfont(soundfont_path, sizeof(soundfont_path),
-               system_dir, output))
+               system_dir, soundfont_output))
          goto error;
 
       filename = strrchr(soundfont_path, '/');

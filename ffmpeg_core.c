@@ -2399,7 +2399,7 @@ void retro_get_system_info(struct retro_system_info *info)
 {
    memset(info, 0, sizeof(*info));
    info->library_name     = "Alpha Player";
-   info->library_version  = "v2.9.0";
+   info->library_version  = "v2.9.1";
    info->need_fullpath    = true;
    info->valid_extensions = "mkv|avi|f4v|f4f|3gp|ogm|flv|mp4|mp3|flac|ogg|m4a|webm|3g2|mov|wmv|mpg|mpeg|vob|asf|divx|m2p|m2ts|ps|ts|mxf|wma|wav|m3u|s3m|it|xm|mod|ay|gbs|gym|hes|kss|nsf|nsfe|sap|spc|vgm|vgz|mid|midi|kar";
 }
@@ -2578,8 +2578,7 @@ void retro_set_environment(retro_environment_t cb)
          }, "enabled"
       },
       {
-         "aplayer_midi_output", "MIDI Output", "Selects a RePlay SoundFont for FluidSynth playback or forwards MIDI messages to the frontend MIDI device. Missing SoundFonts fall back to Default SoundFont. Changes apply when the next MIDI file is loaded.",
-         NULL, NULL, "music",
+         "aplayer_midi_output", "MIDI Output", "Selects a RePlay SoundFont for FluidSynth playback or forwards MIDI messages to the frontend MIDI device. Missing SoundFonts and unavailable frontend MIDI output fall back to Default SoundFont. Changes apply when the next MIDI file is loaded.", NULL, NULL, "music",
          {
             {"default", "Default SoundFont"},
             {"roland_sc55", "Roland SC-55"},
@@ -8527,6 +8526,7 @@ bool retro_load_game(const struct retro_game_info *info)
    bool have_bookmark = false;
    bool internal_playlist_reload = internal_playlist_reload_pending;
    bool requested_playlist = false;
+   bool requested_raw_midi_output = false;
    int resume_frames = 0;
 
    internal_playlist_reload_pending = false;
@@ -8640,22 +8640,19 @@ bool retro_load_game(const struct retro_game_info *info)
       environ_cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &system_dir);
       if (string_is_equal(midi_output, "raw"))
       {
-         if (!environ_cb(RETRO_ENVIRONMENT_GET_MIDI_INTERFACE, &midi_interface))
-         {
-            log_cb(RETRO_LOG_ERROR,
-                  "[APLAYER] Frontend MIDI interface is not available.\n");
-            goto error;
-         }
-         midi_interface_ptr = &midi_interface;
+         requested_raw_midi_output = true;
+         if (environ_cb(RETRO_ENVIRONMENT_GET_MIDI_INTERFACE, &midi_interface))
+            midi_interface_ptr = &midi_interface;
       }
 
       if (!midi_backend_load(local_info.path, midi_output, system_dir,
                media.sample_rate, midi_interface_ptr))
       {
-         if (string_is_equal(midi_output, "raw"))
+         if (requested_raw_midi_output)
             log_cb(RETRO_LOG_ERROR,
-                  "[APLAYER] Failed to initialize raw MIDI output. "
-                  "Configure and enable a frontend MIDI output device.\n");
+                  "[APLAYER] Failed to initialize raw MIDI output or fallback "
+                  "SoundFont. Configure and enable a frontend MIDI output "
+                  "device, or install a supported SoundFont.\n");
          else
             log_cb(RETRO_LOG_ERROR,
                   "[APLAYER] Failed to initialize MIDI output '%s'. "
@@ -8663,6 +8660,11 @@ bool retro_load_game(const struct retro_game_info *info)
                   midi_output);
          goto error;
       }
+
+      if (requested_raw_midi_output && !midi_backend_is_raw())
+         log_cb(RETRO_LOG_WARN,
+               "[APLAYER] Frontend MIDI output is unavailable; falling back to "
+               "Default SoundFont.\n");
 
       time_supported = false;
       seek_supported = false;
