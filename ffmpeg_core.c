@@ -2414,7 +2414,7 @@ void retro_get_system_info(struct retro_system_info *info)
 {
    memset(info, 0, sizeof(*info));
    info->library_name     = "Alpha Player";
-   info->library_version  = "v2.9.1";
+   info->library_version  = "v2.10.0";
    info->need_fullpath    = true;
    info->valid_extensions = "mkv|avi|f4v|f4f|3gp|ogm|flv|mp4|mp3|flac|ogg|m4a|webm|3g2|mov|wmv|mpg|mpeg|vob|asf|divx|m2p|m2ts|ps|ts|mxf|wma|wav|m3u|s3m|it|xm|mod|ay|gbs|gym|hes|kss|nsf|nsfe|sap|spc|vgm|vgz|mid|midi|kar";
 }
@@ -3115,6 +3115,9 @@ static void check_variables(bool firststart)
    }
 }
 
+static void aplayer_stop_at_end(void);
+static void dispaly_time(void);
+
 static void seek_frame(int seek_frames)
 {
    char msg[256];
@@ -3149,31 +3152,17 @@ static void seek_frame(int seek_frames)
       {
          double seek_step_time   = (double)seek_frames / media.interpolate_fps;
          double seek_target_time = current_time + seek_step_time;
-         double seek_time_max    = media.duration.time - 1.0;
 
-         seek_time_max = (seek_time_max > 0.0) ?
-               seek_time_max : 0.0;
-
-         /* Ensure that we don't attempt to seek past
-          * the end of the file */
-         if (seek_target_time > seek_time_max)
+         /* Seeking past EOF should enter the ended state instead of
+          * snapping back to the beginning or stopping short of 100%. */
+         if (seek_target_time >= media.duration.time)
          {
-            seek_step_time = seek_time_max - current_time;
-
-            /* If seek would have taken us to the
-             * end of the file, restart it instead
-             * (less jarring for the user in case of
-             * accidental seeking...) */
-            if (seek_step_time < 0.0)
-               seek_frames_capped = -1;
-            else
-               seek_frames_capped = (int)(seek_step_time * media.interpolate_fps);
+            aplayer_stop_at_end();
+            dispaly_time();
+            return;
          }
 
-         if (seek_frames_capped < 0)
-            frame_cnt  = 0;
-         else
-            frame_cnt += seek_frames_capped;
+         frame_cnt += seek_frames_capped;
       }
       else
          frame_cnt += seek_frames;
@@ -3249,6 +3238,57 @@ static void seek_frame(int seek_frames)
 
    main_sleeping = false;
    slock_unlock(fifo_lock);
+}
+
+static void aplayer_stop_at_end(void)
+{
+   double total_duration = media.duration.time;
+   uint64_t end_frame = 0;
+
+   if (!duration_is_valid(total_duration) || media.interpolate_fps <= 0.0)
+      return;
+
+   end_frame = (uint64_t)(total_duration * media.interpolate_fps + 0.5);
+
+   frame_cnt = end_frame;
+   pts_bias = 0.0;
+   decode_last_audio_time = total_duration;
+
+   if (media.sample_rate > 0.0)
+      audio_frames = (uint64_t)(total_duration * media.sample_rate + 0.5);
+
+   if (time_lock)
+      slock_lock(time_lock);
+   g_current_time = total_duration;
+   if (time_lock)
+      slock_unlock(time_lock);
+
+   frames[0].pts = 0.0;
+   frames[1].pts = 0.0;
+   frames[0].valid = false;
+   frames[1].valid = false;
+   subtitle_overlay_cache_reset();
+
+   if (fifo_lock)
+   {
+      slock_lock(fifo_lock);
+      do_seek = false;
+      seek_time = 0.0;
+      main_sleeping = false;
+      decode_thread_dead = true;
+      if (audio_decode_fifo)
+         fifo_clear(audio_decode_fifo);
+      if (fifo_cond)
+         scond_signal(fifo_cond);
+      if (fifo_decode_cond)
+         scond_signal(fifo_decode_cond);
+      slock_unlock(fifo_lock);
+   }
+   else
+      decode_thread_dead = true;
+
+   if (video_buffer)
+      video_buffer_interrupt_waiters(video_buffer);
 }
 
 static void dispaly_time(void)
