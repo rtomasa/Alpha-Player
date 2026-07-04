@@ -82,6 +82,7 @@ retro_log_printf_t log_cb;
 #define APLAYER_VIDEO_ZOOM_MAX 1.35f
 #define APLAYER_AUDIO_PACKET_BUFFER_LIMIT 128
 #define APLAYER_AUDIO_SWITCH_PREROLL_SECONDS 0.15
+#define APLAYER_AUDIO_RUN_BUFFER_FRAMES 8192
 
 enum aplayer_deinterlace_mode
 {
@@ -1950,6 +1951,22 @@ static bool aplayer_uses_pal_timing(void)
    return aplayer_fps_matches(media.interpolate_fps, 50.0, 0.50);
 }
 
+static size_t aplayer_audio_frames_per_run(void)
+{
+   double frames;
+
+   if (media.sample_rate == 0 || media.interpolate_fps <= 0.0)
+      return 0;
+
+   frames = (double)media.sample_rate / media.interpolate_fps;
+   if (frames < 1.0)
+      return 1;
+   if (frames > (double)APLAYER_AUDIO_RUN_BUFFER_FRAMES)
+      return APLAYER_AUDIO_RUN_BUFFER_FRAMES;
+
+   return (size_t)(frames + 1.0);
+}
+
 static unsigned aplayer_get_content_region(void)
 {
    if (aplayer_uses_pal_timing())
@@ -3222,6 +3239,7 @@ static void seek_frame(int seek_frames)
       {
          if (!scond_wait_timeout(fifo_cond, fifo_lock, 2000))
          {
+            main_sleeping = false;
             log_cb(RETRO_LOG_WARN, "[APLAYER] Seek timed out, continuing.\n");
             break;
          }
@@ -3231,6 +3249,7 @@ static void seek_frame(int seek_frames)
       main_sleeping = false;
    }
 
+   main_sleeping = false;
    slock_unlock(fifo_lock);
 }
 
@@ -4351,8 +4370,9 @@ void retro_run(void)
    static bool last_r2;
    static bool audio_wait_timeout_logged;
    static bool video_wait_timeout_logged;
+   static bool audio_delta_clamp_logged;
    double min_pts;
-   int16_t audio_buffer[2048];
+   int16_t audio_buffer[APLAYER_AUDIO_RUN_BUFFER_FRAMES * 2];
    bool left, right, up, down, start, a, b, x, y, l, r, l2, r2;
    int16_t ret                  = 0;
    size_t to_read_frames        = 0;
@@ -4778,6 +4798,75 @@ void retro_run(void)
       return;
    }
 
+   if (!decode_thread_dead)
+   {
+      bool seek_pending;
+
+      slock_lock(fifo_lock);
+      seek_pending = do_seek;
+      if (seek_pending)
+         scond_signal(fifo_decode_cond);
+      slock_unlock(fifo_lock);
+
+      if (seek_pending)
+      {
+         to_read_frames = audio_streams_num > 0 ?
+               aplayer_audio_frames_per_run() : 0;
+         if (to_read_frames)
+            memset(audio_buffer, 0,
+                  to_read_frames * sizeof(int16_t) * 2);
+
+         if (video_stream_index >= 0)
+         {
+            double pending_min_pts = media.interpolate_fps > 0.0 ?
+                  (double)frame_cnt / media.interpolate_fps + pts_bias :
+                  pts_bias;
+
+            if (!aplayer_render_cached_video_frame(pending_min_pts))
+               video_cb(RETRO_HW_FRAME_BUFFER_VALID,
+                     media.width, media.height, media.width * sizeof(uint32_t));
+         }
+         else if (fft)
+         {
+            if (fft_enabled)
+            {
+               size_t frames = to_read_frames;
+               const int16_t *buffer = audio_buffer;
+
+               while (frames)
+               {
+                  unsigned step = frames > (1 << 11) ?
+                        (1 << 11) : (unsigned)frames;
+                  fft_step_fft(fft, buffer, step);
+                  buffer += step * 2;
+                  frames -= step;
+               }
+
+               fft_render(fft, hw_render.get_current_framebuffer(),
+                     fft_width, fft_height);
+            }
+            else
+            {
+               glBindFramebuffer(GL_FRAMEBUFFER,
+                     hw_render.get_current_framebuffer());
+               glViewport(0, 0, fft_width, fft_height);
+               glClearColor(0, 0, 0, 1);
+               glClear(GL_COLOR_BUFFER_BIT);
+            }
+
+            video_cb(RETRO_HW_FRAME_BUFFER_VALID,
+                  fft_width, fft_height, fft_width * sizeof(uint32_t));
+         }
+         else
+            video_cb(NULL, 1, 1, sizeof(uint32_t));
+
+         if (to_read_frames)
+            audio_batch_cb(audio_buffer, to_read_frames);
+
+         return;
+      }
+   }
+
    if (decode_thread_dead)
    {
       video_cb(NULL, 1, 1, sizeof(uint32_t));
@@ -4797,9 +4886,39 @@ void retro_run(void)
       double old_pts_bias;
       size_t to_read_bytes;
       size_t bytes_per_frame = sizeof(int16_t) * 2;
+      size_t max_read_frames = aplayer_audio_frames_per_run();
       uint64_t expected_audio_frames = frame_cnt * media.sample_rate / media.interpolate_fps;
 
+      if (max_read_frames == 0)
+         max_read_frames = APLAYER_AUDIO_RUN_BUFFER_FRAMES;
+
+      if (expected_audio_frames < audio_frames)
+      {
+         if (!audio_delta_clamp_logged)
+         {
+            log_cb(RETRO_LOG_WARN,
+                  "[APLAYER] Audio clock moved backwards, resyncing.\n");
+            audio_delta_clamp_logged = true;
+         }
+         audio_frames = expected_audio_frames;
+      }
+
       to_read_frames = expected_audio_frames - audio_frames;
+      if (to_read_frames > max_read_frames)
+      {
+         if (!audio_delta_clamp_logged)
+         {
+            log_cb(RETRO_LOG_WARN,
+                  "[APLAYER] Audio frame delta too large (%zu), resyncing.\n",
+                  to_read_frames);
+            audio_delta_clamp_logged = true;
+         }
+         audio_frames = expected_audio_frames - max_read_frames;
+         to_read_frames = max_read_frames;
+      }
+      else
+         audio_delta_clamp_logged = false;
+
       to_read_bytes = to_read_frames * bytes_per_frame;
 
       slock_lock(fifo_lock);
