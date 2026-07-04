@@ -2328,10 +2328,8 @@ static void display_media_title()
    msg[0] = '\0';
    filename = aplayer_filename_from_path(current_media_path);
 
-   if (media.title) {
-      snprintf(msg, sizeof(msg), "%s", media.title->value);
-   } else if (filename) {
-      snprintf(msg, sizeof(msg), "%s", filename);
+   if (filename) {
+      snprintf(msg, sizeof(msg), "%.*s", (int)sizeof(msg) - 1, filename);
    } else {
       snprintf(msg, sizeof(msg), "%s", "Title not available");
    }

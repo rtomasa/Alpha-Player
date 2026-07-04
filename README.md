@@ -98,6 +98,7 @@ If a video has an external subtitle file with the same name and a `.srt` extensi
 - [X] Fixed MIDI content failing to load when frontend raw MIDI output is selected but no MIDI device is available
 - [X] Added fallback from unavailable frontend raw MIDI output to the default SoundFont renderer
 - [X] Fixed audio-only seek timeouts causing MP3 playback to rush toward EOF
+- [X] Changed media title OSD to display the file name instead of embedded metadata title
 
 # v2.9.0
 - [X] Added Standard MIDI file playback through dynamically loaded FluidSynth with an embedded fallback renderer
