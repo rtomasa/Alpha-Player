@@ -96,6 +96,15 @@ If a video has an external subtitle file with the same name and a `.srt` extensi
 
 # Changelog
 
+# v2.11.0
+- [X] Smoother video playback without periodic pauses, freezes, or frame shaking
+- [X] More reliable seeking, with video and audio resuming together at the selected time
+- [X] Improved playback and seeking for older MPEG, DivX, and Xvid videos
+- [X] Automatic support for AVI files that use packed B-frames
+- [X] Better recovery from damaged or inaccurate audio and video timestamps
+- [X] Reduced unnecessary decoding work and buffer growth while seeking or pausing
+- [X] Reduced verbose FFmpeg logging overhead in debug builds, especially for H.264 videos
+
 # v2.10.0
 - [X] Fixed MIDI content failing to load when frontend raw MIDI output is selected but no MIDI device is available
 - [X] Added fallback from unavailable frontend raw MIDI output to the default SoundFont renderer

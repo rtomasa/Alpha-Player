@@ -4,9 +4,11 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <errno.h>
 
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
+#include <libavcodec/bsf.h>
 #include <libswscale/swscale.h>
 #include <libavutil/error.h>
 #include <libavutil/imgutils.h>
@@ -82,7 +84,11 @@ retro_log_printf_t log_cb;
 #define APLAYER_VIDEO_ZOOM_MAX 1.35f
 #define APLAYER_AUDIO_PACKET_BUFFER_LIMIT 128
 #define APLAYER_AUDIO_SWITCH_PREROLL_SECONDS 0.15
+#define APLAYER_AUDIO_PREFETCH_SECONDS 0.25
 #define APLAYER_AUDIO_RUN_BUFFER_FRAMES 8192
+#define APLAYER_VIDEO_LATE_FRAME_THRESHOLD 0.5
+#define APLAYER_FRAME_DECODE_WAIT_TIMEOUT_US 10000
+#define APLAYER_VIDEO_SEEK_PREROLL_MAX_FRAMES 250
 
 enum aplayer_deinterlace_mode
 {
@@ -398,6 +404,10 @@ static char midi_output[32] = "default";
 static uint64_t frame_cnt;
 static uint64_t audio_frames;
 static double pts_bias;
+static bool audio_clock_bias_initialized;
+static bool legacy_mpeg4_avi;
+static double video_timestamp_offset;
+static bool video_seek_timestamp_rebase_pending;
 
 /* Threaded FIFOs. */
 static volatile bool decode_thread_dead;
@@ -465,6 +475,7 @@ static const char *const cantonese_language_tags[] =
 
 /* GL stuff */
 static struct frame frames[2];
+static bool video_seek_display_pending;
 static unsigned frames_tex_width;
 static unsigned frames_tex_height;
 static unsigned subtitle_overlay_width;
@@ -490,6 +501,7 @@ struct aplayer_rect
 
 static struct aplayer_rect subtitle_overlay_dirty;
 static void subtitle_overlay_cache_reset(void);
+static double stream_timestamp_playback_time(int stream_index, int64_t ts);
 
 static struct retro_hw_render_callback hw_render;
 static GLuint prog;
@@ -519,6 +531,10 @@ static void media_reset_defaults(void)
    do_seek               = false;
    seek_time             = 0.0;
    audio_switch_requested = false;
+   audio_clock_bias_initialized = false;
+   legacy_mpeg4_avi       = false;
+   video_timestamp_offset = 0.0;
+   video_seek_timestamp_rebase_pending = false;
    g_current_time        = 0.0;
    frames[0].pts         = 0.0;
    frames[1].pts         = 0.0;
@@ -528,6 +544,7 @@ static void media_reset_defaults(void)
    frames[1].color_range = AVCOL_RANGE_UNSPECIFIED;
    frames[0].valid       = false;
    frames[1].valid       = false;
+   video_seek_display_pending = false;
    yuv_direct_path_logged = false;
    yuv_sws_path_logged    = false;
    subtitle_overlay_cache_reset();
@@ -543,6 +560,9 @@ static void aplayer_reset_playback_timing_to_start(void)
    frame_cnt = 0;
    audio_frames = 0;
    pts_bias = 0.0;
+   audio_clock_bias_initialized = false;
+   video_timestamp_offset = 0.0;
+   video_seek_timestamp_rebase_pending = false;
    frames[0].pts = 0.0;
    frames[1].pts = 0.0;
    frames[0].colorspace = AVCOL_SPC_UNSPECIFIED;
@@ -551,6 +571,7 @@ static void aplayer_reset_playback_timing_to_start(void)
    frames[1].color_range = AVCOL_RANGE_UNSPECIFIED;
    frames[0].valid = false;
    frames[1].valid = false;
+   video_seek_display_pending = false;
    subtitle_overlay_cache_reset();
 
    if (time_lock)
@@ -782,11 +803,27 @@ error:
 static void video_submit_frame_to_worker(video_decoder_context_t *ctx,
       ASS_Track *ass_track_active)
 {
+   AVFrame *frame;
+   bool direct_yuv420;
+
    if (!ctx)
       return;
 
    ctx->ass_track_active = ass_track_active;
-   tpool_add_work(tpool, sws_worker_thread, ctx);
+   frame = ctx->filtered && ctx->filtered->data[0] ?
+         ctx->filtered : ctx->source;
+   direct_yuv420 = frame && frame->data[0] &&
+         frame->width == (int)media.width &&
+         frame->height == (int)media.height &&
+         (frame->format == AV_PIX_FMT_YUV420P ||
+          frame->format == AV_PIX_FMT_YUVJ420P);
+
+   /* The common upload path only moves YUV plane references; sending that
+    * trivial work through another thread can leave every ring slot marked
+    * in-progress long enough for the renderer to underrun. Keep workers for
+    * real scaling/conversion, and never leak a slot if work allocation fails. */
+   if (direct_yuv420 || !tpool_add_work(tpool, sws_worker_thread, ctx))
+      sws_worker_thread(ctx);
 }
 
 static bool video_filter_drain_to_buffer(ASS_Track *ass_track_active)
@@ -2434,7 +2471,7 @@ void retro_get_system_info(struct retro_system_info *info)
 {
    memset(info, 0, sizeof(*info));
    info->library_name     = "Alpha Player";
-   info->library_version  = "v2.10.0";
+   info->library_version  = "v2.11.0";
    info->need_fullpath    = true;
    info->valid_extensions = "mkv|avi|f4v|f4f|3gp|ogm|flv|mp4|mp3|flac|ogg|m4a|webm|3g2|mov|wmv|mpg|mpeg|vob|asf|divx|m2p|m2ts|ps|ts|mxf|wma|wav|m3u|s3m|it|xm|mod|ay|gbs|gym|hes|kss|nsf|nsfe|sap|spc|vgm|vgz|mid|midi|kar";
 }
@@ -3231,11 +3268,19 @@ static void seek_frame(int seek_frames)
          frame_cnt += seek_frames;
    }
 
-   do_seek = true;
    slock_lock(fifo_lock);
    seek_time      = frame_cnt / media.interpolate_fps;
    pts_bias       = 0.0;
+   video_timestamp_offset = 0.0;
+   video_seek_timestamp_rebase_pending = video_stream_index >= 0;
+   /* The requested playback position is authoritative. Decoded timestamps
+    * returning after seek padding must not move the sample-count clock. */
+   audio_clock_bias_initialized = true;
    decode_last_audio_time = seek_time;
+   /* Publish the target before the request. The decode thread reads both
+    * fields under fifo_lock; setting do_seek first lets it observe a new
+    * request with the previous target (usually zero). */
+   do_seek = true;
 
    /* Convert seek time to a printable format */
    format_time_hhmmss(seek_time, seek_time_str, sizeof(seek_time_str));
@@ -3272,10 +3317,17 @@ static void seek_frame(int seek_frames)
    if (seek_frames_capped < 0)
       log_cb(RETRO_LOG_INFO, "[APLAYER] Resetting PTS.\n");
 
+   /* Keep the currently displayed texture visible while the decoder rebuilds
+    * reference frames from the preceding keyframe. Mark it just behind the
+    * new clock so both forward and backward seeks still require replacement
+    * as soon as a frame at the target becomes available. */
+   video_seek_display_pending = frames[1].valid;
    frames[0].pts = 0.0;
-   frames[1].pts = 0.0;
+   if (frames[1].valid)
+      frames[1].pts = seek_time - (1.0 / media.interpolate_fps);
+   else
+      frames[1].pts = 0.0;
    frames[0].valid = false;
-   frames[1].valid = false;
    audio_frames = frame_cnt * media.sample_rate / media.interpolate_fps;
 
    if (audio_decode_fifo)
@@ -3287,7 +3339,8 @@ static void seek_frame(int seek_frames)
       main_sleeping = true;
       if (video_stream_index < 0)
       {
-         if (!scond_wait_timeout(fifo_cond, fifo_lock, 2000))
+         if (!scond_wait_timeout(fifo_cond, fifo_lock,
+               APLAYER_FRAME_DECODE_WAIT_TIMEOUT_US))
          {
             main_sleeping = false;
             log_cb(RETRO_LOG_WARN, "[APLAYER] Seek timed out, continuing.\n");
@@ -3315,6 +3368,8 @@ static void aplayer_stop_at_end(void)
 
    frame_cnt = end_frame;
    pts_bias = 0.0;
+   video_timestamp_offset = 0.0;
+   video_seek_timestamp_rebase_pending = false;
    decode_last_audio_time = total_duration;
 
    if (media.sample_rate > 0.0)
@@ -3330,6 +3385,7 @@ static void aplayer_stop_at_end(void)
    frames[1].pts = 0.0;
    frames[0].valid = false;
    frames[1].valid = false;
+   video_seek_display_pending = false;
    subtitle_overlay_cache_reset();
 
    if (fifo_lock)
@@ -4469,9 +4525,13 @@ void retro_run(void)
    static bool last_r;
    static bool last_l2;
    static bool last_r2;
-   static bool audio_wait_timeout_logged;
+   static bool audio_underrun_logged;
    static bool video_wait_timeout_logged;
    static bool audio_delta_clamp_logged;
+   static uint64_t video_cadence_window_start;
+   static uint64_t video_cadence_previous_frame;
+   static unsigned video_cache_reuse_count;
+   static bool video_cadence_reported;
    double min_pts;
    int16_t audio_buffer[APLAYER_AUDIO_RUN_BUFFER_FRAMES * 2];
    bool left, right, up, down, start, a, b, x, y, l, r, l2, r2;
@@ -4984,15 +5044,16 @@ void retro_run(void)
       /* Audio */
       double reading_pts;
       double expected_pts;
-      double old_pts_bias;
       size_t to_read_bytes;
       size_t bytes_per_frame = sizeof(int16_t) * 2;
       size_t max_read_frames = aplayer_audio_frames_per_run();
       uint64_t expected_audio_frames = frame_cnt * media.sample_rate / media.interpolate_fps;
+      bool have_complete_audio_block;
 
       if (max_read_frames == 0)
          max_read_frames = APLAYER_AUDIO_RUN_BUFFER_FRAMES;
 
+      slock_lock(fifo_lock);
       if (expected_audio_frames < audio_frames)
       {
          if (!audio_delta_clamp_logged)
@@ -5022,37 +5083,37 @@ void retro_run(void)
 
       to_read_bytes = to_read_frames * bytes_per_frame;
 
-      slock_lock(fifo_lock);
-      while (!decode_thread_dead && FIFO_READ_AVAIL(audio_decode_fifo) < to_read_bytes)
+      have_complete_audio_block =
+            FIFO_READ_AVAIL(audio_decode_fifo) >= to_read_bytes;
+      if (!decode_thread_dead && !have_complete_audio_block)
       {
-         main_sleeping = true;
+         /* The frontend render/audio loop has a fixed deadline. Never spend
+          * half a 50 Hz frame waiting for a late decoder packet: wake the
+          * producer, consume what is ready, and pad only the missing samples. */
          scond_signal(fifo_decode_cond);
-         if (!scond_wait_timeout(fifo_cond, fifo_lock, 2000))
+         if (!audio_underrun_logged)
          {
-            main_sleeping = false;
-            if (!audio_wait_timeout_logged)
-            {
-               log_cb(RETRO_LOG_WARN,
-                     "[APLAYER] Audio decode wait timed out, padding silence.\n");
-               audio_wait_timeout_logged = true;
-            }
-            break;
+            log_cb(RETRO_LOG_WARN,
+                  "[APLAYER] Audio FIFO underrun, padding missing samples.\n");
+            audio_underrun_logged = true;
          }
-         main_sleeping = false;
       }
-      if (FIFO_READ_AVAIL(audio_decode_fifo) >= to_read_bytes)
-         audio_wait_timeout_logged = false;
-      reading_pts  = decode_last_audio_time -
-         (double)FIFO_READ_AVAIL(audio_decode_fifo) / (media.sample_rate * bytes_per_frame);
-      expected_pts = (double)audio_frames / media.sample_rate;
-      old_pts_bias = pts_bias;
-      pts_bias     = reading_pts - expected_pts;
+      if (have_complete_audio_block)
+         audio_underrun_logged = false;
 
-      if (pts_bias < old_pts_bias - 1.0)
+      /* Use decoded audio timestamps once to establish the media origin, then
+       * keep presentation on the deterministic delivered-sample clock.
+       * Legacy AVI/MP3 timestamps can jitter even while decoded samples are
+       * continuous. Reapplying that jitter as a clock correction periodically
+       * holds or duplicates a video frame without an actual decoder underrun. */
+      if (have_complete_audio_block && !audio_clock_bias_initialized)
       {
-         log_cb(RETRO_LOG_INFO, "[APLAYER] Resetting PTS (bias).\n");
-         frames[0].pts = 0.0;
-         frames[1].pts = 0.0;
+         reading_pts  = decode_last_audio_time -
+            (double)FIFO_READ_AVAIL(audio_decode_fifo) /
+               (media.sample_rate * bytes_per_frame);
+         expected_pts = (double)audio_frames / media.sample_rate;
+         pts_bias = reading_pts - expected_pts;
+         audio_clock_bias_initialized = true;
       }
 
       if (!decode_thread_dead)
@@ -5071,8 +5132,10 @@ void retro_run(void)
       }
       scond_signal(fifo_decode_cond);
 
-      slock_unlock(fifo_lock);
+      /* Keep this clock update in the same critical section as producer-side
+       * audio clock rebasing, which reads audio_frames under fifo_lock. */
       audio_frames += to_read_frames;
+      slock_unlock(fifo_lock);
    }
 
    min_pts = frame_cnt / media.interpolate_fps + pts_bias;
@@ -5084,26 +5147,25 @@ void retro_run(void)
       while (!decode_thread_dead && (!frames[1].valid || min_pts > frames[1].pts))
       {
          int64_t pts = 0;
-
-         if (frames[1].valid)
-         {
-            struct frame tmp = frames[1];
-            frames[1] = frames[0];
-            frames[0] = tmp;
-         }
+         double presentation_pts = min_pts;
 
          if (!decode_thread_dead)
          {
             video_decoder_context_t *ctx = NULL;
+            bool frame_ready = frames[1].valid ?
+                  video_buffer_has_finished_slot(video_buffer) :
+                  video_buffer_wait_for_finished_slot(video_buffer);
 
-            if (!video_buffer_wait_for_finished_slot(video_buffer))
+            if (!frame_ready)
             {
+               if (frames[1].valid)
+                  video_cache_reuse_count++;
                if (aplayer_consume_playback_restart_pending())
                {
                   min_pts = frame_cnt / media.interpolate_fps + pts_bias;
                   continue;
                }
-               if (!video_wait_timeout_logged)
+               if (!frames[1].valid && !video_wait_timeout_logged)
                {
                   log_cb(RETRO_LOG_WARN,
                         "[APLAYER] Video frame wait timed out, reusing last frame.\n");
@@ -5119,22 +5181,96 @@ void retro_run(void)
             video_wait_timeout_logged = false;
             pts                          = ctx->pts;
 
-            double render_time = min_pts;
             if (pts != AV_NOPTS_VALUE)
-               render_time = av_q2d(fctx->streams[video_stream_index]->time_base) * pts;
+            {
+               double decoded_pts = stream_timestamp_playback_time(
+                     video_stream_index, pts) + video_timestamp_offset;
+
+               /* MPEG program streams may return from a successful seek in a
+                * different PTS epoch. Preroll has already selected this as the
+                * target picture, so anchor that epoch to the logical seek
+                * clock once and preserve the offset for subsequent frames. */
+               if (video_seek_timestamp_rebase_pending)
+               {
+                  double seek_delta = min_pts - decoded_pts;
+
+                  if (seek_delta < -APLAYER_VIDEO_LATE_FRAME_THRESHOLD ||
+                        seek_delta > APLAYER_VIDEO_LATE_FRAME_THRESHOLD)
+                  {
+                     video_timestamp_offset += seek_delta;
+                     decoded_pts += seek_delta;
+                     log_cb(RETRO_LOG_INFO,
+                           "[APLAYER] Rebased post-seek video timestamps by "
+                           "%.3f seconds.\n", seek_delta);
+                  }
+                  video_seek_timestamp_rebase_pending = false;
+               }
+
+               presentation_pts = decoded_pts;
+
+               /* A coarse/broken seek may return a long preroll, sometimes
+                * even from the beginning of the file. Decode it to rebuild
+                * MPEG references, but never present it as current video. */
+               if (decoded_pts < min_pts - APLAYER_VIDEO_LATE_FRAME_THRESHOLD)
+               {
+                  video_buffer_open_slot(video_buffer, ctx);
+                  continue;
+               }
+            }
+
+            if (pts == AV_NOPTS_VALUE && frames[1].valid)
+            {
+               presentation_pts = frames[1].pts +
+                     (1.0 / media.interpolate_fps);
+            }
+
+            /* Keep the currently displayed frame in frames[1] until its
+             * replacement is ready. Swapping before the timed wait made a
+             * transient producer delay display frames[0] (the older frame),
+             * causing a visible backward jump followed by a freeze. */
+            if (video_seek_display_pending)
+            {
+               /* The retained frame was only a seek placeholder. Replace it
+                * directly instead of blending unrelated pre/post-seek images. */
+               frames[0].valid = false;
+               video_seek_display_pending = false;
+            }
+            else if (frames[1].valid)
+            {
+               struct frame tmp = frames[1];
+               frames[1] = frames[0];
+               frames[0] = tmp;
+            }
 
             upload_yuv420_frame(&frames[1], ctx->target);
-            render_subtitles_to_overlay(media.width, media.height, render_time);
+            render_subtitles_to_overlay(media.width, media.height,
+                  presentation_pts);
             video_buffer_open_slot(video_buffer, ctx);
          }
 
-         if (pts != AV_NOPTS_VALUE)
-            frames[1].pts = av_q2d(fctx->streams[video_stream_index]->time_base) * pts;
-         else if (frames[0].valid)
-            frames[1].pts = frames[0].pts + (1.0 / media.interpolate_fps);
-         else
-            frames[1].pts = min_pts;
+         frames[1].pts = presentation_pts;
          frames[1].valid = true;
+      }
+
+      /* One bounded aggregate report distinguishes a producer miss from a
+       * timestamp repair without logging on the playback hot path. */
+      if (frame_cnt <= video_cadence_previous_frame ||
+            (video_cadence_previous_frame > 0 &&
+             frame_cnt != video_cadence_previous_frame + 1))
+      {
+         video_cadence_window_start = frame_cnt;
+         video_cache_reuse_count = 0;
+         video_cadence_reported = false;
+      }
+      video_cadence_previous_frame = frame_cnt;
+      if (!video_cadence_reported && media.interpolate_fps > 0.0 &&
+            frame_cnt - video_cadence_window_start >=
+               (uint64_t)(media.interpolate_fps * 10.0))
+      {
+         log_cb(RETRO_LOG_INFO,
+               "[APLAYER] Video cadence diagnostics: cached reuses=%u "
+               "over 10 seconds.\n", video_cache_reuse_count);
+         video_cadence_reported = true;
       }
 
       /* Draw video using OGL*/
@@ -5667,6 +5803,9 @@ static bool init_media_info(void)
    }
 
    media.interpolate_fps = aplayer_get_content_refresh_rate();
+   legacy_mpeg4_avi = vctx && vctx->codec_id == AV_CODEC_ID_MPEG4 &&
+         fctx && fctx->iformat && fctx->iformat->name &&
+         string_is_equal(fctx->iformat->name, "avi");
 
    if (fctx)
    {
@@ -7412,77 +7551,166 @@ done:
    video_buffer_finish_slot(video_buffer, ctx);
 }
 
-static void decode_video(AVCodecContext *ctx, AVPacket *pkt, ASS_Track *ass_track_active)
+static int64_t packet_start_timestamp(const AVPacket *pkt)
 {
-   int ret = 0;
-   video_decoder_context_t *decoder_ctx = NULL;
+   if (!pkt)
+      return AV_NOPTS_VALUE;
+   if (pkt->pts != AV_NOPTS_VALUE)
+      return pkt->pts;
+   if (pkt->dts != AV_NOPTS_VALUE)
+      return pkt->dts;
+   return AV_NOPTS_VALUE;
+}
 
-   video_filter_drain_to_buffer(ass_track_active);
+static int64_t packet_end_timestamp(const AVPacket *pkt)
+{
+   int64_t start_ts = packet_start_timestamp(pkt);
 
-   /* Stop decoding thread until video_buffer is not full again */
-   while (!decode_thread_dead && !video_buffer_has_open_slot(video_buffer))
+   if (start_ts == AV_NOPTS_VALUE)
+      return AV_NOPTS_VALUE;
+   if (pkt->duration > 0 && start_ts <= INT64_MAX - pkt->duration)
+      return start_ts + pkt->duration;
+   return start_ts;
+}
+
+static double stream_timestamp_playback_time(int stream_index, int64_t ts)
+{
+   AVStream *stream;
+   int64_t start_ts;
+
+   if (!fctx || ts == AV_NOPTS_VALUE || stream_index < 0 ||
+         (unsigned)stream_index >= fctx->nb_streams)
+      return -1.0;
+
+   stream = fctx->streams[stream_index];
+   /* Use one container-wide playback origin for every stream. Subtracting
+    * each stream's independent start_time erases intentional A/V offsets and
+    * leaves the renderer, seek preroll and audio clock in different domains. */
+   if (fctx->start_time != AV_NOPTS_VALUE)
+      start_ts = av_rescale_q(fctx->start_time, AV_TIME_BASE_Q,
+            stream->time_base);
+   else
    {
-      if (main_sleeping)
-      {
-         /* The main thread is waiting for audio. Do not drop finished
-          * video frames here; return to the decode loop so it can feed
-          * audio and let the main thread consume the queued frames. */
-         return;
-      }
+      start_ts = stream->start_time;
+      if (start_ts == AV_NOPTS_VALUE)
+         start_ts = 0;
    }
 
-   /* 1) Send the packet. */
-   ret = avcodec_send_packet(ctx, pkt);
-   if (ret == AVERROR(EAGAIN))
+   return (double)(ts - start_ts) * av_q2d(stream->time_base);
+}
+
+static double packet_end_playback_time(const AVPacket *pkt)
+{
+   if (!pkt)
+      return -1.0;
+   return stream_timestamp_playback_time(pkt->stream_index,
+         packet_end_timestamp(pkt));
+}
+
+static int video_bsf_receive_packets(AVBSFContext *bsf,
+      AVPacket *output, packet_buffer_t *buffer)
+{
+   int ret;
+
+   while ((ret = av_bsf_receive_packet(bsf, output)) >= 0)
    {
-      /* Means the decoder is full, so we must read (receive) frames first. */
-      AVFrame *drain_frame = av_frame_alloc();
-      if (!drain_frame)
-         return;
-
-      while (true)
-      {
-         ret = avcodec_receive_frame(ctx, drain_frame);
-         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
-         {
-            break;
-         }
-         else if (ret < 0)
-         {
-            /* Real error. */
-            log_cb(RETRO_LOG_ERROR,
-               "[APLAYER] Error draining frames: %s\n", av_err2str(ret));
-            av_frame_free(&drain_frame);
-            return;
-         }
-
-         /* We got a frame; if needed we can queue it, or just discard. */
-         av_frame_unref(drain_frame);
-      }
-      av_frame_free(&drain_frame);
-      /* Now try sending the packet again. */
-      ret = avcodec_send_packet(ctx, pkt);
+      packet_buffer_add_packet(buffer, output);
+      av_packet_unref(output);
    }
 
-   /* If still an error that is NOT EAGAIN/EOF, we give up. */
-   if (ret < 0 && ret != AVERROR_EOF)
+   return ret;
+}
+
+static void video_bsf_filter_packet(AVBSFContext *bsf, AVPacket *input,
+      AVPacket *output, packet_buffer_t *buffer)
+{
+   int ret;
+   bool retried = false;
+
+   for (;;)
    {
-      /* Real error. */
-      log_cb(RETRO_LOG_ERROR,
-         "[APLAYER] Can't decode video packet: %s\n", av_err2str(ret));
+      ret = av_bsf_send_packet(bsf, input);
+      if (ret != AVERROR(EAGAIN))
+         break;
+      video_bsf_receive_packets(bsf, output, buffer);
+      if (retried)
+         break;
+      retried = true;
+   }
+
+   if (ret < 0)
+   {
+      log_cb(RETRO_LOG_WARN,
+            "[APLAYER] MPEG-4 packed B-frame filter rejected a packet: %s\n",
+            av_err2str(ret));
+      packet_buffer_add_packet(buffer, input);
       return;
    }
 
-   /* 2) Receive frames in a loop. */
+   video_bsf_receive_packets(bsf, output, buffer);
+}
+
+static void video_bsf_drain(AVBSFContext *bsf, AVPacket *output,
+      packet_buffer_t *buffer)
+{
+   int ret;
+   bool retried = false;
+
+   /* Sending NULL starts filter draining. If output was still pending, pull
+    * it first and retry the drain marker once, as required by the BSF API. */
+   for (;;)
+   {
+      ret = av_bsf_send_packet(bsf, NULL);
+      if (ret != AVERROR(EAGAIN))
+         break;
+      video_bsf_receive_packets(bsf, output, buffer);
+      if (retried)
+         break;
+      retried = true;
+   }
+
+   if (ret >= 0 || ret == AVERROR_EOF)
+      video_bsf_receive_packets(bsf, output, buffer);
+   else
+      log_cb(RETRO_LOG_WARN,
+            "[APLAYER] Failed to drain MPEG-4 packed B-frame filter: %s\n",
+            av_err2str(ret));
+}
+
+enum video_receive_result
+{
+   VIDEO_RECEIVE_NEEDS_INPUT = 0,
+   VIDEO_RECEIVE_OUTPUT_BLOCKED,
+   VIDEO_RECEIVE_EOF,
+   VIDEO_RECEIVE_ERROR
+};
+
+static enum video_receive_result receive_video_frames(AVCodecContext *ctx,
+      ASS_Track *ass_track_active, double seek_preroll_target,
+      double seek_packet_watermark, unsigned *seek_preroll_frames,
+      bool *seek_preroll_pending)
+{
+   int ret;
+   enum video_receive_result result = VIDEO_RECEIVE_NEEDS_INPUT;
+   video_decoder_context_t *decoder_ctx = NULL;
+
+   video_filter_drain_to_buffer(ass_track_active);
+   if (!video_buffer_has_open_slot(video_buffer))
+      return VIDEO_RECEIVE_OUTPUT_BLOCKED;
+
    while (!decode_thread_dead && video_buffer_has_open_slot(video_buffer))
    {
       video_buffer_get_open_slot(video_buffer, &decoder_ctx);
+      if (!decoder_ctx)
+         break;
 
       ret = avcodec_receive_frame(ctx, decoder_ctx->source);
       if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
       {
          /* No more frames now, so break. */
          video_buffer_return_open_slot(video_buffer, decoder_ctx);
+         result = ret == AVERROR_EOF ?
+               VIDEO_RECEIVE_EOF : VIDEO_RECEIVE_NEEDS_INPUT;
          break;
       }
       else if (ret < 0)
@@ -7491,10 +7719,48 @@ static void decode_video(AVCodecContext *ctx, AVPacket *pkt, ASS_Track *ass_trac
          log_cb(RETRO_LOG_ERROR,
             "[APLAYER] Error while reading video frame: %s\n", av_err2str(ret));
          video_buffer_return_open_slot(video_buffer, decoder_ctx);
-         break;
+         return VIDEO_RECEIVE_ERROR;
       }
 
       update_video_presentation_from_frame(decoder_ctx->source);
+
+      if (seek_preroll_pending && *seek_preroll_pending)
+      {
+         int64_t pts = decoder_ctx->source->best_effort_timestamp;
+         bool decoded_target_reached = pts == AV_NOPTS_VALUE;
+         bool packet_target_passed = seek_packet_watermark >=
+               seek_preroll_target + APLAYER_VIDEO_LATE_FRAME_THRESHOLD;
+
+         if (seek_preroll_frames)
+            (*seek_preroll_frames)++;
+
+         if (pts != AV_NOPTS_VALUE)
+         {
+            double decoded_time = stream_timestamp_playback_time(
+                  video_stream_index, pts);
+
+            decoded_target_reached = decoded_time >= seek_preroll_target -
+                  APLAYER_VIDEO_LATE_FRAME_THRESHOLD;
+            if (!decoded_target_reached && !packet_target_passed &&
+                  (!seek_preroll_frames || *seek_preroll_frames <
+                     APLAYER_VIDEO_SEEK_PREROLL_MAX_FRAMES))
+            {
+               /* Decode old GOP frames to rebuild codec references, but do
+                * not spend worker/UI time scaling frames that cannot be
+                * presented after the seek. */
+               av_frame_unref(decoder_ctx->source);
+               video_buffer_return_open_slot(video_buffer, decoder_ctx);
+               continue;
+            }
+         }
+
+         if (!decoded_target_reached)
+            log_cb(RETRO_LOG_WARN,
+                  "[APLAYER] Video seek timestamps did not converge; "
+                  "resuming at the decoded packet boundary.\n");
+         *seek_preroll_pending = false;
+      }
+
       if (video_filter_queue_frame(decoder_ctx, ass_track_active))
          continue;
 
@@ -7502,11 +7768,85 @@ static void decode_video(AVCodecContext *ctx, AVPacket *pkt, ASS_Track *ass_trac
    }
 
    video_filter_drain_to_buffer(ass_track_active);
+   if (result == VIDEO_RECEIVE_NEEDS_INPUT &&
+         !video_buffer_has_open_slot(video_buffer))
+      result = VIDEO_RECEIVE_OUTPUT_BLOCKED;
+   return result;
+}
+
+static bool decode_video(AVCodecContext *ctx, AVPacket *pkt,
+      ASS_Track *ass_track_active, double seek_preroll_target,
+      double seek_packet_watermark, unsigned *seek_preroll_frames,
+      bool *seek_preroll_pending)
+{
+   int ret;
+   enum video_receive_result receive_result;
+
+   /* A packet may contain multiple decoded frames (notably packed MPEG-4
+    * B-frames). Drain every pending frame into the presentation queue before
+    * submitting another packet. Discarding these frames on EAGAIN starved the
+    * renderer and made playback pause repeatedly. */
+   receive_result = receive_video_frames(ctx, ass_track_active,
+         seek_preroll_target, seek_packet_watermark, seek_preroll_frames,
+         seek_preroll_pending);
+   if (receive_result == VIDEO_RECEIVE_OUTPUT_BLOCKED)
+      return false;
+   if (receive_result == VIDEO_RECEIVE_ERROR ||
+         receive_result == VIDEO_RECEIVE_EOF)
+      return true;
+
+   ret = avcodec_send_packet(ctx, pkt);
+   if (ret == AVERROR(EAGAIN))
+      return false;
+   if (ret < 0 && ret != AVERROR_EOF)
+   {
+      log_cb(RETRO_LOG_ERROR,
+            "[APLAYER] Can't decode video packet: %s\n", av_err2str(ret));
+      return true;
+   }
+
+   receive_video_frames(ctx, ass_track_active, seek_preroll_target,
+         seek_packet_watermark, seek_preroll_frames, seek_preroll_pending);
+   return true;
+}
+
+static bool decode_audio_seek_preroll(AVCodecContext *ctx, AVPacket *pkt,
+      AVFrame *frame)
+{
+   int ret;
+
+   if (!ctx || !pkt || !frame)
+      return false;
+
+   ret = avcodec_send_packet(ctx, pkt);
+   if (ret == AVERROR(EAGAIN))
+   {
+      while (avcodec_receive_frame(ctx, frame) >= 0)
+         av_frame_unref(frame);
+      ret = avcodec_send_packet(ctx, pkt);
+   }
+
+   if (ret < 0)
+   {
+      if (ret != AVERROR_EOF)
+         log_cb(RETRO_LOG_WARN,
+               "[APLAYER] Skipping damaged audio seek-preroll packet: %s\n",
+               av_err2str(ret));
+      return false;
+   }
+
+   /* Prime codecs such as MP3 that may depend on data from preceding frames,
+    * but discard the samples so a long keyframe preroll cannot fill the audio
+    * FIFO and throttle video reconstruction to playback speed. */
+   while (avcodec_receive_frame(ctx, frame) >= 0)
+      av_frame_unref(frame);
+
+   return true;
 }
 
 static int16_t *decode_audio(AVCodecContext *ctx, AVPacket *pkt,
       AVFrame *frame, int16_t *buffer, size_t *buffer_cap,
-      SwrContext *swr, bool *clock_rebase_pending)
+      SwrContext *swr, bool *clock_rebase_pending, double timebase)
 {
    int ret = 0;
    int64_t pts = 0;
@@ -7518,7 +7858,58 @@ static int16_t *decode_audio(AVCodecContext *ctx, AVPacket *pkt,
 
    if ((ret = avcodec_send_packet(ctx, pkt)) < 0)
    {
+      int64_t end_ts = packet_end_timestamp(pkt);
+      size_t silence_frames = 0;
+      size_t silence_bytes = 0;
+      size_t max_silence_frames = media.sample_rate > 0.0 ?
+            (size_t)(media.sample_rate / 4.0) : 0;
+
       log_cb(RETRO_LOG_ERROR, "[APLAYER] Can't decode audio packet: %s\n", av_err2str(ret));
+
+      if (pkt->duration > 0 && timebase > 0.0 && media.sample_rate > 0.0)
+      {
+         double frames = pkt->duration * timebase * media.sample_rate;
+         if (frames > 0.0 && frames <= (double)max_silence_frames)
+            silence_frames = (size_t)(frames + 0.5);
+      }
+      if (silence_frames == 0 && ctx->frame_size > 0 &&
+            ctx->sample_rate > 0 && media.sample_rate > 0.0)
+      {
+         double frames = (double)ctx->frame_size * media.sample_rate /
+               ctx->sample_rate;
+         if (frames > 0.0 && frames <= (double)max_silence_frames)
+            silence_frames = (size_t)(frames + 0.5);
+      }
+
+      silence_bytes = silence_frames * bytes_per_frame;
+      if (silence_bytes > *buffer_cap)
+      {
+         int16_t *new_buffer = (int16_t*)av_realloc(buffer, silence_bytes);
+         if (new_buffer)
+         {
+            buffer = new_buffer;
+            *buffer_cap = silence_bytes;
+         }
+         else
+            silence_bytes = 0;
+      }
+      if (silence_bytes > 0)
+         memset(buffer, 0, silence_bytes);
+
+      /* A damaged compressed packet still represents elapsed audio time.
+       * Queue matching silence immediately when space is available so the
+       * main thread does not stall waiting for samples that can never decode. */
+      slock_lock(fifo_lock);
+      if (audio_decode_fifo && silence_bytes > 0 &&
+            FIFO_WRITE_AVAIL(audio_decode_fifo) >= silence_bytes)
+         fifo_write(audio_decode_fifo, buffer, silence_bytes);
+      if (end_ts != AV_NOPTS_VALUE && timebase > 0.0)
+         decode_last_audio_time = stream_timestamp_playback_time(
+               pkt->stream_index, end_ts);
+      else if (silence_frames > 0 && media.sample_rate > 0.0)
+         decode_last_audio_time += silence_frames / media.sample_rate;
+      scond_signal(fifo_cond);
+      slock_unlock(fifo_lock);
       return buffer;
    }
 
@@ -7631,9 +8022,17 @@ static int16_t *decode_audio(AVCodecContext *ctx, AVPacket *pkt,
                pts_bias + queued_seconds;
          *clock_rebase_pending = false;
       }
+      else if (pts != AV_NOPTS_VALUE)
+         decode_last_audio_time = stream_timestamp_playback_time(
+               pkt->stream_index, pts) +
+               (double)out_samples / media.sample_rate;
       else
-         decode_last_audio_time = pts * av_q2d(
-               fctx->streams[audio_streams[audio_streams_ptr]]->time_base);
+      {
+         int64_t end_ts = packet_end_timestamp(pkt);
+         if (end_ts != AV_NOPTS_VALUE)
+            decode_last_audio_time = stream_timestamp_playback_time(
+                  pkt->stream_index, end_ts);
+      }
 
       if (!decode_thread_dead &&
             FIFO_WRITE_AVAIL(audio_decode_fifo) >= required_buffer)
@@ -7647,9 +8046,13 @@ static int16_t *decode_audio(AVCodecContext *ctx, AVPacket *pkt,
 }
 
 
-static void decode_thread_seek(double time)
+static bool decode_thread_seek(double time)
 {
    int64_t seek_to = time * AV_TIME_BASE;
+   int64_t global_target;
+   int seek_stream = -1;
+   int ret = AVERROR(EINVAL);
+   bool use_avi_demuxer_seek = false;
    int i = 0;
 
    if (seek_to < 0)
@@ -7657,8 +8060,66 @@ static void decode_thread_seek(double time)
 
    decode_last_audio_time = time;
 
-   if (avformat_seek_file(fctx, -1, INT64_MIN, seek_to, INT64_MAX, 0) < 0)
-      log_cb(RETRO_LOG_ERROR, "[APLAYER] av_seek_frame() failed.\n");
+   if (video_stream_index >= 0)
+      seek_stream = video_stream_index;
+   else if (audio_streams_num > 0 && audio_streams_ptr < audio_streams_num)
+      seek_stream = audio_streams[audio_streams_ptr];
+
+   global_target = seek_to;
+   if (fctx->start_time != AV_NOPTS_VALUE)
+   {
+      if (fctx->start_time > 0 &&
+            global_target > INT64_MAX - fctx->start_time)
+         global_target = INT64_MAX;
+      else
+         global_target += fctx->start_time;
+   }
+
+   use_avi_demuxer_seek = fctx->iformat && fctx->iformat->name &&
+         string_is_equal(fctx->iformat->name, "avi");
+
+   /* AVI indexes, especially those accompanying DivX-style packed B-frames,
+    * may not map a video-stream timestamp back to the correct interleaved
+    * audio/video chunk. Let the AVI demuxer choose its indexed timestamp as
+    * the older global avformat_seek_file path did successfully. */
+   if (use_avi_demuxer_seek)
+      ret = avformat_seek_file(fctx, -1, INT64_MIN, global_target,
+            INT64_MAX, 0);
+   /* Other legacy MPEG containers need the selected stream's preceding
+    * keyframe. A stream-agnostic seek can land inside video GOPs and MP2/MP3
+    * frames, leaving both decoders unable to recover reliably. */
+   else if (seek_stream >= 0)
+   {
+      AVStream *stream = fctx->streams[seek_stream];
+      int64_t stream_start = stream->start_time;
+      int64_t stream_offset = av_rescale_q(seek_to, AV_TIME_BASE_Q,
+            stream->time_base);
+      int64_t stream_target;
+
+      if (stream_start == AV_NOPTS_VALUE)
+      {
+         if (fctx->start_time != AV_NOPTS_VALUE)
+            stream_start = av_rescale_q(fctx->start_time, AV_TIME_BASE_Q,
+                  stream->time_base);
+         else
+            stream_start = 0;
+      }
+
+      stream_target = stream_start > 0 &&
+            stream_offset > INT64_MAX - stream_start ?
+            INT64_MAX : stream_start + stream_offset;
+      ret = av_seek_frame(fctx, seek_stream, stream_target,
+            AVSEEK_FLAG_BACKWARD);
+   }
+
+   /* Fall back to a bounded global timestamp for demuxers without
+    * stream-specific seek support. */
+   if (ret < 0)
+      ret = avformat_seek_file(fctx, -1, INT64_MIN, global_target,
+            global_target, 0);
+
+   if (ret < 0)
+      log_cb(RETRO_LOG_ERROR, "[APLAYER] Seek failed: %s\n", av_err2str(ret));
 
    if (video_stream_index >= 0)
    {
@@ -7684,40 +8145,8 @@ static void decode_thread_seek(double time)
       if (subtitle_track_is_bitmap((unsigned)i))
          bitmap_subtitle_clear_slot((unsigned)i);
    }
-}
 
-/**
- * This function makes sure that we don't decode too many
- * packets and cause stalls in our decoding pipeline.
- * This could happen if we decode too many packets and
- * saturate our buffers. We have a window of "still okay"
- * to decode, that depends on the media fps.
- **/
-static bool earlier_or_close_enough(double p1, double p2)
-{
-   return (p1 <= p2 || (p1-p2) < (1.0 / media.interpolate_fps) );
-}
-
-static int64_t packet_start_timestamp(const AVPacket *pkt)
-{
-   if (!pkt)
-      return AV_NOPTS_VALUE;
-   if (pkt->pts != AV_NOPTS_VALUE)
-      return pkt->pts;
-   if (pkt->dts != AV_NOPTS_VALUE)
-      return pkt->dts;
-   return AV_NOPTS_VALUE;
-}
-
-static int64_t packet_end_timestamp(const AVPacket *pkt)
-{
-   int64_t start_ts = packet_start_timestamp(pkt);
-
-   if (start_ts == AV_NOPTS_VALUE)
-      return AV_NOPTS_VALUE;
-   if (pkt->duration > 0 && start_ts <= INT64_MAX - pkt->duration)
-      return start_ts + pkt->duration;
-   return start_ts;
+   return ret >= 0;
 }
 
 static void decode_thread(void *data)
@@ -7733,7 +8162,15 @@ static void decode_thread(void *data)
    packet_buffer_t *audio_packet_buffers[MAX_STREAMS] = {0};
    packet_buffer_t *audio_packet_buffer = NULL;
    packet_buffer_t *video_packet_buffer;
-   double last_audio_end  = 0;
+   AVBSFContext *video_bsf = NULL;
+   AVPacket *video_bsf_packet = NULL;
+   bool audio_seek_preroll_pending = false;
+   bool audio_seek_preroll_decode_enabled = true;
+   bool video_seek_preroll_pending = false;
+   bool video_bsf_draining = false;
+   unsigned video_seek_preroll_frames = 0;
+   double seek_preroll_target = 0.0;
+   double video_seek_packet_watermark = -1.0;
 
    (void)data;
 
@@ -7794,11 +8231,46 @@ static void decode_thread(void *data)
 
    if (video_stream_index >= 0)
    {
+      AVStream *video_stream = fctx->streams[video_stream_index];
+
       frame_size = av_image_get_buffer_size(AV_PIX_FMT_YUV420P,
             media.width, media.height, 1);
       video_buffer = video_buffer_create(4, frame_size, media.width, media.height);
       tpool = tpool_create(sw_sws_threads);
       log_cb(RETRO_LOG_INFO, "[APLAYER] Configured worker threads: %d\n", sw_sws_threads);
+
+      if (legacy_mpeg4_avi)
+      {
+         const AVBitStreamFilter *filter =
+               av_bsf_get_by_name("mpeg4_unpack_bframes");
+         int ret = filter ? av_bsf_alloc(filter, &video_bsf) : AVERROR(ENOENT);
+
+         if (ret >= 0)
+            ret = avcodec_parameters_copy(video_bsf->par_in,
+                  video_stream->codecpar);
+         if (ret >= 0)
+         {
+            video_bsf->time_base_in = video_stream->time_base;
+            ret = av_bsf_init(video_bsf);
+         }
+
+         if (ret < 0)
+         {
+            log_cb(RETRO_LOG_WARN,
+                  "[APLAYER] MPEG-4 packed B-frame filter unavailable: %s\n",
+                  av_err2str(ret));
+            av_bsf_free(&video_bsf);
+         }
+         else
+         {
+            video_bsf_packet = av_packet_alloc();
+            if (!video_bsf_packet)
+               av_bsf_free(&video_bsf);
+            else
+               log_cb(RETRO_LOG_INFO,
+                     "[APLAYER] Unpacking DivX-style MPEG-4 packed B-frames.\n");
+         }
+      }
    }
 
    AVPacket *pkt_local = av_packet_alloc();
@@ -7825,10 +8297,6 @@ static void decode_thread(void *data)
       int audio_stream_index, audio_stream_ptr;
 
       double audio_timebase   = 0.0;
-      double video_timebase   = 0.0;
-      double next_video_end   = 0.0;
-      double next_audio_start = 0.0;
-
       AVCodecContext *actx_active = NULL;
       ASS_Track *ass_track_active = NULL;
 
@@ -7840,8 +8308,9 @@ static void decode_thread(void *data)
       if (seek)
       {
          bool restart_request = playback_restart_request;
+         bool seek_succeeded;
 
-         decode_thread_seek(seek_time_thread);
+         seek_succeeded = decode_thread_seek(seek_time_thread);
          if (aud_frame)
             av_frame_unref(aud_frame);
          for (i = 0; (int)i < audio_streams_num; i++)
@@ -7860,14 +8329,27 @@ static void decode_thread(void *data)
             }
          }
          audio_clock_rebase_pending = false;
+         if (video_bsf)
+         {
+            av_bsf_flush(video_bsf);
+            av_packet_unref(video_bsf_packet);
+         }
+         video_bsf_draining = false;
+         seek_preroll_target = seek_time_thread;
+         video_seek_packet_watermark = -1.0;
+         video_seek_preroll_frames = 0;
+         audio_seek_preroll_pending = seek_succeeded &&
+               seek_time_thread > 0.0 &&
+               audio_streams_num > 0;
+         audio_seek_preroll_decode_enabled = true;
+         video_seek_preroll_pending = seek_succeeded &&
+               seek_time_thread > 0.0 &&
+               video_stream_index >= 0;
 
          slock_lock(fifo_lock);
          do_seek          = false;
          eof              = false;
          seek_time        = 0.0;
-         next_video_end   = 0.0;
-         next_audio_start = 0.0;
-         last_audio_end   = 0.0;
 
          if (audio_decode_fifo)
             fifo_clear(audio_decode_fifo);
@@ -7920,7 +8402,6 @@ static void decode_thread(void *data)
                (double)audio_frames / media.sample_rate + pts_bias -
                   APLAYER_AUDIO_SWITCH_PREROLL_SECONDS);
          decode_last_audio_time = (double)audio_frames / media.sample_rate + pts_bias;
-         last_audio_end = decode_last_audio_time;
          audio_clock_rebase_pending = true;
          scond_signal(fifo_cond);
          scond_signal(fifo_decode_cond);
@@ -7936,115 +8417,123 @@ static void decode_thread(void *data)
       if (subtitle_selection_is_valid(subtitle_streams_ptr))
          ass_track_active         = ass_track[subtitle_streams_ptr];
       audio_timebase = av_q2d(fctx->streams[audio_stream_index]->time_base);
-      if (video_stream_index >= 0)
-         video_timebase = av_q2d(fctx->streams[video_stream_index]->time_base);
       slock_unlock(decode_thread_lock);
       audio_packet_buffer = audio_packet_buffers[audio_stream_ptr];
 
-      video_filter_drain_to_buffer(ass_track_active);
+      if (video_stream_index >= 0 && vctx)
+      {
+         bool video_preroll_was_pending = video_seek_preroll_pending;
+
+         /* A decoder may still own output from the previously accepted
+          * packet. Pump it whenever a presentation slot opens, even when the
+          * demuxer has not produced another video packet yet. */
+         receive_video_frames(vctx, ass_track_active, seek_preroll_target,
+               video_seek_packet_watermark, &video_seek_preroll_frames,
+               &video_seek_preroll_pending);
+         if (video_preroll_was_pending && !video_seek_preroll_pending)
+            audio_seek_preroll_pending = false;
+      }
 
       bool need_audio_now = false;
-      bool have_next_audio_start = false;
-      bool have_next_video_end = false;
+      bool should_decode_audio = false;
       slock_lock(fifo_lock);
-      need_audio_now = main_sleeping;   /* main thread is waiting for us */
+      /* Drive audio scheduling from a persistent FIFO low-water condition.
+       * A one-shot main-thread wake cannot communicate urgency because the
+       * decode thread only sees shared state after acquiring this lock. */
+      need_audio_now = main_sleeping ||
+            (actx_active && audio_decode_fifo &&
+             FIFO_READ_AVAIL(audio_decode_fifo) <
+                (size_t)(media.sample_rate * sizeof(int16_t) * 2 *
+                   APLAYER_AUDIO_PREFETCH_SECONDS));
       slock_unlock(fifo_lock);
 
-      if (!packet_buffer_empty(audio_packet_buffer))
+      /* In A/V playback, decode compressed audio only while the sample FIFO
+       * is below its reserve. Previously every buffered audio packet was sent
+       * here even when the two-second FIFO was full. decode_audio() then slept
+       * waiting for enough room for a complete codec frame, withholding video
+       * output for one or more frontend callbacks on slower systems. */
+      should_decode_audio = video_stream_index < 0 || need_audio_now;
+
+      if (should_decode_audio &&
+            !packet_buffer_empty(audio_packet_buffer))
       {
-         int64_t next_audio_start_pts =
-            packet_buffer_peek_start_pts(audio_packet_buffer);
-         if (next_audio_start_pts != AV_NOPTS_VALUE)
-         {
-            next_audio_start = audio_timebase * next_audio_start_pts;
-            have_next_audio_start = true;
-         }
-      }
-
-      if (!packet_buffer_empty(video_packet_buffer))
-      {
-         int64_t next_video_end_pts =
-            packet_buffer_peek_end_pts(video_packet_buffer);
-         if (next_video_end_pts != AV_NOPTS_VALUE)
-         {
-            next_video_end = video_timebase * next_video_end_pts;
-            have_next_video_end = true;
-         }
-      }
-
-      /* Decide whether to pull one audio packet from audio_packet_buffer.
-       *
-       * We do it when:
-       *   1. There is no video stream (audio-only file)
-       *   2. Audio PTS is not “too far” ahead of the next video PTS
-       *      (<= 500 ms tolerance),                              ahead < 0.5
-       *   3. The decoder already hit EOF,                        eof == true
-       *   4. The main thread is blocked waiting for audio data,  need_audio_now
-       *   5. Either packet has no timestamp, so packet order is our best guide
-       *
-       * Together these rules guarantee:
-       *   – Audio never outruns video by more than half a second during normal
-       *     playback.
-       *   – The main thread can never dead-lock after a seek: if it is waiting
-       *     (`main_sleeping`), we always feed at least one packet even when the
-       *     PTS gap is large.
-       */
-
-      double ahead = (have_next_audio_start && have_next_video_end) ?
-         next_audio_start - next_video_end : 0.0;   /* may be < 0 */
-      bool   okay  = (video_stream_index < 0) ||
-                     (ahead < 0.5 /*s*/) ||
-                     !have_next_audio_start ||
-                     !have_next_video_end ||
-                     need_audio_now ||
-                     eof;
-
-      if (okay && !packet_buffer_empty(audio_packet_buffer))
-      {
-         int64_t audio_end_ts;
          packet_buffer_get_packet(audio_packet_buffer, pkt_local);
-         audio_end_ts = packet_end_timestamp(pkt_local);
-         if (audio_end_ts != AV_NOPTS_VALUE)
-            last_audio_end = audio_timebase * audio_end_ts;
          audio_buffer = decode_audio(actx_active, pkt_local, aud_frame,
                                     audio_buffer, &audio_buffer_cap,
                                     swr[audio_stream_ptr],
-                                    &audio_clock_rebase_pending);
+                                    &audio_clock_rebase_pending,
+                                    audio_timebase);
          av_packet_unref(pkt_local);
       }
 
       if (audio_switch_requested)
          continue;
 
-      /*
-       * Decode video packet if:
-       *  1. we already decoded an audio packet
-       *  2. there is no audio stream to play
-       *  3. EOF
-       **/
-      bool waiting_for_audio = need_audio_now && actx_active && !eof;
-      bool video_due = !have_next_video_end ||
-            earlier_or_close_enough(next_video_end, last_audio_end);
+      bool video_packet_blocked = false;
 
-      if (!waiting_for_audio &&
-            !audio_clock_rebase_pending &&
-            !packet_buffer_empty(video_packet_buffer) &&
-            (
-               (!eof && video_due) ||
-               !actx_active ||
-               eof
-            )
-         )
+      /* A reserve refill and one video decode can share this iteration. Audio
+       * urgency must not suppress video until the renderer has already missed
+       * a frame. The four-slot decoded-frame ring is the authoritative
+       * decode-ahead bound; compressed stream timestamps are not reliable
+       * enough to gate progress after seeks in legacy MPEG program streams. */
+      if (!audio_clock_rebase_pending &&
+            !packet_buffer_empty(video_packet_buffer)
+      )
       {
+         bool video_preroll_was_pending = video_seek_preroll_pending;
+
          packet_buffer_get_packet(video_packet_buffer, pkt_local);
 
-         decode_video(vctx, pkt_local, ass_track_active);
+         if (!decode_video(vctx, pkt_local, ass_track_active,
+               seek_preroll_target, video_seek_packet_watermark,
+               &video_seek_preroll_frames, &video_seek_preroll_pending))
+         {
+            packet_buffer_return_packet(video_packet_buffer, pkt_local);
+            video_packet_blocked = true;
+         }
+
+         /* Some legacy AVI audio timestamps never reach the requested seek
+          * time even though video has caught up successfully. Do not let that
+          * stale audio-preroll flag keep normal playback in fast-preroll mode
+          * forever: once a presentable target video frame is decoded, the
+          * interleaved audio decoder is already primed and can resume output. */
+         if (video_preroll_was_pending && !video_seek_preroll_pending)
+            audio_seek_preroll_pending = false;
 
          av_packet_unref(pkt_local);
       }
 
       if (eof && packet_buffer_empty(video_packet_buffer))
          video_filter_drain_to_buffer(ass_track_active);
+
+      if (video_packet_blocked)
+      {
+         bool audio_still_needed;
+         size_t audio_fifo_avail = 0;
+         size_t audio_fifo_low_water = (size_t)(media.sample_rate *
+               sizeof(int16_t) * 2 * APLAYER_AUDIO_PREFETCH_SECONDS);
+
+         slock_lock(fifo_lock);
+         if (audio_decode_fifo)
+            audio_fifo_avail = FIFO_READ_AVAIL(audio_decode_fifo);
+         audio_still_needed = actx_active &&
+               ((!eof && (main_sleeping ||
+                  audio_fifo_avail < audio_fifo_low_water)) ||
+                (eof && !packet_buffer_empty(audio_packet_buffer)));
+         slock_unlock(fifo_lock);
+
+         if (!audio_still_needed)
+         {
+            /* The presentation queue owns every frame slot. Do not keep
+             * demuxing/filtering packets while the renderer is stopped or
+             * slower than decode; that grows the packet queue and can consume
+             * an entire CPU. The bounded wait keeps seeks and shutdowns
+             * responsive. Keep a modest decoded-audio reserve so interleaved
+             * files do not wait for an actual underrun before demux resumes. */
+            video_buffer_wait_for_open_slot_timeout(video_buffer, 2000);
+            continue;
+         }
+      }
 
       bool break_out_loop = false;
 
@@ -8188,6 +8677,14 @@ static void decode_thread(void *data)
       // Read the next frame and stage it in case of audio or video frame.
       if (av_read_frame(fctx, pkt_local) < 0)
       {
+         if (video_bsf && !video_bsf_draining)
+         {
+            video_bsf_drain(video_bsf, video_bsf_packet,
+                  video_packet_buffer);
+            video_bsf_draining = true;
+         }
+         audio_seek_preroll_pending = false;
+         video_seek_preroll_pending = false;
          eof = true;
       }
       else
@@ -8195,7 +8692,8 @@ static void decode_thread(void *data)
          // Update g_current_time if not NOPTS
          if (pkt_local->pts != AV_NOPTS_VALUE)
          {
-            double this_pts_seconds = pkt_local->pts * av_q2d(fctx->streams[pkt_local->stream_index]->time_base);
+            double this_pts_seconds = stream_timestamp_playback_time(
+                  pkt_local->stream_index, pkt_local->pts);
 
             slock_lock(time_lock);
             g_current_time = this_pts_seconds;
@@ -8205,13 +8703,70 @@ static void decode_thread(void *data)
          int audio_slot = audio_slot_for_stream(pkt_local->stream_index);
          if (audio_slot >= 0 && actx[audio_slot])
          {
+            if (audio_seek_preroll_pending &&
+                  audio_slot == audio_stream_ptr)
+            {
+               if (video_stream_index >= 0)
+               {
+                  /* For A/V seeks, decoded video is the authoritative target
+                   * boundary. Legacy AVI audio timestamps may alternate
+                   * between missing, reset and valid values; allowing unknown
+                   * packets into the FIFO makes it repeatedly empty/refill and
+                   * feeds visible backward clock corrections. Prime and
+                   * discard audio until video recovery completes. If one
+                   * damaged packet is rejected, stop submitting the remaining
+                   * preroll packets rather than repeating costly decoder/log
+                   * failures on every AVI chunk. */
+                  if (video_seek_preroll_pending)
+                  {
+                     if (audio_seek_preroll_decode_enabled)
+                        audio_seek_preroll_decode_enabled =
+                              decode_audio_seek_preroll(actx[audio_slot],
+                                    pkt_local, aud_frame);
+                     av_packet_unref(pkt_local);
+                     continue;
+                  }
+
+                  /* Defensive coupling for a transition completed by a
+                   * decoder pump earlier in this iteration. */
+                  audio_seek_preroll_pending = false;
+               }
+               else
+               {
+                  double packet_time = packet_end_playback_time(pkt_local);
+
+                  if (packet_time >= 0.0 &&
+                        packet_time < seek_preroll_target - 0.05)
+                  {
+                     decode_audio_seek_preroll(actx[audio_slot], pkt_local,
+                           aud_frame);
+                     av_packet_unref(pkt_local);
+                     continue;
+                  }
+                  if (packet_time >= seek_preroll_target - 0.05)
+                     audio_seek_preroll_pending = false;
+               }
+            }
+
             packet_buffer_add_packet(audio_packet_buffers[audio_slot], pkt_local);
             if (audio_slot != audio_stream_ptr)
                packet_buffer_trim(audio_packet_buffers[audio_slot],
                      APLAYER_AUDIO_PACKET_BUFFER_LIMIT);
          }
          else if (pkt_local->stream_index == video_stream_index)
-            packet_buffer_add_packet(video_packet_buffer, pkt_local);
+         {
+            if (video_seek_preroll_pending)
+            {
+               double packet_time = packet_end_playback_time(pkt_local);
+               if (packet_time > video_seek_packet_watermark)
+                  video_seek_packet_watermark = packet_time;
+            }
+            if (video_bsf)
+               video_bsf_filter_packet(video_bsf, pkt_local,
+                     video_bsf_packet, video_packet_buffer);
+            else
+               packet_buffer_add_packet(video_packet_buffer, pkt_local);
+         }
          else
          {
             int subtitle_slot = subtitle_slot_for_stream(pkt_local->stream_index);
@@ -8423,6 +8978,8 @@ static void decode_thread(void *data)
 
 end:
    av_packet_free(&pkt_local);
+   av_packet_free(&video_bsf_packet);
+   av_bsf_free(&video_bsf);
 
    for (i = 0; (int)i < audio_streams_num; i++)
       swr_free(&swr[i]);
@@ -8671,6 +9228,9 @@ void retro_unload_game(void)
    rect_reset(&subtitle_overlay_dirty);
    subtitle_overlay_cache_reset();
    pts_bias = 0.0;
+   audio_clock_bias_initialized = false;
+   video_timestamp_offset = 0.0;
+   video_seek_timestamp_rebase_pending = false;
    frame_cnt = 0;
    audio_frames = 0;
 
@@ -8829,7 +9389,11 @@ bool retro_load_game(const struct retro_game_info *info)
       AV_LOG_DEBUG: Debugging messages are printed.
    */
 #ifdef DEBUG
-   av_log_set_level(AV_LOG_DEBUG);
+   /* Keep stream metadata and actionable diagnostics in debug builds, but do
+    * not enable FFmpeg's per-packet decoder trace. H.264 NAL and MPEG-4 VOP
+    * logging runs on the playback hot path and can starve audio on small ARM
+    * systems even when decoding itself is keeping up. */
+   av_log_set_level(AV_LOG_INFO);
 #else
    av_log_set_level(AV_LOG_QUIET);
 #endif

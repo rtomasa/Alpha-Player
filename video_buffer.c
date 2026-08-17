@@ -5,6 +5,8 @@
 
 #include "include/video_buffer.h"
 
+#define VIDEO_BUFFER_FINISHED_WAIT_TIMEOUT_US 10000
+
 enum kbStatus
 {
   KB_OPEN = 0,
@@ -247,6 +249,34 @@ bool video_buffer_wait_for_open_slot(video_buffer_t *video_buffer)
    return ready;
 }
 
+bool video_buffer_wait_for_open_slot_timeout(
+      video_buffer_t *video_buffer, int64_t timeout_us)
+{
+   uint64_t clear_count = 0;
+   bool ready = false;
+
+   if (!video_buffer)
+      return false;
+
+   slock_lock(video_buffer->lock);
+   clear_count = video_buffer->clear_count;
+
+   while (video_buffer->status[video_buffer->head] != KB_OPEN)
+   {
+      if (!scond_wait_timeout(video_buffer->open_cond,
+            video_buffer->lock, timeout_us))
+         break;
+      if (clear_count != video_buffer->clear_count &&
+            video_buffer->status[video_buffer->head] != KB_OPEN)
+         break;
+   }
+
+   ready = video_buffer->status[video_buffer->head] == KB_OPEN;
+
+   slock_unlock(video_buffer->lock);
+   return ready;
+}
+
 bool video_buffer_wait_for_finished_slot(video_buffer_t *video_buffer)
 {
    uint64_t clear_count = 0;
@@ -258,7 +288,7 @@ bool video_buffer_wait_for_finished_slot(video_buffer_t *video_buffer)
    while (video_buffer->status[video_buffer->tail] != KB_FINISHED)
    {
       if (!scond_wait_timeout(video_buffer->finished_cond,
-            video_buffer->lock, 2000))
+            video_buffer->lock, VIDEO_BUFFER_FINISHED_WAIT_TIMEOUT_US))
          break;
       if (clear_count != video_buffer->clear_count &&
             video_buffer->status[video_buffer->tail] != KB_FINISHED)

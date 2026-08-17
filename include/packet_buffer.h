@@ -94,6 +94,17 @@ void packet_buffer_add_packet(packet_buffer_t *packet_buffer, AVPacket *pkt);
 void packet_buffer_get_packet(packet_buffer_t *packet_buffer, AVPacket *pkt);
 
 /**
+ * packet_buffer_return_packet:
+ * @packet_buffer      : packet buffer
+ * @pkt                : packet
+ *
+ * Returns a packet obtained with packet_buffer_get_packet() to the front of
+ * the queue so it remains the next packet consumed.
+ *
+ **/
+void packet_buffer_return_packet(packet_buffer_t *packet_buffer, AVPacket *pkt);
+
+/**
  * packet_buffer_drop_packet:
  * @packet_buffer      : packet buffer
  *

@@ -160,6 +160,17 @@ void video_buffer_finish_slot(video_buffer_t *video_buffer, video_decoder_contex
 bool video_buffer_wait_for_open_slot(video_buffer_t *video_buffer);
 
 /**
+ * video_buffer_wait_for_open_slot_timeout:
+ * @video_buffer      : video buffer.
+ * @timeout_us        : Maximum wait in microseconds.
+ *
+ * Waits for an open producer slot, but returns after @timeout_us so callers
+ * can re-check seek, shutdown, pause, and audio-starvation state.
+ */
+bool video_buffer_wait_for_open_slot_timeout(
+      video_buffer_t *video_buffer, int64_t timeout_us);
+
+/**
  * video_buffer_wait_for_finished_slot:
  * @video_buffer      : video buffer.
  *

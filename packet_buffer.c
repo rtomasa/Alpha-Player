@@ -142,6 +142,37 @@ void packet_buffer_get_packet(packet_buffer_t *packet_buffer, AVPacket *pkt)
    packet_buffer->size--;
 }
 
+void packet_buffer_return_packet(packet_buffer_t *packet_buffer, AVPacket *pkt)
+{
+   AVPacketNode_t *new_tail;
+
+   if (!packet_buffer || !pkt)
+      return;
+
+   new_tail = (AVPacketNode_t*)malloc(sizeof(*new_tail));
+   if (!new_tail)
+      return;
+
+   new_tail->data = av_packet_alloc();
+   if (!new_tail->data)
+   {
+      free(new_tail);
+      return;
+   }
+
+   av_packet_move_ref(new_tail->data, pkt);
+   new_tail->next = NULL;
+   new_tail->previous = packet_buffer->tail;
+
+   if (packet_buffer->tail)
+      packet_buffer->tail->next = new_tail;
+   else
+      packet_buffer->head = new_tail;
+
+   packet_buffer->tail = new_tail;
+   packet_buffer->size++;
+}
+
 void packet_buffer_drop_packet(packet_buffer_t *packet_buffer)
 {
    AVPacketNode_t *new_tail = NULL;
