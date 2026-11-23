@@ -97,6 +97,10 @@ If a video has an external subtitle file with the same name and a `.srt` extensi
 
 # Changelog
 
+# v2.12.0
+- [X] Added support for same-name external `.ass` subtitles
+- [X] Fixed external `.srt` subtitles being reported as loaded without displaying any cues
+
 # v2.11.0
 - [X] Smoother video playback without periodic pauses, freezes, or frame shaking
 - [X] More reliable seeking, with video and audio resuming together at the selected time

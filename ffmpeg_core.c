@@ -2503,7 +2503,7 @@ void retro_get_system_info(struct retro_system_info *info)
 {
    memset(info, 0, sizeof(*info));
    info->library_name     = "Alpha Player";
-   info->library_version  = "v2.11.0";
+   info->library_version  = "v2.12.0";
    info->need_fullpath    = true;
    info->valid_extensions = "mkv|avi|f4v|f4f|3gp|ogm|flv|mp4|mp3|flac|ogg|m4a|webm|3g2|mov|wmv|mpg|mpeg|vob|asf|divx|m2p|m2ts|ps|ts|mxf|wma|wav|m3u|s3m|it|xm|mod|ay|gbs|gym|hes|kss|nsf|nsfe|sap|spc|vgm|vgz|mid|midi|kar";
 }
@@ -5651,8 +5651,7 @@ static void ass_init_subtitle_track(ASS_Track *track, unsigned slot)
 
    if (ass_extra_data_size[slot] > 0)
       ass_process_codec_private(track, (char*)ass_extra_data[slot], ass_extra_data_size[slot]);
-
-   if (track->n_styles == 0)
+   else
       ass_init_default_track(track);
 
    if (subtitle_track_is_text(slot))
@@ -7158,19 +7157,14 @@ static bool parse_srt_time_range_ms(const char *line, int64_t *start_ms, int64_t
    return true;
 }
 
-static bool srt_add_events_from_buffer(ASS_Track *track, char *buf, size_t buf_size,
-      int64_t *first_start_ms_out, AVCodecContext *converter)
+static void srt_add_events_from_buffer(ASS_Track *track, char *buf, size_t buf_size,
+      AVCodecContext *converter)
 {
+   if (!track || !buf || buf_size == 0)
+      return;
+
    char *cursor = buf;
    char *end = buf + buf_size;
-   int64_t first_start_ms = -1;
-   bool any = false;
-
-   if (first_start_ms_out)
-      *first_start_ms_out = -1;
-
-   if (!track || !buf || buf_size == 0)
-      return false;
 
    while (true)
    {
@@ -7264,7 +7258,7 @@ static bool srt_add_events_from_buffer(ASS_Track *track, char *buf, size_t buf_s
 
          if (text && text_len > 0)
          {
-            bool added = false;
+            int event_count = track->n_events;
 
             if (converter)
             {
@@ -7286,43 +7280,22 @@ static bool srt_add_events_from_buffer(ASS_Track *track, char *buf, size_t buf_s
                         continue;
 
                      if (sub.rects[i]->ass)
-                     {
                         ass_add_embedded_event(track, start_ms, end_ms, sub.rects[i]->ass);
-                        added = true;
-                     }
                      else if (sub.rects[i]->text)
-                     {
                         ass_add_text_event(track, start_ms, end_ms, sub.rects[i]->text);
-                        added = true;
-                     }
                   }
                }
 
                avsubtitle_free(&sub);
             }
 
-            if (!added)
-            {
+            if (track->n_events == event_count)
                ass_add_text_event(track, start_ms, end_ms, text);
-               added = true;
-            }
-
-            if (added)
-            {
-               any = true;
-               if (first_start_ms < 0)
-                  first_start_ms = start_ms;
-            }
          }
 
          free(text);
       }
    }
-
-   if (first_start_ms_out)
-      *first_start_ms_out = first_start_ms;
-
-   return any;
 }
 
 static bool ensure_ass_context(void)
@@ -7359,7 +7332,7 @@ static bool ensure_ass_context(void)
 
 static void maybe_load_external_subtitles(const char *media_path)
 {
-   static const char *exts[] = { ".srt" };
+   static const char *exts[] = { ".srt", ".ass" };
    char sub_path[PATH_MAX];
 
    if (!media_path)
@@ -7378,8 +7351,6 @@ static void maybe_load_external_subtitles(const char *media_path)
       ASS_Track *track = NULL;
       AVCodecContext *converter = NULL;
       bool is_ass = false;
-      bool any_events = false;
-      int64_t first_start_ms = -1;
       int slot = subtitle_streams_num;
 
       if (!path_replace_extension(media_path, exts[i], sub_path, sizeof(sub_path)))
@@ -7425,18 +7396,19 @@ static void maybe_load_external_subtitles(const char *media_path)
             subtitle_store_codec_private(slot, converter, true);
 
          ass_init_subtitle_track(track, slot);
-         any_events = srt_add_events_from_buffer(track, buf, buf_size,
-               &first_start_ms, converter);
-         if (!any_events)
-         {
-            ass_free_track(track);
-            av_freep(&ass_extra_data[slot]);
-            ass_extra_data_size[slot] = 0;
-            subtitle_uses_native_text_header[slot] = false;
-            avcodec_free_context(&converter);
-            free(buf);
-            continue;
-         }
+         srt_add_events_from_buffer(track, buf, buf_size, converter);
+      }
+
+      avcodec_free_context(&converter);
+      free(buf);
+
+      if (track->n_events == 0)
+      {
+         ass_free_track(track);
+         av_freep(&ass_extra_data[slot]);
+         ass_extra_data_size[slot] = 0;
+         subtitle_uses_native_text_header[slot] = false;
+         continue;
       }
 
 #ifdef LIBASS_VERSION
@@ -7451,7 +7423,7 @@ static void maybe_load_external_subtitles(const char *media_path)
       subtitle_is_ass[slot] = is_ass;
       subtitle_is_bitmap[slot] = false;
       subtitle_is_external[slot] = true;
-      first_subtitle_start_ms[slot] = first_start_ms;
+      first_subtitle_start_ms[slot] = track->events[0].Start;
       subtitle_streams_num++;
 
       update_subtitle_font_settings();
@@ -7459,8 +7431,6 @@ static void maybe_load_external_subtitles(const char *media_path)
       log_cb(RETRO_LOG_INFO, "[APLAYER] Loaded external subtitles: %s (%s)\n",
             sub_path, is_ass ? "ass" : "text");
 
-      avcodec_free_context(&converter);
-      free(buf);
       break;
    }
 }
